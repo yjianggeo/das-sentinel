@@ -1638,7 +1638,7 @@ git commit -m "feat(web): add three-column review and model lifecycle"
 **Interfaces:**
 - Produces independent CPU and GPU deployment commands with the same API/app-data layout.
 
-- [ ] **Step 1: Add failing static deployment assertions**
+- [ ] **Step 1: Add failing deployment configuration assertions**
 
 ```python
 def test_raw_data_mounts_are_read_only(compose_cpu):
@@ -1650,10 +1650,6 @@ def test_raw_data_mounts_are_read_only(compose_cpu):
 def test_gpu_worker_reserves_nvidia_device(compose_gpu):
     devices = compose_gpu["services"]["worker"]["deploy"]["resources"]["reservations"]["devices"]
     assert devices == [{"driver": "nvidia", "count": 1, "capabilities": ["gpu"]}]
-
-def test_cpu_image_does_not_install_cupy():
-    text = Path("docker/Dockerfile.cpu").read_text("utf-8")
-    assert "cupy" not in text.lower()
 ```
 
 - [ ] **Step 2: Verify failure**
@@ -1765,6 +1761,16 @@ Run: `docker compose -f compose.yaml -f compose.cpu.yaml build`
 
 Expected: both CPU services build. On a CUDA host also run
 `docker compose -f compose.yaml -f compose.gpu.yaml config`.
+
+Run:
+
+```bash
+docker compose -f compose.yaml -f compose.cpu.yaml run --rm --no-deps worker \
+  python -c "import importlib.util; assert importlib.util.find_spec('cupy') is None"
+```
+
+Expected: PASS, proving from the built CPU container's runtime environment that CuPy
+is not installed.
 
 - [ ] **Step 5: Commit**
 
