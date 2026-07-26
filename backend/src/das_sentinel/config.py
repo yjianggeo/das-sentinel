@@ -52,6 +52,15 @@ class ProcessingProfile(BaseModel):
             raise ValueError("overlap_seconds must be nonnegative and smaller than block_seconds")
         if self.sta_seconds <= 0 or self.lta_seconds <= self.sta_seconds:
             raise ValueError("lta_seconds must be greater than sta_seconds")
+        for low, high in (
+            (self.stalta_freq_low_hz, self.stalta_freq_high_hz),
+            (self.coherence_freq_low_hz, self.coherence_freq_high_hz),
+            (self.trajectory_freq_low_hz, self.trajectory_freq_high_hz),
+        ):
+            if low <= 0 or high <= low:
+                raise ValueError("every frequency range must satisfy 0 < low < high")
+        if self.energy_window_seconds <= 0 or self.coherence_window_seconds <= 0:
+            raise ValueError("sampling windows must be positive")
         if self.slowness_points < 3 or self.slowness_points % 2 == 0:
             raise ValueError("slowness_points must be odd and at least 3")
         for low, high in self.energy_bands_hz:
