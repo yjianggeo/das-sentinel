@@ -1,0 +1,74 @@
+from pathlib import Path
+from typing import Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class ProcessingProfile(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    block_seconds: float = 20.0
+    overlap_seconds: float = 5.0
+    device: Literal["auto", "cpu", "cuda"] = "auto"
+    common_mode_removal: bool = True
+    bad_channel_rms_z: float = 8.0
+    stalta_freq_low_hz: float = 2.0
+    stalta_freq_high_hz: float = 40.0
+    sta_seconds: float = 0.5
+    lta_seconds: float = 10.0
+    stalta_threshold: float = 4.0
+    stalta_strong_ratio: float = 8.0
+    min_coincidence: int = 4
+    min_duration_seconds: float = 0.2
+    energy_bands_hz: tuple[tuple[float, float], ...] = (
+        (0.5, 5.0),
+        (5.0, 20.0),
+        (20.0, 80.0),
+    )
+    energy_window_seconds: float = 2.0
+    energy_ratio_threshold: float = 4.0
+    coherence_freq_low_hz: float = 1.0
+    coherence_freq_high_hz: float = 40.0
+    coherence_window_seconds: float = 2.0
+    coherence_threshold: float = 0.08
+    slowness_max_s_per_m: float = 0.002
+    slowness_points: int = 21
+    trajectory_freq_low_hz: float = 1.0
+    trajectory_freq_high_hz: float = 30.0
+    trajectory_velocity_min_mps: float = 2.0
+    trajectory_velocity_max_mps: float = 60.0
+    trajectory_threshold: float = 0.65
+    template_threshold: float = 0.75
+    fusion_normal_score: float = 0.60
+    fusion_strong_score: float = 0.85
+    merge_gap_seconds: float = 1.0
+    artifact_pad_seconds: float = 5.0
+    recursive_discovery: bool = True
+
+    @model_validator(mode="after")
+    def validate_windows_and_bands(self) -> "ProcessingProfile":
+        if self.block_seconds <= 0 or not 0 <= self.overlap_seconds < self.block_seconds:
+            raise ValueError("overlap_seconds must be nonnegative and smaller than block_seconds")
+        if self.sta_seconds <= 0 or self.lta_seconds <= self.sta_seconds:
+            raise ValueError("lta_seconds must be greater than sta_seconds")
+        if self.slowness_points < 3 or self.slowness_points % 2 == 0:
+            raise ValueError("slowness_points must be odd and at least 3")
+        for low, high in self.energy_bands_hz:
+            if low <= 0 or high <= low:
+                raise ValueError("every frequency band must satisfy 0 < low < high")
+        return self
+
+
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(env_prefix="DAS_", env_file=".env")
+
+    data_root: Path = Path("/data")
+    app_data_dir: Path = Path("/app-data")
+    database_url: str = "sqlite+pysqlite:////app-data/das-sentinel.sqlite3"
+    api_url: str = "http://127.0.0.1:8000"
+    session_secret: str = Field(min_length=32)
+    worker_token: str = Field(min_length=32)
+    secure_cookies: bool = True
+    pipeline_version: str = "v1"
+    worker_device: Literal["auto", "cpu", "cuda"] = "auto"
