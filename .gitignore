@@ -1,0 +1,13 @@
+.superpowers/
+.env
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+node_modules/
+dist/
+build/
+*.egg-info/
+.coverage
+htmlcov/
+app-data/
