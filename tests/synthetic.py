@@ -5,11 +5,17 @@ from das_sentinel.signal.preprocess import PreprocessedBlock
 
 
 def preprocessed_block(
-    data: np.ndarray, *, sample_offset: int = 1_000, sample_rate_hz: float = 100.0
+    data: np.ndarray,
+    *,
+    sample_offset: int = 1_000,
+    sample_rate_hz: float = 100.0,
+    bad_channel_mask: np.ndarray | None = None,
 ) -> PreprocessedBlock:
     return PreprocessedBlock(
         data=data.astype(np.float32, copy=False),
-        bad_channel_mask=np.zeros(data.shape[1], dtype=bool),
+        bad_channel_mask=(
+            np.zeros(data.shape[1], dtype=bool) if bad_channel_mask is None else bad_channel_mask
+        ),
         backend_name="cpu",
         sample_offset=sample_offset,
         sample_rate_hz=sample_rate_hz,

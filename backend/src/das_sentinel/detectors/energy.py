@@ -32,11 +32,25 @@ def _runs(mask: np.ndarray) -> list[tuple[int, int]]:
     return list(zip(np.flatnonzero(transitions == 1), np.flatnonzero(transitions == -1), strict=True))
 
 
-def _band_metrics(segment: Any, sample_rate_hz: float, bands: tuple[tuple[float, float], ...], xp: Any) -> tuple[Any, Any]:
-    centered = segment - xp.mean(segment, axis=0, keepdims=True)
-    spectrum = xp.fft.rfft(centered, axis=0)
-    power = xp.mean(xp.square(xp.abs(spectrum)), axis=1)
-    frequency = xp.fft.rfftfreq(segment.shape[0], d=1.0 / sample_rate_hz)
+def _band_metrics(
+    segment: Any,
+    sample_rate_hz: float,
+    bands: tuple[tuple[float, float], ...],
+    xp: Any,
+) -> tuple[Any, Any]:
+    window_samples = min(256, segment.shape[0])
+    hop = max(1, window_samples // 2)
+    window = xp.hanning(window_samples).astype(segment.dtype)
+    window_energy = xp.sum(xp.square(window))
+    frames = []
+    for start in range(0, segment.shape[0] - window_samples + 1, hop):
+        frame = segment[start : start + window_samples]
+        frames.append(frame - xp.mean(frame, axis=0, keepdims=True))
+    framed = xp.stack(frames, axis=0) * window[None, :, None]
+    spectrum = xp.fft.rfft(framed, axis=1)
+    periodograms = xp.square(xp.abs(spectrum)) / (sample_rate_hz * window_energy)
+    power = xp.mean(periodograms, axis=(0, 2))
+    frequency = xp.fft.rfftfreq(window_samples, d=1.0 / sample_rate_hz)
     band_powers = xp.asarray([xp.sum(power[(frequency >= low) & (frequency < high)]) for low, high in bands])
     normalized = band_powers / xp.maximum(xp.sum(band_powers), xp.finfo(segment.dtype).eps)
     entropy = -xp.sum(xp.where(normalized > 0, normalized * xp.log(normalized), 0.0))
@@ -61,7 +75,6 @@ def detect_energy(block: PreprocessedBlock, profile: ProcessingProfile) -> list[
     active_channels = (ratio >= profile.energy_ratio_threshold) & good[None, :]
     coincidence = xp.sum(active_channels, axis=1)
     active = coincidence >= profile.min_coincidence
-    active[:window] = False
     active[-window:] = False
     active_cpu = _to_numpy(active, block.backend_name)
 
@@ -70,9 +83,10 @@ def detect_energy(block: PreprocessedBlock, profile: ProcessingProfile) -> list[
     for start, stop in _runs(active_cpu):
         if stop - start < min_duration:
             continue
-        peak_relative = int(_to_numpy(xp.argmax(xp.max(ratio[start:stop], axis=1)), block.backend_name))
+        good_ratios = xp.where(good[None, :], ratio[start:stop], 0.0)
+        peak_relative = int(_to_numpy(xp.argmax(xp.max(good_ratios, axis=1)), block.backend_name))
         peak_index = start + peak_relative
-        peak_ratio = float(_to_numpy(xp.max(ratio[peak_index]), block.backend_name))
+        peak_ratio = float(_to_numpy(xp.max(good_ratios[peak_relative]), block.backend_name))
         channel_hits = xp.any(active_channels[start:stop], axis=0)
         channel_indices = np.flatnonzero(_to_numpy(channel_hits, block.backend_name))
         if channel_indices.size < profile.min_coincidence:

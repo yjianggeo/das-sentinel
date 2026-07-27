@@ -59,7 +59,6 @@ def detect_stalta(block: PreprocessedBlock, profile: ProcessingProfile) -> list[
     active = coincidence >= profile.min_coincidence
 
     margin = lta
-    active[:margin] = False
     active[-margin:] = False
     active_cpu = _to_numpy(active, block.backend_name)
     min_duration = max(1, round(profile.min_duration_seconds * block.sample_rate_hz))
@@ -68,9 +67,10 @@ def detect_stalta(block: PreprocessedBlock, profile: ProcessingProfile) -> list[
         if stop - start < min_duration:
             continue
         run_ratios = ratios[start:stop]
-        peak_relative = int(_to_numpy(xp.argmax(xp.max(run_ratios, axis=1)), block.backend_name))
+        good_ratios = xp.where(good[None, :], run_ratios, 0.0)
+        peak_relative = int(_to_numpy(xp.argmax(xp.max(good_ratios, axis=1)), block.backend_name))
         peak_index = start + peak_relative
-        peak_ratio = float(_to_numpy(xp.max(run_ratios[peak_relative]), block.backend_name))
+        peak_ratio = float(_to_numpy(xp.max(good_ratios[peak_relative]), block.backend_name))
         run_channels = active_channels[start:stop]
         channel_hits = xp.any(run_channels, axis=0)
         channel_indices = np.flatnonzero(_to_numpy(channel_hits, block.backend_name))
