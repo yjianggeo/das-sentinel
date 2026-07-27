@@ -842,6 +842,9 @@ git commit -m "feat(classify): add explainable features rules and abstention"
 
 **Interfaces:**
 - Produces: `SimilarityIndex.fit/query`, `TrainingReport`, `train_model`, `save_model_bundle`, `load_model_bundle`.
+- `save_model_bundle` returns the SHA-256 of the complete saved bundle.
+- `load_model_bundle` requires an `expected_sha256` obtained from trusted persistence and
+  verifies it before parsing the outer ZIP, JSON metadata, or skops model payload.
 
 - [ ] **Step 1: Add failing semantic and release-gate tests**
 
@@ -1079,7 +1082,8 @@ Use SQLAlchemy 2 typed mappings, foreign keys, unique run keys, immutable profil
 append-only reviews/classifications, UTC strings or timezone-aware conversion, and
 transaction-scoped repository methods. On startup check SQLite version, set
 `journal_mode=WAL`, `foreign_keys=ON`, `busy_timeout=5000`, and reject remote-looking
-database URLs/paths. Protect all writes with one async application lock in the API layer.
+database URLs/paths. Model-version rows store the complete model-bundle SHA-256 separately
+from the artifact path. Protect all writes with one async application lock in the API layer.
 
 - [ ] **Step 4: Run migrations twice and repository tests**
 
@@ -1373,7 +1377,9 @@ Expected: FAIL importing `TrainingService`.
 - [ ] **Step 3: Implement snapshots, reports, atomic activation, and rollback**
 
 Snapshot reviewed event IDs, labels, ordered feature JSON, profile version, and SHA-256.
-Training creates a model artifact and report without activation. Publishing verifies the
+Training creates a model artifact, stores the SHA-256 returned by `save_model_bundle` in
+the model-version database row, and creates the report without activation. Every model load
+passes that trusted database digest to `load_model_bundle`. Publishing verifies the
 four-class counts and metrics and refuses a candidate whose macro-F1 is below the active
 model, deactivates the prior model and activates the candidate in one transaction. Rollback
 activates the immediately preceding valid site model. Never delete model files during
