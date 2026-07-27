@@ -14,6 +14,25 @@ def _as_float(value: Any, backend: ArrayBackend) -> float:
     return float(backend.asnumpy(value))
 
 
+def _coherence_score(semblance: float, threshold: float) -> float:
+    return float(0.60 + 0.40 * np.clip((semblance - threshold) / threshold, 0.0, 1.0))
+
+
+def _selects_moveout(
+    *,
+    score: float,
+    slowness: float,
+    best_score: float,
+    best_slowness: float,
+) -> bool:
+    """Select strictly higher coherence, then the smaller equivalent moveout."""
+    if score > best_score:
+        return True
+    if score < best_score:
+        return False
+    return abs(slowness) < abs(best_slowness)
+
+
 def _trailing_sum(values: Any, width: int, xp: Any) -> Any:
     cumulative = xp.concatenate((xp.zeros(1, dtype=values.dtype), xp.cumsum(values)))
     return cumulative[width:] - cumulative[:-width]
@@ -80,9 +99,11 @@ def detect_coherence(
         best_value = _as_float(best_semblance, backend)
         slowness_value = _as_float(slowness, backend)
         best_slowness_value = _as_float(best_slowness, backend)
-        if score_value > best_value + 1e-7 or (
-            np.isclose(score_value, best_value, rtol=1e-6, atol=1e-7)
-            and abs(slowness_value) < abs(best_slowness_value)
+        if _selects_moveout(
+            score=score_value,
+            slowness=slowness_value,
+            best_score=best_value,
+            best_slowness=best_slowness_value,
         ):
             best_semblance = score
             best_peak = peak
@@ -100,9 +121,7 @@ def detect_coherence(
     direction = 0.0 if near_zero else float(np.sign(slowness))
     apparent_velocity = 0.0 if near_zero else 1.0 / abs(slowness)
     half_window = max(1, window // 2)
-    score = 0.60 + 0.40 * np.clip(
-        (semblance - profile.coherence_threshold) / profile.coherence_threshold, 0.0, 1.0
-    )
+    score = _coherence_score(semblance, profile.coherence_threshold)
     return [
         Candidate(
             detector="coherence",
@@ -111,7 +130,7 @@ def detect_coherence(
             peak_sample=block.sample_offset + peak,
             channel_start=int(valid_indices[0]),
             channel_stop=int(valid_indices[-1]) + 1,
-            score=float(score),
+            score=score,
             metrics={
                 "semblance": semblance,
                 "slowness_s_per_m": slowness,

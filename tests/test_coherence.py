@@ -1,7 +1,12 @@
 import numpy as np
 import pytest
 from das_sentinel.config import ProcessingProfile
-from das_sentinel.detectors.coherence import detect_coherence
+from das_sentinel.detectors.coherence import (
+    _coherence_score,
+    _moveout_semblance,
+    _selects_moveout,
+    detect_coherence,
+)
 from das_sentinel.signal.backend import select_backend
 
 from tests.synthetic import preprocessed_block
@@ -84,3 +89,68 @@ def test_coherence_excludes_bad_channel_from_moveout_normalization(profile, cpu_
 
     assert candidate.metrics["slowness_s_per_m"] == pytest.approx(2.5e-4, abs=5e-5)
     assert candidate.channel_stop == 5
+
+
+def test_coherence_selects_a_genuinely_higher_semblance_despite_close_scores():
+    """A tolerance tie-break must not replace a physically better moveout."""
+    assert _selects_moveout(
+        score=0.50000005,
+        slowness=0.0005,
+        best_score=0.5,
+        best_slowness=0.0,
+    )
+
+
+def test_coherence_selects_smaller_slowness_only_for_equal_score():
+    """An exact score tie has no evidence basis for a nonzero tie winner."""
+    assert _selects_moveout(
+        score=0.5,
+        slowness=0.0,
+        best_score=0.5,
+        best_slowness=0.0005,
+    )
+
+
+def test_coherence_score_uses_exact_threshold_boundaries():
+    """Changing either score boundary miscalibrates coherence evidence for fusion."""
+    assert _coherence_score(0.08, 0.08) == pytest.approx(0.60)
+    assert _coherence_score(0.16, 0.08) == pytest.approx(1.0)
+
+
+def test_moveout_semblance_excludes_truncated_alignment_windows():
+    """A right-edge partial overlap must not contribute to a delayed stack."""
+    semblance, _ = _moveout_semblance(
+        np.ones((8, 2), dtype=np.float32), np.array([0, 2]), 4, np
+    )
+
+    np.testing.assert_allclose(semblance[:3], 0.5)
+    np.testing.assert_array_equal(semblance[3:], 0.0)
+
+
+def test_coherence_cuda_matches_cpu_or_skips_when_unavailable(moving_wavefront, profile, cpu_backend):
+    """A backend-specific slant stack would change the exported candidate evidence."""
+    cuda_backend = select_backend("auto")
+    if cuda_backend.name != "cuda":
+        pytest.skip(cuda_backend.unavailable_reason or "CUDA backend unavailable")
+
+    cuda_block = moving_wavefront.__class__(
+        **{**moving_wavefront.__dict__, "data": cuda_backend.asarray(moving_wavefront.data), "backend_name": "cuda"}
+    )
+    cpu_candidate = detect_coherence(moving_wavefront, profile, cpu_backend)[0]
+    cuda_candidate = detect_coherence(cuda_block, profile, cuda_backend)[0]
+
+    assert (
+        cuda_candidate.start_sample,
+        cuda_candidate.end_sample,
+        cuda_candidate.peak_sample,
+        cuda_candidate.channel_start,
+        cuda_candidate.channel_stop,
+    ) == (
+        cpu_candidate.start_sample,
+        cpu_candidate.end_sample,
+        cpu_candidate.peak_sample,
+        cpu_candidate.channel_start,
+        cpu_candidate.channel_stop,
+    )
+    assert cuda_candidate.score == pytest.approx(cpu_candidate.score, rel=1e-5, abs=1e-6)
+    assert cuda_candidate.metrics == pytest.approx(cpu_candidate.metrics, rel=1e-5, abs=1e-6)
