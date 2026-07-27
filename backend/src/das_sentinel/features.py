@@ -39,18 +39,18 @@ def _event_window(block: PreprocessedBlock, event: EventRecord) -> tuple[slice, 
     return slice(start, stop), indices[~block.bad_channel_mask[indices]]
 
 
-def _spectrum(waveform: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray]:
-    if waveform.size < 2 or fs <= 0:
+def _spectrum(data: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray]:
+    if data.shape[0] < 2 or data.shape[1] == 0 or fs <= 0:
         return np.zeros(1), np.zeros(1)
-    window = min(waveform.size, max(8, round(fs * 2)))
+    window = min(data.shape[0], max(8, round(fs * 2)))
     step = max(1, window // 2)
-    starts = range(0, waveform.size - window + 1, step)
-    segments = [waveform[start : start + window] for start in starts] or [waveform]
+    starts = range(0, data.shape[0] - window + 1, step)
+    segments = [data[start : start + window] for start in starts] or [data]
     powers = []
     for segment in segments:
-        taper = np.hanning(segment.size)
-        powers.append(np.abs(np.fft.rfft(segment * taper)) ** 2)
-    return np.fft.rfftfreq(segments[0].size, d=1.0 / fs), np.mean(powers, axis=0)
+        taper = np.hanning(segment.shape[0])
+        powers.append(np.mean(np.abs(np.fft.rfft(segment * taper[:, None], axis=0)) ** 2, axis=1))
+    return np.fft.rfftfreq(segments[0].shape[0], d=1.0 / fs), np.mean(powers, axis=0)
 
 
 def _propagation(event: EventRecord) -> dict[str, float]:
@@ -92,8 +92,7 @@ def extract_features(
 
     energy = np.square(data)
     channel_energy = energy.sum(axis=0)
-    waveform = data.mean(axis=1)
-    envelope = np.abs(waveform)
+    envelope = np.sqrt(np.mean(energy, axis=1))
     peak = float(envelope.max(initial=0.0))
     epsilon = np.finfo(float).eps
     if peak > epsilon:
@@ -105,7 +104,7 @@ def extract_features(
         values["pulse_interval_s"] = float(np.mean(np.diff(crossings)) / sample_rate) if crossings.size > 1 and sample_rate else 0.0
         values["repetition_rate_hz"] = float(crossings.size / duration) if duration else 0.0
 
-    frequency, power = _spectrum(waveform, sample_rate)
+    frequency, power = _spectrum(data, sample_rate)
     total_power = float(power.sum())
     if total_power > epsilon:
         dominant = int(np.argmax(power))
@@ -133,8 +132,8 @@ def extract_features(
     centered = data - np.mean(data)
     variance = float(np.mean(np.square(centered)))
     values["kurtosis"] = float(np.mean(centered**4) / (variance**2)) if variance > epsilon else 0.0
-    median = float(np.median(envelope))
-    values["peak_median_ratio"] = peak / median if median > epsilon else 0.0
+    mean_absolute_amplitude = float(np.mean(np.abs(data)))
+    values["peak_median_ratio"] = peak / mean_absolute_amplitude if mean_absolute_amplitude > epsilon else 0.0
     if data.shape[1] > 1 and np.all(np.std(data, axis=0) > epsilon):
         correlation = np.corrcoef(data.T)
         upper = correlation[np.triu_indices(data.shape[1], 1)]

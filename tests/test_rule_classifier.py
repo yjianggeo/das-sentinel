@@ -23,3 +23,10 @@ def test_rules_return_stable_zero_scores_when_evidence_is_missing():
 
     assert tuple(result.scores) == (Label.EARTHQUAKE, Label.BLAST, Label.TRAFFIC, Label.NOISE)
     assert all(score == 0.0 for score in result.scores.values())
+
+
+def test_nonfinite_zero_slowness_evidence_does_not_create_noise_reason():
+    result = score_rules({"zero_slowness_flag": float("nan")}, {})
+
+    assert result.scores[Label.NOISE] == 0.0
+    assert result.reasons[Label.NOISE] == ()

@@ -1,3 +1,4 @@
+import pytest
 from das_sentinel.classifiers.fusion import fuse_classification
 from das_sentinel.domain import Label
 
@@ -34,3 +35,21 @@ def test_fusion_quality_flags_override_high_scores():
     )
 
     assert result.label == Label.NOISE
+
+
+@pytest.mark.parametrize("value", (float("nan"), float("inf"), float("-inf")))
+def test_fusion_abstains_for_nonfinite_rule_evidence(value):
+    result = fuse_classification({Label.EARTHQUAKE: value}, None, ())
+
+    assert result.label == Label.UNKNOWN
+    assert result.reasons == ("nonfinite_classification_evidence",)
+    assert all(0.0 <= score <= 1.0 for score in result.scores.values())
+
+
+@pytest.mark.parametrize("value", (float("nan"), float("inf"), float("-inf")))
+def test_fusion_abstains_for_nonfinite_model_evidence(value):
+    result = fuse_classification({Label.EARTHQUAKE: 0.9}, {Label.EARTHQUAKE: value}, ())
+
+    assert result.label == Label.UNKNOWN
+    assert result.reasons == ("nonfinite_classification_evidence",)
+    assert all(0.0 <= score <= 1.0 for score in result.scores.values())

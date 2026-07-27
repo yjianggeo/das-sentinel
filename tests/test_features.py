@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
-from das_sentinel.domain import Candidate, EventRecord
+from das_sentinel.classifiers.rules import score_rules
+from das_sentinel.domain import Candidate, EventRecord, Label
 from das_sentinel.features import FEATURE_NAMES, extract_features
 
 from tests.synthetic import preprocessed_block
@@ -52,3 +53,27 @@ def test_short_or_zero_energy_events_return_finite_stable_features():
 
     assert tuple(features) == FEATURE_NAMES
     assert all(np.isfinite(value) for value in features.values() if isinstance(value, float))
+
+
+def test_opposite_phase_channels_preserve_welch_dominant_frequency():
+    fs = 100.0
+    time = np.arange(400) / fs
+    signal = np.sin(2 * np.pi * 12.0 * time).astype(np.float32)
+    block = preprocessed_block(np.column_stack((signal, -signal)), sample_rate_hz=fs)
+    event = EventRecord("opposite", 1_000, 1_400, 1_200, 0, 2, ())
+
+    features = extract_features(block, event)
+
+    assert features["dominant_frequency_hz"] == pytest.approx(12.0, rel=0.1)
+
+
+def test_impulse_peak_mean_ratio_supports_blast_rule_evidence():
+    data = np.zeros((100, 2), dtype=np.float32)
+    data[50] = 10.0
+    block = preprocessed_block(data)
+    event = EventRecord("pulse", 1_000, 1_100, 1_050, 0, 2, ())
+
+    features = extract_features(block, event)
+
+    assert features["peak_median_ratio"] > 5.0
+    assert score_rules(features, {}).scores[Label.BLAST] == 1.0

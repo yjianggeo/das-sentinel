@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from math import isfinite
 
 from das_sentinel.domain import Label
 
@@ -14,7 +15,11 @@ class RuleResult:
 
 def _number(features: Mapping[str, object], key: str) -> float:
     value = features.get(key, 0.0)
-    return float(value) if isinstance(value, (int, float)) else 0.0
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return number if isfinite(number) else 0.0
 
 
 def score_rules(features: Mapping[str, object], site_profile: Mapping[str, object]) -> RuleResult:
