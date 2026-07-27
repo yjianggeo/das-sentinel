@@ -712,7 +712,9 @@ git commit -m "feat(detect): add traffic trajectories and templates"
 - Create: `tests/test_fusion.py`
 
 **Interfaces:**
-- Produces: `fuse_candidates(candidates, profile, site_id, pipeline_version) -> list[EventRecord]`.
+- Produces: `fuse_candidates(candidates, profile, sample_rate_hz, site_id, pipeline_version) -> list[EventRecord]`.
+- `sample_rate_hz` is explicit so `merge_gap_seconds` is converted to samples without
+  hiding structural timing data inside detector metrics.
 
 - [ ] **Step 1: Write failing balanced-gate tests**
 
@@ -720,17 +722,19 @@ git commit -m "feat(detect): add traffic trajectories and templates"
 def test_two_overlapping_normal_candidates_form_event(profile):
     events = fuse_candidates(
         [candidate("stalta", 100, 180, 0.65), candidate("energy", 120, 190, 0.64)],
-        profile, "site-a", "v1",
+        profile, 100.0, "site-a", "v1",
     )
     assert len(events) == 1
     assert {e.detector for e in events[0].evidence} == {"stalta", "energy"}
 
 def test_single_weak_candidate_stays_out_of_review_queue(profile):
-    assert fuse_candidates([candidate("energy", 100, 180, 0.45)], profile, "site-a", "v1") == []
+    assert fuse_candidates(
+        [candidate("energy", 100, 180, 0.45)], profile, 100.0, "site-a", "v1"
+    ) == []
 
 def test_event_id_is_deterministic(profile):
-    first = fuse_candidates([candidate("stalta", 100, 180, 0.95)], profile, "s", "v1")[0]
-    second = fuse_candidates([candidate("stalta", 100, 180, 0.95)], profile, "s", "v1")[0]
+    first = fuse_candidates([candidate("stalta", 100, 180, 0.95)], profile, 100.0, "s", "v1")[0]
+    second = fuse_candidates([candidate("stalta", 100, 180, 0.95)], profile, 100.0, "s", "v1")[0]
     assert first.event_id == second.event_id
 ```
 
