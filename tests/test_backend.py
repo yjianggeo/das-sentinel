@@ -6,16 +6,25 @@ from das_sentinel.signal.preprocess import fft_bandpass
 
 def test_auto_backend_falls_back_to_cpu(monkeypatch):
     monkeypatch.setattr("das_sentinel.signal.backend._load_cupy", lambda: None)
+    monkeypatch.setattr(
+        "das_sentinel.signal.backend._CUPY_LOAD_ERROR",
+        "CuPy/CUDA is unavailable: test CUDA load failure",
+    )
 
     backend = select_backend("auto")
 
     assert backend.name == "cpu"
+    assert backend.unavailable_reason == "CuPy/CUDA is unavailable: test CUDA load failure"
 
 
 def test_cuda_backend_raises_recorded_unavailable_reason(monkeypatch):
     monkeypatch.setattr("das_sentinel.signal.backend._load_cupy", lambda: None)
+    monkeypatch.setattr(
+        "das_sentinel.signal.backend._CUPY_LOAD_ERROR",
+        "CuPy/CUDA is unavailable: test CUDA load failure",
+    )
 
-    with pytest.raises(BackendUnavailable, match="CuPy"):
+    with pytest.raises(BackendUnavailable, match="test CUDA load failure"):
         select_backend("cuda")
 
 

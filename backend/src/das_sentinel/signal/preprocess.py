@@ -27,14 +27,19 @@ def find_bad_channels(data: Any, rms_z: float = 8.0) -> np.ndarray:
         raise ValueError("data must have shape [time, channel]")
 
     finite = np.isfinite(values).all(axis=0)
-    rms = np.sqrt(np.mean(np.square(np.where(np.isfinite(values), values, 0.0)), axis=0))
-    bad = ~finite | ~np.isfinite(rms) | (rms <= np.finfo(np.float32).eps)
+    finite_values = np.where(np.isfinite(values), values, 0.0)
+    epsilon = np.finfo(values.dtype).eps
+    rms = np.sqrt(np.mean(np.square(finite_values), axis=0))
+    bad = ~finite | (np.ptp(finite_values, axis=0) <= epsilon) | ~np.isfinite(rms)
     valid_rms = rms[~bad]
     if valid_rms.size:
         median = np.median(valid_rms)
         mad = np.median(np.abs(valid_rms - median))
-        if mad > 0:
+        tolerance = epsilon * max(1.0, float(abs(median)))
+        if mad > tolerance:
             bad |= np.abs(rms - median) > rms_z * 1.4826 * mad
+        else:
+            bad |= ~np.isclose(rms, median, rtol=1e-5, atol=tolerance)
     return bad.astype(bool, copy=False)
 
 

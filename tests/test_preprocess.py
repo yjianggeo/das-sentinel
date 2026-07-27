@@ -30,6 +30,22 @@ def test_constant_and_nonfinite_channels_are_bad():
     assert find_bad_channels(block).tolist() == [False, True, False, True]
 
 
+def test_nonzero_constant_channel_is_bad():
+    time = np.arange(100, dtype=np.float32)
+    variable = 5 * np.sqrt(2) * np.sin(2 * np.pi * time / 20)
+    block = np.column_stack((variable, np.full_like(variable, 5.0), -variable)).astype(np.float32)
+
+    assert find_bad_channels(block).tolist() == [False, True, False]
+
+
+def test_rms_outlier_is_bad_when_valid_channel_mad_is_zero():
+    time = np.arange(100, dtype=np.float32)
+    unit_rms = np.sin(2 * np.pi * time / 20)
+    block = np.column_stack((unit_rms, -unit_rms, unit_rms, 20 * unit_rms)).astype(np.float32)
+
+    assert find_bad_channels(block).tolist() == [False, False, False, True]
+
+
 def test_preprocess_returns_backend_data_without_mutating_input():
     samples = 200
     channels = 3
