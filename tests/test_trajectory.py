@@ -119,8 +119,48 @@ def test_template_creation_rejects_blank_event_id_or_invalid_sample_rate(blast_b
         Template.from_event(invalid_block, event_id=event_id)
 
 
-def test_template_score_rejects_manual_empty_event_id_or_invalid_sample_rate(blast_block):
+def test_template_constructor_rejects_manual_empty_event_id_or_invalid_sample_rate(blast_block):
     template = Template.from_event(blast_block, event_id="reviewed-blast")
 
-    assert score_template(blast_block, replace(template, source_event_id="")) == 0.0
-    assert score_template(blast_block, replace(template, sample_rate_hz=float("nan"))) == 0.0
+    with pytest.raises(ValueError):
+        replace(template, source_event_id="")
+    with pytest.raises(ValueError):
+        replace(template, sample_rate_hz=float("nan"))
+
+
+def test_direct_template_normalizes_scaled_arrays_without_changing_ncc(blast_block):
+    standard = Template.from_event(blast_block, event_id="reviewed-blast")
+    scaled = Template(
+        waveform=standard.waveform * 7.0,
+        spectrum=standard.spectrum * 11.0,
+        site_id=standard.site_id,
+        profile_version=standard.profile_version,
+        source_event_id=standard.source_event_id,
+        sample_rate_hz=standard.sample_rate_hz,
+    )
+
+    assert np.linalg.norm(scaled.waveform) == pytest.approx(1.0)
+    assert np.linalg.norm(scaled.spectrum) == pytest.approx(1.0)
+    assert not np.shares_memory(scaled.waveform, standard.waveform)
+    assert score_template(blast_block, scaled) == pytest.approx(score_template(blast_block, standard))
+
+
+@pytest.mark.parametrize(
+    ("waveform", "spectrum"),
+    (
+        (np.zeros(3), np.ones(2)),
+        (np.array([1.0, float("nan")]), np.ones(2)),
+        (np.ones(3), np.zeros(2)),
+        (np.ones(3), np.array([1.0, float("inf")])),
+    ),
+)
+def test_direct_template_rejects_zero_or_nonfinite_arrays(waveform, spectrum):
+    with pytest.raises(ValueError):
+        Template(
+            waveform=waveform,
+            spectrum=spectrum,
+            site_id="site-a",
+            profile_version="p1",
+            source_event_id="event-1",
+            sample_rate_hz=100.0,
+        )

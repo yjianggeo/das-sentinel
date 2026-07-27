@@ -15,8 +15,8 @@ def _normalize(values: np.ndarray) -> np.ndarray:
     return centered / norm if norm > np.finfo(np.float64).eps else np.zeros_like(centered)
 
 
-def _valid_text(value: str) -> bool:
-    return bool(value and value.strip())
+def _valid_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip())
 
 
 def _valid_sample_rate(sample_rate_hz: float) -> bool:
@@ -34,6 +34,16 @@ class Template:
     source_event_id: str
     sample_rate_hz: float
 
+    def __post_init__(self) -> None:
+        if not _valid_text(self.source_event_id):
+            raise ValueError("templates require a non-empty event_id")
+        if not _valid_text(self.site_id) or not _valid_text(self.profile_version):
+            raise ValueError("templates require non-empty site_id and profile_version")
+        if not _valid_sample_rate(self.sample_rate_hz):
+            raise ValueError("templates require a finite positive sample rate")
+        object.__setattr__(self, "waveform", _normalized_template_array(self.waveform, "waveform"))
+        object.__setattr__(self, "spectrum", _normalized_template_array(self.spectrum, "spectrum"))
+
     @classmethod
     def from_event(
         cls,
@@ -43,19 +53,10 @@ class Template:
         site_id: str = "unknown-site",
         profile_version: str = "unknown-profile",
     ) -> Template:
-        if not _valid_text(event_id):
-            raise ValueError("templates require a non-empty event_id")
-        if not _valid_text(site_id) or not _valid_text(profile_version):
-            raise ValueError("templates require non-empty site_id and profile_version")
-        if not _valid_sample_rate(block.sample_rate_hz):
-            raise ValueError("templates require a finite positive sample rate")
         waveform = _beam_waveform(block)
         if waveform.size == 0:
             raise ValueError("templates require at least one good channel")
         spectrum = np.abs(np.fft.rfft(waveform))
-        spectrum_norm = np.linalg.norm(spectrum)
-        if spectrum_norm > np.finfo(np.float64).eps:
-            spectrum = spectrum / spectrum_norm
         return cls(
             waveform=waveform,
             spectrum=spectrum,
@@ -64,6 +65,16 @@ class Template:
             source_event_id=event_id,
             sample_rate_hz=block.sample_rate_hz,
         )
+
+
+def _normalized_template_array(values: object, name: str) -> np.ndarray:
+    array = np.array(values, dtype=np.float64, copy=True)
+    if array.ndim != 1 or array.size == 0 or not np.isfinite(array).all():
+        raise ValueError(f"templates require a finite non-empty {name}")
+    norm = np.linalg.norm(array)
+    if norm <= np.finfo(np.float64).eps:
+        raise ValueError(f"templates require a non-zero {name}")
+    return array / norm
 
 
 def _beam_waveform(block: PreprocessedBlock) -> np.ndarray:
