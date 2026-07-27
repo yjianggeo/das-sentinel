@@ -55,16 +55,28 @@ def _spectrum(data: np.ndarray, fs: float) -> tuple[np.ndarray, np.ndarray]:
 
 def _propagation(event: EventRecord) -> dict[str, float]:
     metrics: dict[str, float] = {}
+    valid_slowness: float | None = None
     for evidence in sorted(event.evidence, key=lambda item: item.score, reverse=True):
         for key, value in evidence.metrics.items():
-            metrics.setdefault(key, _finite(value))
+            if key != "slowness_s_per_m":
+                metrics.setdefault(key, _finite(value))
+                continue
+            try:
+                raw_slowness = float(value)
+            except (TypeError, ValueError):
+                raw_slowness = 0.0
+            if valid_slowness is None and np.isfinite(raw_slowness):
+                valid_slowness = raw_slowness
+                metrics[key] = raw_slowness
+            else:
+                metrics.setdefault(key, 0.0)
     slowness = metrics.get("slowness_s_per_m", 0.0)
     return {
         "best_slowness_s_per_m": slowness,
         "apparent_velocity_mps": metrics.get("apparent_velocity_mps", 0.0),
         "direction": metrics.get("direction", 0.0),
         "coherence": metrics.get("semblance", metrics.get("coherence", 0.0)),
-        "zero_slowness_flag": float(("slowness_s_per_m" in metrics and abs(slowness) <= np.finfo(float).eps) or any(
+        "zero_slowness_flag": float((valid_slowness is not None and abs(valid_slowness) <= np.finfo(float).eps) or any(
             "zero_slowness" in flag for evidence in event.evidence for flag in evidence.quality_flags
         )),
     }

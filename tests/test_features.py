@@ -77,3 +77,32 @@ def test_impulse_peak_mean_ratio_supports_blast_rule_evidence():
 
     assert features["peak_median_ratio"] > 5.0
     assert score_rules(features, {}).scores[Label.BLAST] == 1.0
+
+
+@pytest.mark.parametrize("slowness", (float("nan"), float("inf"), float("-inf")))
+def test_nonfinite_slowness_does_not_create_common_mode_evidence(slowness):
+    block = preprocessed_block(np.ones((10, 2), dtype=np.float32))
+    event = EventRecord(
+        "nonfinite-slowness", 1_000, 1_010, 1_005, 0, 2,
+        (Candidate("coherence", 1_000, 1_010, 1_005, 0, 2, 0.9,
+                   {"slowness_s_per_m": slowness}),),
+    )
+
+    features = extract_features(block, event)
+    rules = score_rules(features, {})
+
+    assert features["zero_slowness_flag"] == 0.0
+    assert rules.scores[Label.NOISE] == 0.0
+    assert rules.reasons[Label.NOISE] == ()
+
+
+@pytest.mark.parametrize("slowness, flags", ((0.0, ()), (0.001, ("zero_slowness_common_mode",))))
+def test_finite_zero_or_common_mode_quality_flag_marks_zero_slowness(slowness, flags):
+    block = preprocessed_block(np.ones((10, 2), dtype=np.float32))
+    event = EventRecord(
+        "common-mode", 1_000, 1_010, 1_005, 0, 2,
+        (Candidate("coherence", 1_000, 1_010, 1_005, 0, 2, 0.9,
+                   {"slowness_s_per_m": slowness}, flags),),
+    )
+
+    assert extract_features(block, event)["zero_slowness_flag"] == 1.0
