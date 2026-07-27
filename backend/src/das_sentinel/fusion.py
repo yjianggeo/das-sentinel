@@ -86,8 +86,10 @@ def fuse_candidates(
     """Merge compatible detector evidence into stable, reviewable event records."""
     if not math.isfinite(sample_rate_hz) or sample_rate_hz <= 0:
         raise ValueError("sample_rate_hz must be positive and finite")
+    if profile.merge_gap_seconds < 0:
+        raise ValueError("merge_gap_seconds must be nonnegative")
 
-    merge_gap_samples = round(profile.merge_gap_seconds * sample_rate_hz)
+    merge_gap_samples = math.floor(profile.merge_gap_seconds * sample_rate_hz)
     remaining = sorted(candidates, key=_candidate_key)
     groups: list[tuple[Candidate, ...]] = []
     while remaining:

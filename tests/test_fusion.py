@@ -87,6 +87,41 @@ def test_candidates_outside_sample_rate_converted_gap_do_not_merge(profile):
     assert events == []
 
 
+def test_fractional_merge_gap_does_not_round_up_to_an_extra_sample(profile):
+    fractional_gap_profile = profile.model_copy(update={"merge_gap_seconds": 0.006})
+
+    events = fuse_candidates(
+        [candidate("stalta", 100, 150, 0.70), candidate("energy", 151, 200, 0.70)],
+        fractional_gap_profile,
+        100.0,
+        "site-a",
+        "v1",
+    )
+
+    assert events == []
+
+
+def test_fractional_merge_gap_allows_zero_sample_gap(profile):
+    fractional_gap_profile = profile.model_copy(update={"merge_gap_seconds": 0.006})
+
+    events = fuse_candidates(
+        [candidate("stalta", 100, 150, 0.70), candidate("energy", 150, 200, 0.70)],
+        fractional_gap_profile,
+        100.0,
+        "site-a",
+        "v1",
+    )
+
+    assert len(events) == 1
+
+
+def test_rejects_negative_merge_gap(profile):
+    invalid_profile = profile.model_copy(update={"merge_gap_seconds": -0.01})
+
+    with pytest.raises(ValueError, match="merge_gap_seconds must be nonnegative"):
+        fuse_candidates([], invalid_profile, 100.0, "site-a", "v1")
+
+
 def test_spatially_disjoint_candidates_do_not_merge(profile):
     events = fuse_candidates(
         [
