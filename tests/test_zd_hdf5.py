@@ -46,6 +46,39 @@ def test_rejects_file_missing_required_dataset(tmp_path):
         ZdHdf5Reader().read_metadata(path)
 
 
+@pytest.mark.parametrize(
+    ("corruption", "expected_reason"),
+    [
+        ("missing_attribute", "OutputDataRate"),
+        ("dataset_is_group", "RawData"),
+        ("time_axis_mismatch", "dimensions"),
+        ("raw_is_dataset", "Acquisition/Raw[0]"),
+    ],
+)
+def test_probe_rejects_invalid_required_structure(tmp_path, corruption, expected_reason):
+    path = tmp_path / f"{corruption}.h5"
+    write_zd_h5(path)
+    with h5py.File(path, "r+") as handle:
+        acquisition = handle["Acquisition"]
+        raw = acquisition["Raw[0]"]
+        if corruption == "missing_attribute":
+            del raw.attrs["OutputDataRate"]
+        elif corruption == "dataset_is_group":
+            del raw["RawData"]
+            raw.create_group("RawData")
+        elif corruption == "time_axis_mismatch":
+            del raw["RawData"]
+            raw.create_dataset("RawData", data=np.zeros((3, 4), dtype=np.float32))
+        else:
+            del acquisition["Raw[0]"]
+            acquisition.create_dataset("Raw[0]", data=np.zeros(1, dtype=np.float32))
+
+    result = ZdHdf5Reader().probe(path)
+
+    assert not result.supported
+    assert expected_reason in result.reason
+
+
 def test_compares_filename_time_with_source_start_not_block_start(tmp_path):
     matching_path = tmp_path / "20260726T000000Z.h5"
     mismatched_path = tmp_path / "20260726T000001Z.h5"

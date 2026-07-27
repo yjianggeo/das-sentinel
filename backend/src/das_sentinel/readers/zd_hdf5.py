@@ -25,12 +25,28 @@ class ZdHdf5Reader:
         try:
             with h5py.File(path, "r") as handle:
                 raw = handle.get(self.RAW_GROUP)
-                if raw is None:
-                    return ProbeResult(False, self.FORMAT_NAME, f"missing {self.RAW_GROUP}")
-                for dataset_name in (self.DATASET_DATA, self.DATASET_TIME):
-                    if dataset_name not in raw:
-                        return ProbeResult(False, self.FORMAT_NAME, f"missing {dataset_name}")
-        except OSError as error:
+                if not isinstance(raw, h5py.Group):
+                    return ProbeResult(False, self.FORMAT_NAME, f"{self.RAW_GROUP} is not a group")
+                data = raw.get(self.DATASET_DATA)
+                times = raw.get(self.DATASET_TIME)
+                if not isinstance(data, h5py.Dataset):
+                    return ProbeResult(False, self.FORMAT_NAME, f"{self.DATASET_DATA} is not a dataset")
+                if not isinstance(times, h5py.Dataset):
+                    return ProbeResult(False, self.FORMAT_NAME, f"{self.DATASET_TIME} is not a dataset")
+                if data.ndim != 2 or times.ndim != 1:
+                    return ProbeResult(False, self.FORMAT_NAME, "RawData dimensions are invalid")
+                n_time = times.shape[0]
+                if data.shape[0] != n_time and data.shape[1] != n_time:
+                    return ProbeResult(False, self.FORMAT_NAME, "RawData dimensions do not match RawDataTime")
+                for attribute_name in (
+                    self.ATTR_SAMPLE_RATE,
+                    self.ATTR_CHANNEL_SPACING,
+                    self.ATTR_START_LOCUS,
+                    self.ATTR_UNIT,
+                ):
+                    if attribute_name not in raw.attrs:
+                        return ProbeResult(False, self.FORMAT_NAME, f"missing {attribute_name}")
+        except (OSError, TypeError, ValueError) as error:
             return ProbeResult(False, self.FORMAT_NAME, str(error))
         return ProbeResult(True, self.FORMAT_NAME)
 
