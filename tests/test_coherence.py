@@ -154,3 +154,14 @@ def test_coherence_cuda_matches_cpu_or_skips_when_unavailable(moving_wavefront, 
     )
     assert cuda_candidate.score == pytest.approx(cpu_candidate.score, rel=1e-5, abs=1e-6)
     assert cuda_candidate.metrics == pytest.approx(cpu_candidate.metrics, rel=1e-5, abs=1e-6)
+
+
+@pytest.mark.parametrize("threshold", [0.0, -0.01])
+def test_coherence_rejects_nonpositive_threshold_before_scanning(
+    moving_wavefront, profile, cpu_backend, threshold
+):
+    """A nonpositive threshold would make score normalization undefined or misleading."""
+    invalid_profile = profile.model_copy(update={"coherence_threshold": threshold})
+
+    with pytest.raises(ValueError, match="coherence_threshold must be positive"):
+        detect_coherence(moving_wavefront, invalid_profile, cpu_backend)

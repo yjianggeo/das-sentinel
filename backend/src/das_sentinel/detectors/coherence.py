@@ -65,6 +65,8 @@ def detect_coherence(
     block: PreprocessedBlock, profile: ProcessingProfile, backend: ArrayBackend
 ) -> list[Candidate]:
     """Find the most coherent integer-sample spatial moveout in a block."""
+    if profile.coherence_threshold <= 0:
+        raise ValueError("coherence_threshold must be positive")
     if block.backend_name != backend.name:
         raise ValueError("block and backend must use the same array backend")
 
