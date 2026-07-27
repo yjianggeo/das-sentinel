@@ -15,6 +15,14 @@ def _normalize(values: np.ndarray) -> np.ndarray:
     return centered / norm if norm > np.finfo(np.float64).eps else np.zeros_like(centered)
 
 
+def _valid_text(value: str) -> bool:
+    return bool(value and value.strip())
+
+
+def _valid_sample_rate(sample_rate_hz: float) -> bool:
+    return bool(np.isfinite(sample_rate_hz) and sample_rate_hz > 0)
+
+
 @dataclass(frozen=True)
 class Template:
     """A reviewed, site- and profile-scoped normalized beam waveform."""
@@ -35,8 +43,12 @@ class Template:
         site_id: str = "unknown-site",
         profile_version: str = "unknown-profile",
     ) -> Template:
-        if not site_id or not profile_version:
+        if not _valid_text(event_id):
+            raise ValueError("templates require a non-empty event_id")
+        if not _valid_text(site_id) or not _valid_text(profile_version):
             raise ValueError("templates require non-empty site_id and profile_version")
+        if not _valid_sample_rate(block.sample_rate_hz):
+            raise ValueError("templates require a finite positive sample rate")
         waveform = _beam_waveform(block)
         if waveform.size == 0:
             raise ValueError("templates require at least one good channel")
@@ -63,7 +75,11 @@ def _beam_waveform(block: PreprocessedBlock) -> np.ndarray:
 
 def score_template(block: PreprocessedBlock, template: Template) -> float:
     """Return normalized waveform correlation, or zero for incompatible inputs."""
-    if not template.site_id or not template.profile_version:
+    if not _valid_text(template.source_event_id):
+        return 0.0
+    if not _valid_text(template.site_id) or not _valid_text(template.profile_version):
+        return 0.0
+    if not _valid_sample_rate(template.sample_rate_hz) or not _valid_sample_rate(block.sample_rate_hz):
         return 0.0
     if getattr(block, "site_id", template.site_id) != template.site_id:
         return 0.0
@@ -86,7 +102,8 @@ def _energy_image(
         frequency <= min(profile.trajectory_freq_high_hz, block.sample_rate_hz / 2.0)
     )
     filtered = np.fft.irfft(np.fft.rfft(data, axis=0) * band[:, None], n=data.shape[0], axis=0)
-    return np.square(filtered)
+    energy = np.square(filtered)
+    return np.clip(energy - np.median(energy, axis=1, keepdims=True), 0.0, None)
 
 
 def _line_energy(
