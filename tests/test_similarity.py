@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import pytest
 from das_sentinel.classifiers.similarity import FeatureVectorizer, SimilarityIndex
+from das_sentinel.domain import Label
 
 
 @dataclass(frozen=True)
@@ -24,8 +25,10 @@ def test_similarity_returns_cluster_and_reviewed_neighbors(feature_rows):
     result = index.query(feature_rows[0].features, limit=3)
 
     assert result.cluster_id is not None
+    assert not isinstance(result.cluster_id, Label)
     assert result.neighbors[0].event_id == feature_rows[0].event_id
     assert result.neighbors[0].distance == pytest.approx(0.0)
+    assert 0.0 <= result.outlier_score <= 1.0
 
 
 def test_vectorizer_rejects_unapproved_or_string_features():

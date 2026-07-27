@@ -17,6 +17,7 @@ dependencies = [
   "scipy>=1.14",
   "h5py>=3.12",
   "scikit-learn>=1.6",
+  "skops>=0.14",
   "matplotlib>=3.9",
   "pysqlite3-binary>=0.5.4; platform_system == 'Linux' and platform_machine == 'x86_64'",
   "argon2-cffi>=23.1",

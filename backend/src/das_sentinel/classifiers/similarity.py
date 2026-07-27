@@ -57,6 +57,7 @@ class SimilarNeighbor:
 class SimilarityResult:
     cluster_id: int
     neighbors: tuple[SimilarNeighbor, ...]
+    outlier_score: float
 
 
 class SimilarityIndex:
@@ -68,6 +69,7 @@ class SimilarityIndex:
         self._rows: tuple[Any, ...] = ()
         self._scaled = np.empty((0, len(self._vectorizer.feature_names)))
         self._cluster_ids = np.empty(0, dtype=int)
+        self._outlier_scores = np.empty(0, dtype=np.float64)
 
     def fit(self, rows: Iterable[Any]) -> SimilarityIndex:
         self._rows = tuple(rows)
@@ -77,9 +79,12 @@ class SimilarityIndex:
         self._scaled = self._scaler.fit_transform(vectors)
         if len(self._rows) == 1:
             self._cluster_ids = np.array([-1], dtype=int)
+            self._outlier_scores = np.array([1.0])
         else:
             clusterer = HDBSCAN(min_cluster_size=min(5, len(self._rows)), allow_single_cluster=True, copy=False)
             self._cluster_ids = clusterer.fit_predict(self._scaled)
+            probabilities = np.asarray(clusterer.probabilities_, dtype=np.float64)
+            self._outlier_scores = np.clip(np.where(np.isfinite(probabilities), 1.0 - probabilities, 1.0), 0.0, 1.0)
         return self
 
     def query(self, features: Mapping[str, Any], limit: int = 5) -> SimilarityResult:
@@ -91,4 +96,4 @@ class SimilarityIndex:
         distances = pairwise_distances(query, self._scaled, metric="euclidean")[0]
         indices = np.argsort(distances, kind="stable")[:limit]
         neighbors = tuple(SimilarNeighbor(str(self._rows[index].event_id), float(distances[index])) for index in indices)
-        return SimilarityResult(int(self._cluster_ids[indices[0]]), neighbors)
+        return SimilarityResult(int(self._cluster_ids[indices[0]]), neighbors, float(self._outlier_scores[indices[0]]))
