@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import multiprocessing
@@ -230,6 +231,30 @@ def test_store_rejects_concurrent_different_content_without_wrong_digest(tmp_pat
     thread.join()
     assert first.sha256 == hashlib.sha256(first.path.read_bytes()).hexdigest()
     assert len(outcomes) == 1 and isinstance(outcomes[0], ArtifactConflictError)
+
+
+def test_store_rejects_lock_symlink_without_modifying_external_file(tmp_path):
+    """Following a pre-positioned lock symlink outside the artifact root must make this fail."""
+    from das_sentinel.artifacts import ArtifactStore
+
+    root = tmp_path / "artifacts"
+    event_dir = root / EVENT_ID
+    event_dir.mkdir(parents=True)
+    sentinel = tmp_path / "sentinel"
+    sentinel.write_bytes(b"sentinel-bytes")
+    lock_path = event_dir / "evidence.json.lock"
+    try:
+        lock_path.symlink_to(sentinel)
+    except OSError as error:
+        if error.errno in {errno.EACCES, errno.EPERM} or getattr(error, "winerror", None) == 1314:
+            pytest.skip(f"symbolic links are not permitted: {error}")
+        raise
+
+    with pytest.raises(OSError):
+        ArtifactStore(root).write(EVENT_ID, "evidence", b"artifact", "application/json")
+
+    assert sentinel.read_bytes() == b"sentinel-bytes"
+    assert not (event_dir / "evidence.json").exists()
 
 
 def test_store_serializes_real_processes_for_conflicting_bytes(tmp_path):

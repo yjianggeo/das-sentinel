@@ -4,6 +4,7 @@ import errno
 import hashlib
 import json
 import os
+import stat
 import tempfile
 import time
 from collections.abc import Mapping
@@ -177,13 +178,10 @@ def _finite_float_copy(values: Any, name: str) -> np.ndarray:
 
 @contextmanager
 def _process_lock(path: Path):
-    lock_file = open(path, "a+b")  # noqa: SIM115 - lock lifetime crosses yield.
+    lock_file = _open_lock_file(path)
     try:
         if os.name == "nt":
             import msvcrt
-            lock_file.seek(0)
-            lock_file.write(b"0")
-            lock_file.flush()
             lock_file.seek(0)
             while True:
                 try:
@@ -204,6 +202,92 @@ def _process_lock(path: Path):
         else:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
         lock_file.close()
+
+
+def _open_lock_file(path: Path):
+    if os.name != "nt":
+        flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_CLOEXEC
+        descriptor = os.open(path, flags, 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise OSError(errno.EINVAL, "lock path must be a regular file", path)
+            return os.fdopen(descriptor, "r+b")
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    get_information = kernel32.GetFileInformationByHandle
+    get_information.argtypes = [wintypes.HANDLE, ctypes.POINTER(ByHandleFileInformation)]
+    get_information.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    generic_read_write = 0x80000000 | 0x40000000
+    share_read_write = 0x00000001 | 0x00000002
+    open_always = 4
+    file_attribute_normal = 0x00000080
+    file_flag_open_reparse_point = 0x00200000
+    handle = create_file(
+        str(path),
+        generic_read_write,
+        share_read_write,
+        None,
+        open_always,
+        file_attribute_normal | file_flag_open_reparse_point,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        information = ByHandleFileInformation()
+        if not get_information(handle, ctypes.byref(information)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        file_attribute_directory = 0x00000010
+        file_attribute_reparse_point = 0x00000400
+        if information.file_attributes & (file_attribute_directory | file_attribute_reparse_point):
+            raise OSError(errno.ELOOP, "lock path must be a regular non-reparse file", path)
+        descriptor = msvcrt.open_osfhandle(handle, os.O_RDWR | os.O_BINARY)
+        handle = None
+        try:
+            return os.fdopen(descriptor, "r+b")
+        except BaseException:
+            os.close(descriptor)
+            raise
+    finally:
+        if handle is not None:
+            close_handle(handle)
 
 
 def _event_selection(data: EventArtifactData, event: EventRecord) -> tuple[slice, np.ndarray]:
