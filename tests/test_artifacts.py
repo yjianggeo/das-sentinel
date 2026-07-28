@@ -44,7 +44,9 @@ def _artifact_data():
         start_time_utc=datetime(2026, 7, 26, 12, 0, tzinfo=UTC),
         site_timezone="Asia/Shanghai",
         profile={"name": "default"},
+        profile_version="profile-1",
         pipeline_version="v1",
+        model_version="rules-only",
         backend_name="cpu",
         rule_output={"label": "traffic", "score": 0.9},
         model_output={"label": "traffic", "score": float("nan")},
@@ -67,6 +69,9 @@ def test_renders_complete_event_artifact_set_with_distinct_raw_and_filtered_inpu
         assert artifact.sha256 == hashlib.sha256(artifact.path.read_bytes()).hexdigest()
     evidence = json.loads(manifest.files["evidence"].path.read_text("utf-8"))
     assert evidence["event_id"] == EVENT_ID
+    assert evidence["profile_version"] == "profile-1"
+    assert evidence["pipeline_version"] == "v1"
+    assert evidence["model_version"] == "rules-only"
     assert evidence["source_range"]["sample_rate_hz"] == 100.0
     assert evidence["quality_flags"]["bad_channel_count"] == 1
     assert evidence["input_sha256"]["raw"] == hashlib.sha256(data.raw_data.tobytes()).hexdigest()

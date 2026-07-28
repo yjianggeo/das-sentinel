@@ -6,6 +6,7 @@ import os
 import tempfile
 import threading
 from collections.abc import Mapping
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime, timedelta
 from enum import Enum
@@ -37,7 +38,9 @@ class EventArtifactData:
     start_time_utc: datetime
     site_timezone: str
     profile: Mapping[str, Any]
+    profile_version: str
     pipeline_version: str
+    model_version: str
     backend_name: str
     rule_output: Mapping[str, Any]
     model_output: Mapping[str, Any] | None = None
@@ -63,8 +66,8 @@ class EventArtifactData:
             ZoneInfo(self.site_timezone)
         except ZoneInfoNotFoundError as error:
             raise ValueError("site_timezone must be a valid IANA timezone") from error
-        if not self.pipeline_version or not self.backend_name:
-            raise ValueError("pipeline_version and backend_name must be non-empty")
+        if not self.profile_version or not self.pipeline_version or not self.model_version or not self.backend_name:
+            raise ValueError("profile_version, pipeline_version, model_version, and backend_name must be non-empty")
         object.__setattr__(self, "raw_data", raw)
         object.__setattr__(self, "filtered_data", filtered)
         object.__setattr__(self, "channel_distance_m", distance)
@@ -118,28 +121,28 @@ class ArtifactStore:
         target = (event_dir / f"{kind}{self._suffixes[kind]}").resolve()
         if target.parent != event_dir:
             raise ValueError("artifact path escapes event directory")
-        with self._lock_for(target):
-            digest = hashlib.sha256(content).hexdigest()
-            if target.exists():
+        with self._lock_for(target), _process_lock(target.with_suffix(target.suffix + ".lock")):
+                digest = hashlib.sha256(content).hexdigest()
+                if target.exists():
+                    final_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                    if final_digest == digest:
+                        return ArtifactFile(kind, target, media_type, final_digest)
+                    raise ArtifactConflictError(f"artifact already exists with different bytes: {kind}")
+                descriptor, temporary_name = tempfile.mkstemp(prefix=f".{kind}-", suffix=".tmp", dir=event_dir)
+                temporary = Path(temporary_name)
+                try:
+                    with os.fdopen(descriptor, "wb") as stream:
+                        stream.write(content)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.replace(temporary, target)
+                finally:
+                    if temporary.exists():
+                        temporary.unlink()
                 final_digest = hashlib.sha256(target.read_bytes()).hexdigest()
-                if final_digest == digest:
-                    return ArtifactFile(kind, target, media_type, final_digest)
-                raise ArtifactConflictError(f"artifact already exists with different bytes: {kind}")
-            descriptor, temporary_name = tempfile.mkstemp(prefix=f".{kind}-", suffix=".tmp", dir=event_dir)
-            temporary = Path(temporary_name)
-            try:
-                with os.fdopen(descriptor, "wb") as stream:
-                    stream.write(content)
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.replace(temporary, target)
-            finally:
-                if temporary.exists():
-                    temporary.unlink()
-            final_digest = hashlib.sha256(target.read_bytes()).hexdigest()
-            if final_digest != digest:
-                raise RuntimeError("artifact bytes changed during atomic write")
-            return ArtifactFile(kind, target, media_type, final_digest)
+                if final_digest != digest:
+                    raise RuntimeError("artifact bytes changed during atomic write")
+                return ArtifactFile(kind, target, media_type, final_digest)
 
     @classmethod
     def _lock_for(cls, target: Path) -> threading.Lock:
@@ -177,6 +180,30 @@ def _finite_float_copy(values: Any, name: str) -> np.ndarray:
         raise ValueError(f"{name} must be a floating-point array")
     result = array.copy()
     return result
+
+
+@contextmanager
+def _process_lock(path: Path):
+    path.touch(exist_ok=True)
+    with open(path, "r+b") as lock_file:
+        if os.name == "nt":
+            import msvcrt
+            lock_file.seek(0)
+            lock_file.write(b"0")
+            lock_file.flush()
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _event_selection(data: EventArtifactData, event: EventRecord) -> tuple[slice, np.ndarray]:
@@ -236,7 +263,7 @@ def _waterfall_png(values: np.ndarray, dates: np.ndarray, distances: np.ndarray,
     image = _waterfall_mesh(axis, values, mdates.date2num(dates), distances, low, high)
     figure.colorbar(image, ax=axis, label="Amplitude")
     axis.set_ylabel("Distance (m)")
-    axis.set_title(f"{title} | {data.sample_rate_hz:g} Hz | input unit")
+    axis.set_title(f"{title} | {_versions(data)} | {data.sample_rate_hz:g} Hz | input unit")
     _time_axes(axis, dates, data.site_timezone)
     return _png(figure)
 
@@ -265,9 +292,10 @@ def _waveform_png(values: np.ndarray, dates: np.ndarray, data: EventArtifactData
     for sample, label in ((event.start_sample, "event start"), (event.end_sample, "event end"), (event.peak_sample, "event peak")):
         axis.axvline(mdates.date2num(data.start_time_utc + timedelta(seconds=(sample - data.sample_offset) / data.sample_rate_hz)), label=label, linewidth=0.8)
     for candidate in event.evidence:
+        axis.axvspan(mdates.date2num(data.start_time_utc + timedelta(seconds=(candidate.start_sample - data.sample_offset) / data.sample_rate_hz)), mdates.date2num(data.start_time_utc + timedelta(seconds=(candidate.end_sample - data.sample_offset) / data.sample_rate_hz)), alpha=0.1, label=f"{candidate.detector} span")
         axis.axvline(mdates.date2num(data.start_time_utc + timedelta(seconds=(candidate.peak_sample - data.sample_offset) / data.sample_rate_hz)), label=f"{candidate.detector} peak", linestyle="--", linewidth=0.7)
     axis.legend(fontsize="x-small")
-    axis.set_title(f"Robust filtered good-channel beam | samples {data.sample_offset + samples.start}:{data.sample_offset + samples.stop}")
+    axis.set_title(f"Robust filtered good-channel beam | {_versions(data)} | samples {data.sample_offset + samples.start}:{data.sample_offset + samples.stop}")
     _time_axes(axis, dates, data.site_timezone)
     return _png(figure)
 
@@ -275,14 +303,14 @@ def _waveform_png(values: np.ndarray, dates: np.ndarray, data: EventArtifactData
 def _psd_png(values: np.ndarray, data: EventArtifactData, features: Mapping[str, Any]) -> bytes:
     samples = len(values)
     nperseg = min(samples, max(1, round(data.sample_rate_hz * 2)))
-    frequency, power = welch(values, fs=data.sample_rate_hz, nperseg=nperseg)
+    frequency, power = welch(values.astype(np.float64, copy=False), fs=data.sample_rate_hz, nperseg=nperseg)
     figure, axis = plt.subplots(figsize=(7, 3))
-    axis.semilogy(frequency, np.maximum(power, np.finfo(float).tiny))
+    axis.semilogy(frequency, np.maximum(power, np.finfo(np.float64).tiny))
     dominant = features.get("dominant_frequency_hz")
     if isinstance(dominant, (int, float)) and np.isfinite(dominant):
         axis.axvline(dominant, color="tab:red", label="dominant frequency")
         axis.legend(fontsize="x-small")
-    axis.set(xlabel="Frequency (Hz)", ylabel="PSD (amplitude^2/Hz)", title=f"Welch PSD | {data.profile.get('energy_bands_hz', ())} | {data.pipeline_version} | {data.model_output or 'no model'}")
+    axis.set(xlabel="Frequency (Hz)", ylabel="PSD (amplitude^2/Hz)", title=f"Welch PSD | {data.profile.get('energy_bands_hz', ())} | {_versions(data)}")
     return _png(figure)
 
 
@@ -294,8 +322,12 @@ def _stft_png(values: np.ndarray, data: EventArtifactData) -> bytes:
     figure, axis = plt.subplots(figsize=(7, 3))
     image = axis.pcolormesh(times, frequency, np.abs(spectrum) ** 2, shading="auto")
     figure.colorbar(image, ax=axis, label="Energy")
-    axis.set(xlabel="Time from event window start (s)", ylabel="Frequency (Hz)", title=f"STFT energy | {data.pipeline_version}")
+    axis.set(xlabel="Time from event window start (s)", ylabel="Frequency (Hz)", title=f"STFT energy | {_versions(data)}")
     return _png(figure)
+
+
+def _versions(data: EventArtifactData) -> str:
+    return f"profile={data.profile_version} pipeline={data.pipeline_version} model={data.model_version}"
 
 
 def _json_value(value: Any) -> Any:
@@ -328,7 +360,9 @@ def _evidence(data: EventArtifactData, event: EventRecord, features: Mapping[str
     return _json_value({
         "event_id": event.event_id,
         "profile": data.profile,
+        "profile_version": data.profile_version,
         "pipeline_version": data.pipeline_version,
+        "model_version": data.model_version,
         "backend": data.backend_name,
         "source_range": {"sample_start": data.sample_offset + samples.start, "sample_stop": data.sample_offset + samples.stop, "sample_rate_hz": data.sample_rate_hz, "channel_indices": channels.tolist(), "distance_m": data.channel_distance_m[channels].tolist(), "start_time_utc": data.start_time_utc.isoformat(), "site_timezone": data.site_timezone},
         "detections": [asdict(candidate) for candidate in event.evidence],
