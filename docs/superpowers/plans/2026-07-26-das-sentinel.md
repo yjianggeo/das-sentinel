@@ -355,7 +355,8 @@ git commit -m "feat(core): add settings and DAS domain contracts"
 
 **Interfaces:**
 - Consumes: `DasMetadata`, `DasBlock`.
-- Produces: `DasReader` protocol, `ReaderRegistry`, `ZdHdf5Reader.probe/read_metadata/read_block`.
+- Produces: `DasReader` protocol, `ReaderRegistry`,
+  `ZdHdf5Reader.probe/read_metadata/sample_count/read_block`.
 
 - [ ] **Step 1: Add a synthetic HDF5 fixture and failing reader tests**
 
@@ -418,6 +419,7 @@ class ProbeResult:
 class DasReader(Protocol):
     def probe(self, path: Path) -> ProbeResult: ...
     def read_metadata(self, path: Path) -> DasMetadata: ...
+    def sample_count(self, path: Path) -> int: ...
     def read_block(self, path: Path, sample_start: int, sample_stop: int,
                    channel_slice: slice = slice(None)) -> DasBlock: ...
 
@@ -980,7 +982,15 @@ git commit -m "feat(artifacts): render waterfall and spectral products"
 - Create: `tests/test_performance.py`
 
 **Interfaces:**
-- Produces: `FileAnalysis`, `analyze_file(path, reader, profile, backend, artifact_root)`.
+- Produces: `AnalysisContext`, `FileAnalysis`,
+  `analyze_file(path, reader, profile, backend, artifact_root, context=None)`.
+- `AnalysisContext` explicitly carries the stable run identity and site metadata required
+  by fusion, features, and artifacts: `site_id`, IANA `site_timezone`,
+  `profile_version`, `pipeline_version`, `cable_type`, `device_config`, and
+  `rule_profile`. Defaults are stable (`unknown-site`, `UTC`, `profile-v1`,
+  `pipeline-v1`, unknown cable/device, and an empty rule profile), so the original
+  five-argument call remains valid. Task 11 is rules-only and records model version
+  `rules-only`; later worker/model tasks may extend model inputs explicitly.
 
 - [ ] **Step 1: Add failing cross-block and idempotent-result tests**
 
@@ -1019,12 +1029,13 @@ class FileAnalysis:
     artifacts: tuple[ArtifactManifest, ...]
 ```
 
-Read 20-second blocks with 5-second overlap, preprocess once per detector frequency bank,
-run the enabled detectors, translate to file-global indexes, fuse after all blocks, extract
-features from event windows, classify, and render only fused review events. For each
-rendered event, assemble one `EventArtifactData` from the true raw samples and the matching
-filtered samples, preserving their shared sample/channel coordinates plus UTC and site
-timezone metadata. Return audit
+Use `reader.sample_count(path)` to include the final partial block without bypassing the
+reader abstraction. Read 20-second blocks with 5-second overlap, preprocess once per
+detector frequency bank, run the enabled detectors, translate to file-global indexes,
+fuse after all blocks, extract features from event windows, classify, and render only
+fused review events. For each rendered event, assemble one `EventArtifactData` from the
+true raw samples and the matching filtered samples, preserving their shared sample/channel
+coordinates plus UTC and site timezone metadata from `AnalysisContext`. Return audit
 candidates separately from review events. `FileAnalysis` contains source fingerprint,
 metadata warnings, events, audit candidate count, timings, actual backend, and artifact
 manifests.
