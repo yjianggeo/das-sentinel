@@ -2,8 +2,11 @@ import json
 import pickle
 import zipfile
 from dataclasses import dataclass
+from hashlib import sha256
+from io import BytesIO
 from pathlib import Path
 
+import numpy as np
 import pytest
 from das_sentinel.classifiers.supervised import (
     TrainingGateError,
@@ -12,6 +15,8 @@ from das_sentinel.classifiers.supervised import (
     train_model,
 )
 from das_sentinel.domain import Label
+from sklearn.ensemble import RandomForestClassifier
+from skops.io import dumps as skops_dumps
 
 
 def _write_sentinel(path: str) -> None:
@@ -82,10 +87,10 @@ def test_publishable_report_meets_all_gates_and_bundle_schema_is_checked(tmp_pat
     assert 0.0 <= report.rule_baseline_macro_f1 <= 1.0
     assert bundle.feature_names == tuple(sorted(rows[0].features))
     path = tmp_path / "model.joblib"
-    save_model_bundle(bundle, path)
-    assert load_model_bundle(path, expected_feature_names=bundle.feature_names).feature_schema_version == bundle.feature_schema_version
+    digest = save_model_bundle(bundle, path)
+    assert load_model_bundle(path, expected_feature_names=bundle.feature_names, expected_sha256=digest).feature_schema_version == bundle.feature_schema_version
     with pytest.raises(ValueError, match="feature schema"):
-        load_model_bundle(path, expected_feature_names=("rms",))
+        load_model_bundle(path, expected_feature_names=("rms",), expected_sha256=digest)
 
 
 def test_load_rejects_pickle_without_executing_it(tmp_path: Path):
@@ -94,7 +99,7 @@ def test_load_rejects_pickle_without_executing_it(tmp_path: Path):
     path.write_bytes(pickle.dumps(_MaliciousPickle(sentinel)))
 
     with pytest.raises((ValueError, TypeError)):
-        load_model_bundle(path, expected_feature_names=("duration_s", "rms"))
+        load_model_bundle(path, expected_feature_names=("duration_s", "rms"), expected_sha256="0" * 64)
 
     assert not sentinel.exists()
 
@@ -113,7 +118,7 @@ def test_load_rejects_tampered_bundle_members(tmp_path: Path, member: str):
             archive.writestr(name, value)
 
     with pytest.raises((ValueError, TypeError)):
-        load_model_bundle(path, expected_feature_names=bundle.feature_names)
+        load_model_bundle(path, expected_feature_names=bundle.feature_names, expected_sha256=sha256(path.read_bytes()).hexdigest())
 
 
 def test_load_rejects_tampered_sklearn_version(tmp_path: Path):
@@ -130,7 +135,7 @@ def test_load_rejects_tampered_sklearn_version(tmp_path: Path):
         archive.writestr("model.skops", model)
 
     with pytest.raises(ValueError, match="sklearn version"):
-        load_model_bundle(path, expected_feature_names=bundle.feature_names)
+        load_model_bundle(path, expected_feature_names=bundle.feature_names, expected_sha256=sha256(path.read_bytes()).hexdigest())
 
 
 def test_snapshot_hash_is_stable_when_rows_and_groups_are_reordered():
@@ -141,3 +146,72 @@ def test_snapshot_hash_is_stable_when_rows_and_groups_are_reordered():
     second, _ = train_model(list(reversed(rows)), groups=list(reversed(groups)))
 
     assert first.training_snapshot_hash == second.training_snapshot_hash
+
+
+def _replace_model(path: Path, model_bytes: bytes) -> str:
+    with zipfile.ZipFile(path) as archive:
+        metadata = archive.read("metadata.json")
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("metadata.json", metadata)
+        archive.writestr("model.skops", model_bytes)
+    return sha256(path.read_bytes()).hexdigest()
+
+
+def _approved_model(feature_count: int) -> RandomForestClassifier:
+    rows = np.arange(16 * feature_count, dtype=float).reshape(16, feature_count)
+    labels = np.array(["earthquake", "blast", "traffic", "noise"] * 4)
+    return RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=20260726, n_jobs=1).fit(rows, labels)
+
+
+def test_load_rejects_legitimate_model_replacement_before_parsing(tmp_path: Path):
+    rows = _rows(20)
+    bundle, _ = train_model(rows, groups=[row.day for row in rows])
+    path = tmp_path / "model.bundle"
+    digest = save_model_bundle(bundle, path)
+    _replace_model(path, skops_dumps(_approved_model(2)))
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        load_model_bundle(path, expected_feature_names=bundle.feature_names, expected_sha256=digest)
+
+
+def test_load_rejects_replacement_with_wrong_feature_dimension_after_hash_check(tmp_path: Path):
+    rows = _rows(20)
+    bundle, _ = train_model(rows, groups=[row.day for row in rows])
+    path = tmp_path / "model.bundle"
+    save_model_bundle(bundle, path)
+    replacement_digest = _replace_model(path, skops_dumps(_approved_model(3)))
+
+    with pytest.raises(ValueError, match="feature count"):
+        load_model_bundle(path, expected_feature_names=bundle.feature_names, expected_sha256=replacement_digest)
+
+
+def test_load_rejects_inner_skops_zip_bomb_before_skops_parsing(tmp_path: Path):
+    rows = _rows(20)
+    bundle, _ = train_model(rows, groups=[row.day for row in rows])
+    path = tmp_path / "model.bundle"
+    save_model_bundle(bundle, path)
+    payload = BytesIO()
+    with zipfile.ZipFile(payload, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr("schema.json", b"0" * (1024 * 1024))
+    digest = _replace_model(path, payload.getvalue())
+
+    with pytest.raises(ValueError, match="skops archive"):
+        load_model_bundle(path, expected_feature_names=bundle.feature_names, expected_sha256=digest)
+
+
+def test_rule_profile_changes_baseline_and_snapshot_binding():
+    rows = [
+        TrainingRow(row.event_id, row.label, row.features | {"apparent_velocity_mps": 10.0 if row.label is Label.TRAFFIC else 0.0, "continuity": 0.5}, row.day)
+        for row in _rows(20)
+    ]
+    groups = [row.day for row in rows]
+
+    default_bundle, default_report = train_model(rows, groups=groups)
+    custom_bundle, custom_report = train_model(
+        rows, groups=groups, rule_profile={"traffic_velocity_mps": (100.0, 200.0)}, rule_profile_version="traffic-off",
+    )
+
+    assert default_report.rule_baseline_macro_f1 != custom_report.rule_baseline_macro_f1
+    assert default_bundle.training_snapshot_hash != custom_bundle.training_snapshot_hash
+    assert custom_report.rule_profile == {"traffic_velocity_mps": [100.0, 200.0]}
+    assert custom_report.rule_profile_version == "traffic-off"
