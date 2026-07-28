@@ -903,13 +903,19 @@ git commit -m "feat(ml): add similarity and supervised model gates"
 - Create: `tests/test_artifacts.py`
 
 **Interfaces:**
-- Produces: `ArtifactManifest`, `render_event_artifacts(block, event, features, out_dir)`.
+- Produces: `EventArtifactData`, `ArtifactManifest`,
+  `render_event_artifacts(data, event, features, out_dir)`.
+- `EventArtifactData` explicitly carries distinct `raw_data` and `filtered_data` arrays,
+  `sample_offset`, `sample_rate_hz`, `channel_distance_m`, `bad_channel_mask`,
+  `start_time_utc`, IANA `site_timezone`, `profile`, `pipeline_version`,
+  `backend_name`, `rule_output`, and optional `model_output`. The two arrays must have
+  the same `[time, channel]` shape; rendering must never relabel filtered data as raw.
 
 - [ ] **Step 1: Add failing artifact tests**
 
 ```python
-def test_renders_complete_event_artifact_set(tmp_path, event_block, event, features):
-    manifest = render_event_artifacts(event_block, event, features, tmp_path)
+def test_renders_complete_event_artifact_set(tmp_path, event_artifact_data, event, features):
+    manifest = render_event_artifacts(event_artifact_data, event, features, tmp_path)
     assert set(manifest.files) == {
         "waterfall_raw", "waterfall_filtered", "waveform", "psd", "stft", "evidence"
     }
@@ -1012,7 +1018,10 @@ class FileAnalysis:
 
 Read 20-second blocks with 5-second overlap, preprocess once per detector frequency bank,
 run the enabled detectors, translate to file-global indexes, fuse after all blocks, extract
-features from event windows, classify, and render only fused review events. Return audit
+features from event windows, classify, and render only fused review events. For each
+rendered event, assemble one `EventArtifactData` from the true raw samples and the matching
+filtered samples, preserving their shared sample/channel coordinates plus UTC and site
+timezone metadata. Return audit
 candidates separately from review events. `FileAnalysis` contains source fingerprint,
 metadata warnings, events, audit candidate count, timings, actual backend, and artifact
 manifests.
