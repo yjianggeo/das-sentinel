@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
 import tempfile
-import threading
 import time
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -101,8 +101,6 @@ class ArtifactStore:
         "waterfall_raw": ".png", "waterfall_filtered": ".png", "waveform": ".png",
         "psd": ".png", "stft": ".png", "evidence": ".json",
     }
-    _locks: ClassVar[dict[Path, threading.Lock]] = {}
-    _locks_guard: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root).resolve()
@@ -122,7 +120,7 @@ class ArtifactStore:
         target = (event_dir / f"{kind}{self._suffixes[kind]}").resolve()
         if target.parent != event_dir:
             raise ValueError("artifact path escapes event directory")
-        with self._lock_for(target), _process_lock(target.with_suffix(target.suffix + ".lock")):
+        with _process_lock(target.with_suffix(target.suffix + ".lock")):
                 digest = hashlib.sha256(content).hexdigest()
                 if target.exists():
                     final_digest = hashlib.sha256(target.read_bytes()).hexdigest()
@@ -144,12 +142,6 @@ class ArtifactStore:
                 if final_digest != digest:
                     raise RuntimeError("artifact bytes changed during atomic write")
                 return ArtifactFile(kind, target, media_type, final_digest)
-
-    @classmethod
-    def _lock_for(cls, target: Path) -> threading.Lock:
-        with cls._locks_guard:
-            return cls._locks.setdefault(target, threading.Lock())
-
 
 def render_event_artifacts(
     data: EventArtifactData, event: EventRecord, features: Mapping[str, Any], out_dir: Path
@@ -185,20 +177,33 @@ def _finite_float_copy(values: Any, name: str) -> np.ndarray:
 
 @contextmanager
 def _process_lock(path: Path):
-    deadline = time.monotonic() + 10
-    while True:
-        try:
-            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError:
-            if time.monotonic() >= deadline:
-                raise
-            time.sleep(0.01)
+    lock_file = open(path, "a+b")
     try:
-        os.close(descriptor)
+        if os.name == "nt":
+            import msvcrt
+            lock_file.seek(0)
+            lock_file.write(b"0")
+            lock_file.flush()
+            lock_file.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as error:
+                    if error.errno not in {errno.EACCES, errno.EDEADLK}:
+                        raise
+                    time.sleep(0.01)
+        else:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         yield
     finally:
-        path.unlink(missing_ok=True)
+        if os.name == "nt":
+            lock_file.seek(0)
+            msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
 
 
 def _event_selection(data: EventArtifactData, event: EventRecord) -> tuple[slice, np.ndarray]:
@@ -230,9 +235,10 @@ def _robust_limits(values: np.ndarray) -> tuple[float, float]:
     return float(lower), float(upper)
 
 
-def _time_axes(axis: Any, dates: np.ndarray, timezone: str) -> None:
+def _time_axes(axis: Any, dates: np.ndarray, timezone: str, sample_rate_hz: float) -> None:
     utc_numbers = mdates.date2num(dates)
-    axis.set_xlim(utc_numbers[0], utc_numbers[-1] if len(utc_numbers) > 1 else utc_numbers[0] + 1 / 86_400)
+    step = 1 / sample_rate_hz / 86_400
+    axis.set_xlim(utc_numbers[0] - step / 2, utc_numbers[-1] + 1.5 * step)
     axis.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S", tz=UTC))
     axis.set_xlabel("UTC time")
     local = axis.twiny()
@@ -259,7 +265,7 @@ def _waterfall_png(values: np.ndarray, dates: np.ndarray, distances: np.ndarray,
     figure.colorbar(image, ax=axis, label="Amplitude")
     axis.set_ylabel("Distance (m)")
     axis.set_title(f"{title} | {_versions(data)} | {data.sample_rate_hz:g} Hz | input unit")
-    _time_axes(axis, dates, data.site_timezone)
+    _time_axes(axis, dates, data.site_timezone, data.sample_rate_hz)
     return _png(figure)
 
 
@@ -291,7 +297,7 @@ def _waveform_png(values: np.ndarray, dates: np.ndarray, data: EventArtifactData
         axis.axvline(mdates.date2num(data.start_time_utc + timedelta(seconds=(candidate.peak_sample - data.sample_offset) / data.sample_rate_hz)), label=f"{candidate.detector} peak", linestyle="--", linewidth=0.7)
     axis.legend(fontsize="x-small")
     axis.set_title(f"Robust filtered good-channel beam | {_versions(data)} | samples {data.sample_offset + samples.start}:{data.sample_offset + samples.stop}")
-    _time_axes(axis, dates, data.site_timezone)
+    _time_axes(axis, dates, data.site_timezone, data.sample_rate_hz)
     return _png(figure)
 
 
