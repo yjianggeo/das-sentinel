@@ -185,35 +185,20 @@ def _finite_float_copy(values: Any, name: str) -> np.ndarray:
 
 @contextmanager
 def _process_lock(path: Path):
-    path.touch(exist_ok=True)
     deadline = time.monotonic() + 10
     while True:
         try:
-            lock_file = open(path, "r+b")  # noqa: SIM115 - retry requires deferred context entry.
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             break
-        except PermissionError:
+        except FileExistsError:
             if time.monotonic() >= deadline:
                 raise
             time.sleep(0.01)
-    with lock_file:
-        if os.name == "nt":
-            import msvcrt
-            lock_file.seek(0)
-            lock_file.write(b"0")
-            lock_file.flush()
-            lock_file.seek(0)
-            msvcrt.locking(lock_file.fileno(), msvcrt.LK_LOCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            yield
-        finally:
-            if os.name == "nt":
-                lock_file.seek(0)
-                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
-            else:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    try:
+        os.close(descriptor)
+        yield
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def _event_selection(data: EventArtifactData, event: EventRecord) -> tuple[slice, np.ndarray]:
