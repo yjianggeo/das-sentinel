@@ -177,7 +177,7 @@ def _finite_float_copy(values: Any, name: str) -> np.ndarray:
 
 @contextmanager
 def _process_lock(path: Path):
-    lock_file = open(path, "a+b")
+    lock_file = open(path, "a+b")  # noqa: SIM115 - lock lifetime crosses yield.
     try:
         if os.name == "nt":
             import msvcrt

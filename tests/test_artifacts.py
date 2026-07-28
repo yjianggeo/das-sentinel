@@ -7,7 +7,7 @@ import os
 import threading
 import warnings
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from enum import Enum
 from pathlib import Path
 
@@ -282,3 +282,31 @@ def test_process_lock_recovers_after_crashed_owner_leaves_lock_file(tmp_path):
     recovered.start(); assert next_acquired.wait(10)
     release.set(); recovered.join(10)
     assert recovered.exitcode == 0
+
+
+def test_waveform_axis_contains_event_and_candidate_exclusive_boundaries(monkeypatch):
+    from das_sentinel import artifacts
+    from matplotlib import dates as mdates
+    from matplotlib import pyplot as plt
+
+    data = _artifact_data()
+    candidate = Candidate("energy", 1_030, 1_070, 1_050, 1, 5, 0.9)
+    event = replace(_event(), evidence=(candidate,))
+    captured = {}
+
+    def capture(figure):
+        captured["axis"] = figure.axes[0]
+        plt.close(figure)
+        return b"png"
+
+    monkeypatch.setattr(artifacts, "_png", capture)
+    dates = artifacts._sample_dates(data, slice(20, 80))
+    artifacts._waveform_png(np.zeros(60), dates, data, event, slice(20, 80))
+    axis = captured["axis"]
+    start = mdates.date2num(data.start_time_utc + timedelta(seconds=.2))
+    end = mdates.date2num(data.start_time_utc + timedelta(seconds=.8))
+    candidate_start = mdates.date2num(data.start_time_utc + timedelta(seconds=.3))
+    candidate_end = mdates.date2num(data.start_time_utc + timedelta(seconds=.7))
+    assert {round(line.get_xdata()[0], 10) for line in axis.lines} >= {round(start, 10), round(end, 10)}
+    assert any(round(patch.get_x(), 10) == round(candidate_start, 10) and round(patch.get_x() + patch.get_width(), 10) == round(candidate_end, 10) for patch in axis.patches)
+    assert axis.get_xlim()[0] < start and axis.get_xlim()[1] > end
