@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
 import threading
 import warnings
 from dataclasses import replace
@@ -14,6 +15,18 @@ import pytest
 from das_sentinel.domain import Candidate, EventRecord
 
 EVENT_ID = "123e4567-e89b-12d3-a456-426614174000"
+
+
+def _process_store_worker(root: str, content: bytes, ready, start, results) -> None:
+    from das_sentinel.artifacts import ArtifactConflictError, ArtifactStore
+
+    ready.set()
+    start.wait(10)
+    try:
+        artifact = ArtifactStore(Path(root)).write(EVENT_ID, "evidence", content, "application/json")
+        results.put(("success", artifact.sha256))
+    except ArtifactConflictError:
+        results.put(("conflict", None))
 
 
 def _event() -> EventRecord:
@@ -205,3 +218,27 @@ def test_store_rejects_concurrent_different_content_without_wrong_digest(tmp_pat
     thread.join()
     assert first.sha256 == hashlib.sha256(first.path.read_bytes()).hexdigest()
     assert len(outcomes) == 1 and isinstance(outcomes[0], ArtifactConflictError)
+
+
+def test_store_serializes_real_processes_for_conflicting_bytes(tmp_path):
+    """Removing the cross-process lock must allow both writers to incorrectly succeed."""
+    context = multiprocessing.get_context("spawn")
+    ready = [context.Event(), context.Event()]
+    start, results = context.Event(), context.Queue()
+    processes = [
+        context.Process(target=_process_store_worker, args=(str(tmp_path), content, signal, start, results))
+        for content, signal in ((b"first", ready[0]), (b"second", ready[1]))
+    ]
+    for process in processes:
+        process.start()
+    assert all(signal.wait(10) for signal in ready)
+    start.set()
+    for process in processes:
+        process.join(20)
+        assert process.exitcode == 0
+    outcomes = [results.get(timeout=5), results.get(timeout=5)]
+    successes = [digest for status, digest in outcomes if status == "success"]
+    assert len(successes) == 1
+    assert sum(status == "conflict" for status, _ in outcomes) == 1
+    target = tmp_path / EVENT_ID / "evidence.json"
+    assert hashlib.sha256(target.read_bytes()).hexdigest() == successes[0]

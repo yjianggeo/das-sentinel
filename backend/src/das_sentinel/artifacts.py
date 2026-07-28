@@ -5,6 +5,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 from collections.abc import Mapping
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, is_dataclass
@@ -185,7 +186,16 @@ def _finite_float_copy(values: Any, name: str) -> np.ndarray:
 @contextmanager
 def _process_lock(path: Path):
     path.touch(exist_ok=True)
-    with open(path, "r+b") as lock_file:
+    deadline = time.monotonic() + 10
+    while True:
+        try:
+            lock_file = open(path, "r+b")  # noqa: SIM115 - retry requires deferred context entry.
+            break
+        except PermissionError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.01)
+    with lock_file:
         if os.name == "nt":
             import msvcrt
             lock_file.seek(0)
