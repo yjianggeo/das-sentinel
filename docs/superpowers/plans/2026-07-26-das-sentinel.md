@@ -907,9 +907,11 @@ git commit -m "feat(ml): add similarity and supervised model gates"
   `render_event_artifacts(data, event, features, out_dir)`.
 - `EventArtifactData` explicitly carries distinct `raw_data` and `filtered_data` arrays,
   `sample_offset`, `sample_rate_hz`, `channel_distance_m`, `bad_channel_mask`,
-  `start_time_utc`, IANA `site_timezone`, `profile`, `pipeline_version`,
-  `backend_name`, `rule_output`, and optional `model_output`. The two arrays must have
-  the same `[time, channel]` shape; rendering must never relabel filtered data as raw.
+  `start_time_utc`, IANA `site_timezone`, `profile`, explicit `profile_version`,
+  `pipeline_version`, explicit `model_version`, `backend_name`, `rule_output`, and
+  optional `model_output`. Use `rules-only` as `model_version` when no learned model
+  participates. The two arrays must have the same `[time, channel]` shape; rendering must
+  never relabel filtered data as raw.
 
 - [ ] **Step 1: Add failing artifact tests**
 
@@ -950,9 +952,10 @@ class ArtifactManifest:
 
 Use Matplotlib `Agg`, robust 1st/99th percentile limits, explicit UTC/local axes, physical
 distance axes, `scipy.signal.welch`, and `scipy.signal.stft`. Write to a temporary sibling
-file and atomically replace the final file. Derive directories from validated event UUIDs,
-not user strings. Evidence JSON includes profile, pipeline, backend, source range,
-detections, features, rule/model outputs, and quality flags.
+file and atomically replace the final file while serializing writers across processes.
+Derive directories from validated event UUIDs, not user strings. Every plot displays the
+profile, pipeline, and model versions. Evidence JSON includes those versions, profile,
+backend, source range, detections, features, rule/model outputs, and quality flags.
 
 - [ ] **Step 4: Run artifact tests**
 
