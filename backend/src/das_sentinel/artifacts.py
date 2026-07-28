@@ -4,9 +4,11 @@ import hashlib
 import json
 import os
 import tempfile
+import threading
 from collections.abc import Mapping
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import UTC, datetime, timedelta
+from enum import Enum
 from pathlib import Path
 from typing import Any, ClassVar
 from uuid import UUID
@@ -84,6 +86,10 @@ class ArtifactManifest:
     files: dict[str, ArtifactFile]
 
 
+class ArtifactConflictError(RuntimeError):
+    """Raised when a stable artifact target already contains different bytes."""
+
+
 class ArtifactStore:
     """Atomically store fixed artifact kinds beneath a validated event UUID."""
 
@@ -91,6 +97,8 @@ class ArtifactStore:
         "waterfall_raw": ".png", "waterfall_filtered": ".png", "waveform": ".png",
         "psd": ".png", "stft": ".png", "evidence": ".json",
     }
+    _locks: ClassVar[dict[Path, threading.Lock]] = {}
+    _locks_guard: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self, root: Path) -> None:
         self.root = Path(root).resolve()
@@ -110,21 +118,33 @@ class ArtifactStore:
         target = (event_dir / f"{kind}{self._suffixes[kind]}").resolve()
         if target.parent != event_dir:
             raise ValueError("artifact path escapes event directory")
-        digest = hashlib.sha256(content).hexdigest()
-        if target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() == digest:
-            return ArtifactFile(kind, target, media_type, digest)
-        descriptor, temporary_name = tempfile.mkstemp(prefix=f".{kind}-", suffix=".tmp", dir=event_dir)
-        temporary = Path(temporary_name)
-        try:
-            with os.fdopen(descriptor, "wb") as stream:
-                stream.write(content)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, target)
-        finally:
-            if temporary.exists():
-                temporary.unlink()
-        return ArtifactFile(kind, target, media_type, digest)
+        with self._lock_for(target):
+            digest = hashlib.sha256(content).hexdigest()
+            if target.exists():
+                final_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+                if final_digest == digest:
+                    return ArtifactFile(kind, target, media_type, final_digest)
+                raise ArtifactConflictError(f"artifact already exists with different bytes: {kind}")
+            descriptor, temporary_name = tempfile.mkstemp(prefix=f".{kind}-", suffix=".tmp", dir=event_dir)
+            temporary = Path(temporary_name)
+            try:
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, target)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+            final_digest = hashlib.sha256(target.read_bytes()).hexdigest()
+            if final_digest != digest:
+                raise RuntimeError("artifact bytes changed during atomic write")
+            return ArtifactFile(kind, target, media_type, final_digest)
+
+    @classmethod
+    def _lock_for(cls, target: Path) -> threading.Lock:
+        with cls._locks_guard:
+            return cls._locks.setdefault(target, threading.Lock())
 
 
 def render_event_artifacts(
@@ -137,13 +157,12 @@ def render_event_artifacts(
     filtered = data.filtered_data[time_slice][:, channels]
     dates = _sample_dates(data, time_slice)
     distances = data.channel_distance_m[channels]
-    representative = channels[len(channels) // 2]
-    waveform = data.filtered_data[time_slice, representative]
+    waveform = _representative_beam(filtered)
     files = {
         "waterfall_raw": store.write(event.event_id, "waterfall_raw", _waterfall_png(raw, dates, distances, data, "Raw waterfall"), "image/png"),
         "waterfall_filtered": store.write(event.event_id, "waterfall_filtered", _waterfall_png(filtered, dates, distances, data, "Filtered waterfall"), "image/png"),
-        "waveform": store.write(event.event_id, "waveform", _waveform_png(waveform, dates, data, representative), "image/png"),
-        "psd": store.write(event.event_id, "psd", _psd_png(waveform, data), "image/png"),
+        "waveform": store.write(event.event_id, "waveform", _waveform_png(waveform, dates, data, event, time_slice), "image/png"),
+        "psd": store.write(event.event_id, "psd", _psd_png(waveform, data, features), "image/png"),
         "stft": store.write(event.event_id, "stft", _stft_png(waveform, data), "image/png"),
     }
     evidence = _evidence(data, event, features, time_slice, channels)
@@ -157,7 +176,6 @@ def _finite_float_copy(values: Any, name: str) -> np.ndarray:
     if not np.issubdtype(array.dtype, np.floating):
         raise ValueError(f"{name} must be a floating-point array")
     result = array.copy()
-    np.nan_to_num(result, copy=False)
     return result
 
 
@@ -176,14 +194,16 @@ def _event_selection(data: EventArtifactData, event: EventRecord) -> tuple[slice
 
 
 def _sample_dates(data: EventArtifactData, samples: slice) -> np.ndarray:
-    start = data.sample_offset + samples.start
-    return np.array([data.start_time_utc + timedelta(seconds=(start + index) / data.sample_rate_hz) for index in range(samples.stop - samples.start)])
+    return np.array([data.start_time_utc + timedelta(seconds=(samples.start + index) / data.sample_rate_hz) for index in range(samples.stop - samples.start)])
 
 
 def _robust_limits(values: np.ndarray) -> tuple[float, float]:
-    lower, upper = np.percentile(values, (1, 99))
-    if not np.isfinite(lower) or not np.isfinite(upper) or lower == upper:
-        center = float(np.nan_to_num(lower))
+    finite = values[np.isfinite(values)]
+    if finite.size == 0:
+        return -1.0, 1.0
+    lower, upper = np.percentile(finite, (1, 99))
+    if lower == upper:
+        center = float(lower)
         return center - 1.0, center + 1.0
     return float(lower), float(upper)
 
@@ -203,20 +223,17 @@ def _png(figure: Any) -> bytes:
     import io
 
     buffer = io.BytesIO()
-    figure.savefig(buffer, format="png", dpi=120, metadata={"Software": "das-sentinel"})
-    plt.close(figure)
-    return buffer.getvalue()
+    try:
+        figure.savefig(buffer, format="png", dpi=120, metadata={"Software": "das-sentinel"})
+        return buffer.getvalue()
+    finally:
+        plt.close(figure)
 
 
 def _waterfall_png(values: np.ndarray, dates: np.ndarray, distances: np.ndarray, data: EventArtifactData, title: str) -> bytes:
     figure, axis = plt.subplots(figsize=(9, 4))
-    left, right = mdates.date2num((dates[0], dates[-1]))
-    if left == right:
-        right += 1 / 86_400
-    low_distance, high_distance = float(np.min(distances)), float(np.max(distances))
-    if low_distance == high_distance:
-        high_distance += 1.0
-    image = axis.imshow(values.T, aspect="auto", origin="lower", extent=(left, right, low_distance, high_distance), vmin=_robust_limits(values)[0], vmax=_robust_limits(values)[1], cmap="viridis")
+    low, high = _robust_limits(values)
+    image = _waterfall_mesh(axis, values, mdates.date2num(dates), distances, low, high)
     figure.colorbar(image, ax=axis, label="Amplitude")
     axis.set_ylabel("Distance (m)")
     axis.set_title(f"{title} | {data.sample_rate_hz:g} Hz | input unit")
@@ -224,40 +241,78 @@ def _waterfall_png(values: np.ndarray, dates: np.ndarray, distances: np.ndarray,
     return _png(figure)
 
 
-def _waveform_png(values: np.ndarray, dates: np.ndarray, data: EventArtifactData, channel: int) -> bytes:
+def _coordinate_edges(values: np.ndarray) -> np.ndarray:
+    if len(values) == 1:
+        return np.array([values[0] - 0.5, values[0] + 0.5])
+    middle = (values[:-1] + values[1:]) / 2
+    return np.concatenate(([values[0] - (middle[0] - values[0])], middle, [values[-1] + (values[-1] - middle[-1])]))
+
+
+def _waterfall_mesh(axis: Any, values: np.ndarray, times: np.ndarray, distances: np.ndarray, low: float, high: float) -> Any:
+    return axis.pcolormesh(_coordinate_edges(times), _coordinate_edges(distances), values.T, shading="flat", vmin=low, vmax=high, cmap="viridis")
+
+
+def _representative_beam(values: np.ndarray) -> np.ndarray:
+    with np.errstate(all="ignore"):
+        beam = np.nanmedian(np.where(np.isfinite(values), values, np.nan), axis=1)
+    return np.where(np.isfinite(beam), beam, 0.0)
+
+
+def _waveform_png(values: np.ndarray, dates: np.ndarray, data: EventArtifactData, event: EventRecord, samples: slice) -> bytes:
     figure, axis = plt.subplots(figsize=(9, 3))
     axis.plot(mdates.date2num(dates), values, linewidth=0.8)
     axis.set_ylabel("Filtered amplitude")
-    axis.set_title(f"Representative good channel {channel} at {data.channel_distance_m[channel]:g} m | {data.sample_rate_hz:g} Hz")
+    for sample, label in ((event.start_sample, "event start"), (event.end_sample, "event end"), (event.peak_sample, "event peak")):
+        axis.axvline(mdates.date2num(data.start_time_utc + timedelta(seconds=(sample - data.sample_offset) / data.sample_rate_hz)), label=label, linewidth=0.8)
+    for candidate in event.evidence:
+        axis.axvline(mdates.date2num(data.start_time_utc + timedelta(seconds=(candidate.peak_sample - data.sample_offset) / data.sample_rate_hz)), label=f"{candidate.detector} peak", linestyle="--", linewidth=0.7)
+    axis.legend(fontsize="x-small")
+    axis.set_title(f"Robust filtered good-channel beam | samples {data.sample_offset + samples.start}:{data.sample_offset + samples.stop}")
     _time_axes(axis, dates, data.site_timezone)
     return _png(figure)
 
 
-def _psd_png(values: np.ndarray, data: EventArtifactData) -> bytes:
+def _psd_png(values: np.ndarray, data: EventArtifactData, features: Mapping[str, Any]) -> bytes:
     samples = len(values)
     nperseg = min(samples, max(1, round(data.sample_rate_hz * 2)))
     frequency, power = welch(values, fs=data.sample_rate_hz, nperseg=nperseg)
     figure, axis = plt.subplots(figsize=(7, 3))
     axis.semilogy(frequency, np.maximum(power, np.finfo(float).tiny))
-    axis.set(xlabel="Frequency (Hz)", ylabel="PSD (amplitude^2/Hz)", title="Welch PSD")
+    dominant = features.get("dominant_frequency_hz")
+    if isinstance(dominant, (int, float)) and np.isfinite(dominant):
+        axis.axvline(dominant, color="tab:red", label="dominant frequency")
+        axis.legend(fontsize="x-small")
+    axis.set(xlabel="Frequency (Hz)", ylabel="PSD (amplitude^2/Hz)", title=f"Welch PSD | {data.profile.get('energy_bands_hz', ())} | {data.pipeline_version} | {data.model_output or 'no model'}")
     return _png(figure)
 
 
 def _stft_png(values: np.ndarray, data: EventArtifactData) -> bytes:
     samples = len(values)
-    nperseg = min(samples, max(1, round(data.sample_rate_hz)))
+    nperseg = min(samples, max(1, samples // 4))
     noverlap = 0 if nperseg == 1 else nperseg // 2
     frequency, times, spectrum = stft(values, fs=data.sample_rate_hz, nperseg=nperseg, noverlap=noverlap)
     figure, axis = plt.subplots(figsize=(7, 3))
-    image = axis.pcolormesh(times, frequency, np.abs(spectrum), shading="auto")
-    figure.colorbar(image, ax=axis, label="Amplitude")
-    axis.set(xlabel="Time from event window start (s)", ylabel="Frequency (Hz)", title="STFT")
+    image = axis.pcolormesh(times, frequency, np.abs(spectrum) ** 2, shading="auto")
+    figure.colorbar(image, ax=axis, label="Energy")
+    axis.set(xlabel="Time from event window start (s)", ylabel="Frequency (Hz)", title=f"STFT energy | {data.pipeline_version}")
     return _png(figure)
 
 
 def _json_value(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return _json_value(value.tolist())
+    if isinstance(value, Enum):
+        return _json_value(value.value)
+    if is_dataclass(value) and not isinstance(value, type):
+        return _json_value(asdict(value))
+    if isinstance(value, datetime):
+        return value.isoformat()
+    if isinstance(value, Path):
+        return str(value)
     if isinstance(value, Mapping):
         return {str(key): _json_value(item) for key, item in value.items()}
+    if isinstance(value, set):
+        return [_json_value(item) for item in sorted(value, key=repr)]
     if isinstance(value, (list, tuple)):
         return [_json_value(item) for item in value]
     if isinstance(value, np.generic):
@@ -266,7 +321,7 @@ def _json_value(value: Any) -> Any:
         return value if np.isfinite(value) else None
     if isinstance(value, (str, int, bool)) or value is None:
         return value
-    return str(value)
+    raise TypeError(f"unsupported JSON evidence value: {type(value).__name__}")
 
 
 def _evidence(data: EventArtifactData, event: EventRecord, features: Mapping[str, Any], samples: slice, channels: np.ndarray) -> dict[str, Any]:
