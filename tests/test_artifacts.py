@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import multiprocessing
+import os
 import threading
 import warnings
 from dataclasses import replace
@@ -27,6 +28,17 @@ def _process_store_worker(root: str, content: bytes, ready, start, results) -> N
         results.put(("success", artifact.sha256))
     except ArtifactConflictError:
         results.put(("conflict", None))
+
+
+def _lock_worker(path: str, attempting, acquired, release, crash: bool) -> None:
+    from das_sentinel.artifacts import _process_lock
+
+    attempting.set()
+    with _process_lock(Path(path)):
+        acquired.set()
+        if crash:
+            os._exit(0)
+        release.wait(10)
 
 
 def _event() -> EventRecord:
@@ -242,3 +254,31 @@ def test_store_serializes_real_processes_for_conflicting_bytes(tmp_path):
     assert sum(status == "conflict" for status, _ in outcomes) == 1
     target = tmp_path / EVENT_ID / "evidence.json"
     assert hashlib.sha256(target.read_bytes()).hexdigest() == successes[0]
+
+
+def test_process_lock_excludes_spawned_contender_until_release(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    lock = str(tmp_path / "artifact.lock")
+    first_attempt, first_acquired, release = context.Event(), context.Event(), context.Event()
+    second_attempt, second_acquired = context.Event(), context.Event()
+    first = context.Process(target=_lock_worker, args=(lock, first_attempt, first_acquired, release, False))
+    second = context.Process(target=_lock_worker, args=(lock, second_attempt, second_acquired, release, False))
+    first.start(); assert first_acquired.wait(10)
+    second.start(); assert second_attempt.wait(10)
+    assert not second_acquired.wait(0.3)
+    release.set(); first.join(10); second.join(10)
+    assert first.exitcode == second.exitcode == 0 and second_acquired.is_set()
+
+
+def test_process_lock_recovers_after_crashed_owner_leaves_lock_file(tmp_path):
+    context = multiprocessing.get_context("spawn")
+    lock = str(tmp_path / "artifact.lock")
+    attempted, acquired, release = context.Event(), context.Event(), context.Event()
+    crashed = context.Process(target=_lock_worker, args=(lock, attempted, acquired, release, True))
+    crashed.start(); assert acquired.wait(10); crashed.join(10)
+    assert crashed.exitcode == 0 and Path(lock).exists()
+    next_attempt, next_acquired = context.Event(), context.Event()
+    recovered = context.Process(target=_lock_worker, args=(lock, next_attempt, next_acquired, release, False))
+    recovered.start(); assert next_acquired.wait(10)
+    release.set(); recovered.join(10)
+    assert recovered.exitcode == 0
