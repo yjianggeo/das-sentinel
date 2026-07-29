@@ -4,8 +4,11 @@ import os
 import subprocess
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from typing import BinaryIO
 
+import h5py
 import pytest
+from das_sentinel.config import ProcessingProfile as ProfileConfig
 from das_sentinel.persistence import (
     Repositories,
     create_local_engine,
@@ -154,20 +157,25 @@ def test_metadata_change_resets_stability_baseline(tmp_path: Path):
 
 
 class _MutatingProbe:
-    def __init__(self) -> None:
+    def __init__(self, path: Path) -> None:
+        self.path = path
         self.calls = 0
 
-    def probe(self, path: Path) -> ProbeResult:
+    def probe(self, source: BinaryIO) -> ProbeResult:
+        del source
         self.calls += 1
-        old_mtime = path.stat().st_mtime_ns
-        os.utime(path, ns=(old_mtime + 1_000_000, old_mtime + 1_000_000))
+        old_mtime = self.path.stat().st_mtime_ns
+        os.utime(
+            self.path,
+            ns=(old_mtime + 1_000_000, old_mtime + 1_000_000),
+        )
         return ProbeResult(True, "test")
 
 
 def test_mutation_during_probe_resets_baseline_and_emits_nothing(tmp_path: Path):
     path = tmp_path / "a.h5"
     write_zd_h5(path)
-    reader = _MutatingProbe()
+    reader = _MutatingProbe(path)
     tracker = StableFileTracker(reader=reader)
 
     assert tracker.observe(path, now=0) is None
@@ -362,6 +370,148 @@ def test_load_site_requires_enabled_site_and_exactly_one_current_profile(
             DiscoveryConfigurationError, match="exactly one current"
         ):
             load_discovery_site(session, missing_id)
+
+
+def test_load_site_rejects_malformed_non_discovery_profile_field(
+    discovery_database,
+    tmp_path: Path,
+):
+    sessions, _ = discovery_database
+    root = tmp_path / "invalid-profile"
+    root.mkdir()
+    with sessions.begin() as session:
+        repositories = Repositories(session)
+        site = repositories.sites.add(
+            name="invalid-profile-site",
+            data_path=str(root),
+            timezone="UTC",
+            cable_type="urban",
+        )
+        repositories.profiles.add(
+            site_id=site.id,
+            version=1,
+            payload={
+                "recursive_discovery": True,
+                "block_seconds": -1,
+            },
+            is_current=True,
+        )
+        site_id = site.id
+
+    with sessions() as session, pytest.raises(
+        DiscoveryConfigurationError, match="processing profile"
+    ):
+        load_discovery_site(session, site_id)
+
+
+def test_load_site_accepts_complete_json_profile_with_energy_band_arrays(
+    discovery_database,
+    tmp_path: Path,
+):
+    sessions, _ = discovery_database
+    root = tmp_path / "complete-profile"
+    root.mkdir()
+    with sessions.begin() as session:
+        repositories = Repositories(session)
+        site = repositories.sites.add(
+            name="complete-profile-site",
+            data_path=str(root),
+            timezone="UTC",
+            cable_type="urban",
+        )
+        repositories.profiles.add(
+            site_id=site.id,
+            version=1,
+            payload=ProfileConfig().model_dump(mode="json"),
+            is_current=True,
+        )
+        site_id = site.id
+
+    with sessions() as session:
+        loaded = load_discovery_site(session, site_id)
+
+    assert loaded.recursive_discovery is True
+
+
+class _ReplacingParentProbe:
+    def __init__(
+        self,
+        parent: Path,
+        moved: Path,
+        outside: Path,
+    ) -> None:
+        self.parent = parent
+        self.moved = moved
+        self.outside = outside
+        self.replaced = False
+        self.opened_markers: list[str] = []
+
+    def probe(self, source: Path | BinaryIO) -> ProbeResult:
+        try:
+            self.parent.rename(self.moved)
+            self.parent.symlink_to(self.outside, target_is_directory=True)
+            self.replaced = True
+        except OSError:
+            self.replaced = False
+        with h5py.File(source, "r") as handle:
+            self.opened_markers.append(str(handle.attrs["discovery_marker"]))
+        return ProbeResult(self.replaced, "test")
+
+
+class _FailingProbe:
+    def probe(self, source: BinaryIO) -> ProbeResult:
+        del source
+        raise ValueError("probe failed")
+
+
+def test_probe_cannot_be_redirected_by_parent_replacement_after_enumeration(
+    tmp_path: Path,
+):
+    root = tmp_path / "root"
+    parent = root / "incoming"
+    moved = root / "incoming-original"
+    outside = tmp_path / "outside"
+    parent.mkdir(parents=True)
+    outside.mkdir()
+    internal = parent / "a.h5"
+    external = outside / "a.h5"
+    write_zd_h5(internal)
+    write_zd_h5(external)
+    with h5py.File(internal, "r+") as handle:
+        handle.attrs["discovery_marker"] = "internal"
+    with h5py.File(external, "r+") as handle:
+        handle.attrs["discovery_marker"] = "external"
+
+    preflight = root / "symlink-preflight"
+    try:
+        preflight.symlink_to(outside, target_is_directory=True)
+        preflight.unlink()
+    except OSError as error:
+        pytest.skip(f"directory symlink unavailable: {error}")
+
+    reader = _ReplacingParentProbe(parent, moved, outside)
+    tracker = StableFileTracker(reader=reader)
+    site = _site(root)
+    assert discover_batch(site, root, tracker=tracker, now=0) == ()
+
+    files = discover_batch(site, root, tracker=tracker, now=10)
+
+    assert files == ()
+    assert reader.opened_markers == ["internal"]
+    assert "external" not in reader.opened_markers
+
+
+def test_probe_failure_releases_all_anchored_handles(tmp_path: Path):
+    root = tmp_path / "root"
+    parent = root / "incoming"
+    parent.mkdir(parents=True)
+    write_zd_h5(parent / "a.h5")
+    tracker = StableFileTracker(reader=_FailingProbe())
+
+    assert discover_batch(_site(root), root, tracker=tracker, now=0) == ()
+    assert discover_batch(_site(root), root, tracker=tracker, now=10) == ()
+
+    parent.rename(root / "released")
 
 
 def test_enqueue_is_idempotent_across_repeated_scans_and_tracker_restart(

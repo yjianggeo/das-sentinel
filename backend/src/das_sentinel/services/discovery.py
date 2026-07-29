@@ -6,16 +6,20 @@ import math
 import os
 import stat
 import time
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import BinaryIO, Protocol
 
+from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from das_sentinel.config import ProcessingProfile as ProfileConfig
 from das_sentinel.persistence.models import ProcessingProfile, Site
 from das_sentinel.persistence.repositories import SourceFileRepository
+from das_sentinel.readers.base import ProbeResult
 from das_sentinel.readers.zd_hdf5 import ZdHdf5Reader
 from das_sentinel.services.jobs import JobService, JobSnapshot
 
@@ -84,7 +88,7 @@ class _Observation:
 
 
 class _ProbeReader(Protocol):
-    def probe(self, path: Path): ...
+    def probe(self, source: BinaryIO) -> ProbeResult: ...
 
 
 class StableFileTracker:
@@ -108,48 +112,78 @@ class StableFileTracker:
         self._observations: dict[str, _Observation] = {}
         self._emitted: set[str] = set()
 
-    def observe(self, path: Path, *, now: float) -> DiscoveredFile | None:
+    def observe(
+        self,
+        path: Path,
+        *,
+        now: float,
+        root: Path | None = None,
+    ) -> DiscoveredFile | None:
         observed_at = _monotonic_value(now)
         key = _path_key(path)
         try:
-            current = _snapshot_file(path)
-        except FileNotFoundError:
+            anchor_root = _validated_root(root or Path(path).parent)
+            with _open_anchored_source(
+                anchor_root,
+                Path(path),
+            ) as source_context:
+                current = source_context.snapshot()
+                previous = self._observations.get(key)
+                if (
+                    previous is None
+                    or previous.snapshot.signature != current.signature
+                ):
+                    self._observations[key] = _Observation(
+                        current,
+                        observed_at,
+                    )
+                    return None
+                if observed_at < previous.since:
+                    raise ValueError(
+                        "monotonic observation time moved backwards"
+                    )
+                if observed_at - previous.since < self.stable_seconds:
+                    return None
+
+                candidate = current.discovered()
+                if candidate.fingerprint in self._emitted:
+                    return None
+
+                try:
+                    probe = self.reader.probe(source_context.stream)
+                except (OSError, TypeError, ValueError):
+                    self._observations[key] = _Observation(
+                        current,
+                        observed_at,
+                    )
+                    return None
+                if not probe.supported:
+                    self._observations[key] = _Observation(
+                        current,
+                        observed_at,
+                    )
+                    return None
+
+                after_probe = source_context.snapshot()
+                if after_probe.signature != current.signature:
+                    self._observations[key] = _Observation(
+                        after_probe,
+                        observed_at,
+                    )
+                    return None
+                if not _path_still_targets_source(
+                    anchor_root,
+                    Path(path),
+                    source_context.stat_result(),
+                ):
+                    self._observations.pop(key, None)
+                    return None
+
+                self._emitted.add(candidate.fingerprint)
+                return candidate
+        except (DiscoveryPathError, FileNotFoundError, OSError):
             self._observations.pop(key, None)
             return None
-
-        previous = self._observations.get(key)
-        if previous is None or previous.snapshot.signature != current.signature:
-            self._observations[key] = _Observation(current, observed_at)
-            return None
-        if observed_at < previous.since:
-            raise ValueError("monotonic observation time moved backwards")
-        if observed_at - previous.since < self.stable_seconds:
-            return None
-
-        candidate = current.discovered()
-        if candidate.fingerprint in self._emitted:
-            return None
-
-        try:
-            probe = self.reader.probe(current.path)
-        except (OSError, TypeError, ValueError):
-            self._observations[key] = _Observation(current, observed_at)
-            return None
-        if not probe.supported:
-            self._observations[key] = _Observation(current, observed_at)
-            return None
-
-        try:
-            after_probe = _snapshot_file(current.path)
-        except FileNotFoundError:
-            self._observations.pop(key, None)
-            return None
-        if after_probe.signature != current.signature:
-            self._observations[key] = _Observation(after_probe, observed_at)
-            return None
-
-        self._emitted.add(candidate.fingerprint)
-        return candidate
 
     def retain(self, paths: Iterable[Path]) -> None:
         """Reset baselines for files absent from the current directory poll."""
@@ -188,16 +222,15 @@ def load_discovery_site(session: Session, site_id: str) -> DiscoverySite:
         )
     profile = profiles[0]
     try:
-        payload = json.loads(profile.payload_json)
-    except (TypeError, json.JSONDecodeError) as error:
-        raise DiscoveryConfigurationError(
-            "current profile payload must be valid JSON"
-        ) from error
-    recursive = payload.get("recursive_discovery")
-    if not isinstance(recursive, bool):
-        raise DiscoveryConfigurationError(
-            "current profile recursive_discovery must be a boolean"
+        validated_profile = ProfileConfig.model_validate_json(
+            profile.payload_json,
+            strict=True,
         )
+    except (TypeError, ValidationError) as error:
+        raise DiscoveryConfigurationError(
+            "current processing profile, including recursive_discovery, is invalid"
+        ) from error
+    recursive = validated_profile.recursive_discovery
     root = Path(row.data_path)
     _require_lexical_absolute(root, field="site data root")
     return DiscoverySite(
@@ -228,7 +261,7 @@ def discover_batch(
     tracker.retain(candidates)
     stable: list[DiscoveredFile] = []
     for candidate in candidates:
-        discovered = tracker.observe(candidate, now=now)
+        discovered = tracker.observe(candidate, now=now, root=root)
         if discovered is not None:
             _validate_discovered(root, discovered)
             stable.append(discovered)
@@ -328,6 +361,250 @@ def watch_site(
         if cancelled():
             return
         wait(float(poll_interval))
+
+
+@dataclass(frozen=True)
+class _AnchoredSource:
+    path: Path
+    stream: BinaryIO
+
+    def stat_result(self) -> os.stat_result:
+        return os.fstat(self.stream.fileno())
+
+    def snapshot(self) -> _FileSnapshot:
+        result = self.stat_result()
+        if not stat.S_ISREG(result.st_mode):
+            raise DiscoveryPathError("source handle must identify a regular file")
+        return _FileSnapshot(
+            path=self.path,
+            size_bytes=result.st_size,
+            mtime_ns=result.st_mtime_ns,
+        )
+
+
+class _SourceHandle:
+    def __init__(self, value: int, close: Callable[[int], object]) -> None:
+        self.value: int | None = value
+        self._close = close
+
+    def close(self) -> None:
+        if self.value is not None:
+            value = self.value
+            self.value = None
+            self._close(value)
+
+
+@contextmanager
+def _open_anchored_source(
+    root: Path,
+    path: Path,
+) -> Iterator[_AnchoredSource]:
+    candidate = Path(path)
+    _require_lexical_absolute(candidate, field="source path")
+    if candidate.suffix.lower() != ".h5":
+        raise DiscoveryPathError("source path must have an .h5 extension")
+    try:
+        relative = candidate.relative_to(root)
+    except ValueError as error:
+        raise DiscoveryPathError(
+            "source path must remain beneath the configured site root"
+        ) from error
+    if not relative.parts:
+        raise DiscoveryPathError("source path must identify a regular file")
+
+    with ExitStack() as stack:
+        try:
+            root_handle = _open_source_component(
+                root,
+                None,
+                expect_directory=True,
+            )
+            stack.callback(root_handle.close)
+            parent_handle = root_handle
+            current = root
+            final_handle: _SourceHandle | None = None
+            for index, component in enumerate(relative.parts):
+                current /= component
+                expect_directory = index < len(relative.parts) - 1
+                opened = _open_source_component(
+                    current,
+                    parent_handle,
+                    expect_directory=expect_directory,
+                )
+                stack.callback(opened.close)
+                parent_handle = opened
+                final_handle = opened
+            if final_handle is None:
+                raise OSError("source path is missing a final component")
+            stream = stack.enter_context(_source_stream(final_handle))
+            source = _AnchoredSource(candidate, stream)
+            source.snapshot()
+        except OSError as error:
+            raise DiscoveryPathError(
+                "source path must use an existing no-follow regular file chain"
+            ) from error
+        yield source
+
+
+@contextmanager
+def _source_stream(handle: _SourceHandle) -> Iterator[BinaryIO]:
+    if handle.value is None:
+        raise OSError("source handle is already closed")
+    if os.name == "nt":
+        import msvcrt
+
+        flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
+        descriptor = msvcrt.open_osfhandle(handle.value, flags)
+        handle.value = None
+    else:
+        descriptor = os.dup(handle.value)
+    try:
+        stream = os.fdopen(descriptor, "rb")
+    except BaseException:
+        os.close(descriptor)
+        raise
+    try:
+        yield stream
+    finally:
+        stream.close()
+
+
+def _path_still_targets_source(
+    root: Path,
+    path: Path,
+    expected: os.stat_result,
+) -> bool:
+    try:
+        with _open_anchored_source(root, path) as reopened:
+            return os.path.samestat(expected, reopened.stat_result())
+    except (DiscoveryPathError, FileNotFoundError, OSError):
+        return False
+
+
+def _open_source_component(
+    path: Path,
+    parent_handle: _SourceHandle | None,
+    *,
+    expect_directory: bool,
+) -> _SourceHandle:
+    if os.name == "nt":
+        return _open_windows_source_component(path, expect_directory)
+    return _open_posix_source_component(
+        path,
+        parent_handle,
+        expect_directory,
+    )
+
+
+def _open_posix_source_component(
+    path: Path,
+    parent_handle: _SourceHandle | None,
+    expect_directory: bool,
+) -> _SourceHandle:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    if expect_directory:
+        flags |= os.O_DIRECTORY
+    opened: str | Path = path
+    directory_descriptor = None
+    if parent_handle is not None:
+        if parent_handle.value is None:
+            raise OSError("source parent handle is closed")
+        opened = path.name
+        directory_descriptor = parent_handle.value
+    descriptor = os.open(opened, flags, dir_fd=directory_descriptor)
+    try:
+        mode = os.fstat(descriptor).st_mode
+        valid = stat.S_ISDIR(mode) if expect_directory else stat.S_ISREG(mode)
+        if not valid:
+            raise OSError("source component has the wrong file type")
+        return _SourceHandle(descriptor, os.close)
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _open_windows_source_component(
+    path: Path,
+    expect_directory: bool,
+) -> _SourceHandle:
+    import ctypes
+    from ctypes import wintypes
+
+    class ByHandleFileInformation(ctypes.Structure):
+        _fields_ = [
+            ("file_attributes", wintypes.DWORD),
+            ("creation_time", wintypes.FILETIME),
+            ("last_access_time", wintypes.FILETIME),
+            ("last_write_time", wintypes.FILETIME),
+            ("volume_serial_number", wintypes.DWORD),
+            ("file_size_high", wintypes.DWORD),
+            ("file_size_low", wintypes.DWORD),
+            ("number_of_links", wintypes.DWORD),
+            ("file_index_high", wintypes.DWORD),
+            ("file_index_low", wintypes.DWORD),
+        ]
+
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel32.CreateFileW
+    create_file.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    ]
+    create_file.restype = wintypes.HANDLE
+    get_information = kernel32.GetFileInformationByHandle
+    get_information.argtypes = [
+        wintypes.HANDLE,
+        ctypes.POINTER(ByHandleFileInformation),
+    ]
+    get_information.restype = wintypes.BOOL
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+
+    generic_read = 0x80000000
+    share_read_write = 0x00000001 | 0x00000002
+    open_existing = 3
+    file_flag_backup_semantics = 0x02000000
+    file_flag_open_reparse_point = 0x00200000
+    handle = create_file(
+        str(path),
+        generic_read,
+        share_read_write,
+        None,
+        open_existing,
+        file_flag_backup_semantics | file_flag_open_reparse_point,
+        None,
+    )
+    invalid_handle = ctypes.c_void_p(-1).value
+    if handle == invalid_handle:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        information = ByHandleFileInformation()
+        if not get_information(handle, ctypes.byref(information)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        file_attribute_directory = 0x00000010
+        file_attribute_reparse_point = 0x00000400
+        is_directory = bool(
+            information.file_attributes & file_attribute_directory
+        )
+        is_reparse = bool(
+            information.file_attributes & file_attribute_reparse_point
+        )
+        if is_reparse or is_directory != expect_directory:
+            raise OSError(
+                "source component has the wrong type or is a reparse point"
+            )
+        result = _SourceHandle(handle, close_handle)
+        handle = None
+        return result
+    finally:
+        if handle is not None:
+            close_handle(handle)
 
 
 def _validate_discovered(root: Path, item: DiscoveredFile) -> None:

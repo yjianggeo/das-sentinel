@@ -1,6 +1,7 @@
 import re
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import BinaryIO
 
 import h5py
 import numpy as np
@@ -21,7 +22,7 @@ class ZdHdf5Reader:
     ATTR_START_LOCUS = "StartLocusIndex"
     ATTR_UNIT = "RawDataUnit"
 
-    def probe(self, path: Path) -> ProbeResult:
+    def probe(self, path: Path | BinaryIO) -> ProbeResult:
         try:
             with h5py.File(path, "r") as handle:
                 raw = handle.get(self.RAW_GROUP)
