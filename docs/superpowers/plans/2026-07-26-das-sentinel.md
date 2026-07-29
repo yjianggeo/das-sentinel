@@ -1042,10 +1042,12 @@ class FileAnalysis:
 ```
 
 Use `reader.sample_count(path)` to include the final partial block without bypassing the
-reader abstraction. Use 20-second logical blocks at a 15-second step, but prepend the
-required LTA history when reading internal blocks. Keep only candidates whose peak belongs
-to that block's canonical `[logical_start, next_logical_start)` interval, with the last
-block owning through EOF; this prevents both boundary blind zones and overlap duplicates.
+reader abstraction. Use 20-second logical blocks at a 15-second step. Prepend the required
+LTA history only for STA/LTA detection; coherence, trajectory, and other detectors search
+the logical block so a stronger history-only peak cannot suppress a canonical candidate.
+Keep only candidates whose peak belongs to that block's canonical
+`[logical_start, next_logical_start)` interval, with the last block owning through EOF;
+this prevents both boundary blind zones and overlap duplicates.
 Process one distinct detector frequency bank at a time, reuse it for detectors sharing
 that band, then release it before the next band to bound memory. Run the enabled detectors,
 translate to file-global indexes, apply deterministic same-detector safety deduplication
@@ -1064,9 +1066,13 @@ file size, and nanosecond modification time. Pass it into fusion and verify it a
 reads and before/following artifact rendering; fail the run if it changes. Do not hash the
 complete DAS payload a second time. Validate the metadata sample rate as finite and
 positive, and reject detector/energy bands outside its Nyquist range before processing.
-Render every run into a private staging directory, revalidate the source, then atomically
-promote complete event directories. On failure, remove staging and only final directories
-newly promoted by that failed run; never leave unregistered partial artifacts.
+Render every run into a private staging directory. Under the same promotion lock, perform
+the final source revalidation and then atomically promote complete event directories.
+Transfer/clear rollback ownership before releasing that lock after a successful commit;
+no later failure may delete an already published directory without reacquiring the same
+lock and proving ownership. On failure before commit, remove staging and only final
+directories still exclusively owned by that failed run; never leave unregistered partial
+artifacts.
 
 - [ ] **Step 4: Run pipeline and opt-in performance tests**
 
@@ -1080,8 +1086,8 @@ Expected: PASS on the configured baseline host for the approved logical baseline
 `60 s x 1 kHz x 1000 channels`, including at least one bounded event artifact, with peak
 RSS below 4 GiB. Use distinct approved frequency banks and execute real
 energy/coherence/trajectory detector workspaces; a fixed detector may supply the single
-bounded artifact event. Assert the configured CPU baseline wall-time ceiling, while not
-asserting a universal GPU speedup.
+bounded artifact event. Assert the approved CPU baseline wall-time ceiling of less than
+60 seconds, while not asserting a universal GPU speedup.
 
 - [ ] **Step 5: Commit**
 
