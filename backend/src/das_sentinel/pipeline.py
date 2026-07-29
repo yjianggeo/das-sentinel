@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -34,6 +35,10 @@ from das_sentinel.signal.preprocess import PreprocessedBlock, preprocess_block
 _TIMING_NAMES = ("read", "preprocess", "detect", "fuse", "classify", "render")
 
 
+class SourceChangedError(RuntimeError):
+    """Raised when source identity changes during one analysis run."""
+
+
 @dataclass(frozen=True)
 class AnalysisContext:
     site_id: str = "unknown-site"
@@ -43,6 +48,7 @@ class AnalysisContext:
     cable_type: str = "unknown"
     device_config: str = "unknown"
     rule_profile: Mapping[str, Any] = field(default_factory=dict)
+    rule_profile_sha256: str = field(init=False)
 
     def __post_init__(self) -> None:
         values = (
@@ -61,6 +67,23 @@ class AnalysisContext:
             raise ValueError("site_timezone must be a valid IANA timezone") from error
         if not isinstance(self.rule_profile, Mapping):
             raise TypeError("rule_profile must be a mapping")
+        try:
+            canonical = json.dumps(
+                dict(self.rule_profile),
+                allow_nan=False,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            snapshot = json.loads(canonical)
+        except (TypeError, ValueError) as error:
+            raise ValueError("rule_profile must be canonical JSON data") from error
+        object.__setattr__(self, "rule_profile", MappingProxyType(snapshot))
+        object.__setattr__(
+            self,
+            "rule_profile_sha256",
+            hashlib.sha256(canonical.encode()).hexdigest(),
+        )
 
 
 @dataclass(frozen=True)
@@ -95,6 +118,7 @@ def analyze_file(
     metadata = reader.read_metadata(source)
     sample_count = reader.sample_count(source)
     timings["read"] += _elapsed_ms(read_started)
+    _validate_metadata(profile, metadata.sample_rate_hz)
     if sample_count <= 0:
         raise ValueError("DAS source must contain at least one sample")
 
@@ -114,6 +138,10 @@ def analyze_file(
         if sample_stop == sample_count:
             break
 
+    _ensure_source_unchanged(source, source_fingerprint)
+    candidates = _deduplicate_candidates(
+        candidates, profile, metadata.sample_rate_hz
+    )
     fuse_started = time.perf_counter()
     review_events = fuse_candidates(
         candidates,
@@ -127,7 +155,12 @@ def analyze_file(
 
     events: list[EventRecord] = []
     artifacts: list[ArtifactManifest] = []
-    profile_payload = profile.model_dump(mode="json")
+    profile_payload = {
+        **profile.model_dump(mode="json"),
+        "rule_profile": dict(run_context.rule_profile),
+        "profile_version": run_context.profile_version,
+        "rule_profile_sha256": run_context.rule_profile_sha256,
+    }
     for event in review_events:
         window_start, window_stop = _event_window(
             event,
@@ -203,16 +236,19 @@ def analyze_file(
             pipeline_version=run_context.pipeline_version,
             model_version="rules-only",
             backend_name=backend.name,
-            rule_output=_rule_output(rule_result),
+            rule_output=_rule_output(rule_result, run_context),
             model_output=None,
         )
+        _ensure_source_unchanged(source, source_fingerprint)
         artifacts.append(
             render_event_artifacts(
                 artifact_data, classified, features, Path(artifact_root)
             )
         )
+        _ensure_source_unchanged(source, source_fingerprint)
         timings["render"] += _elapsed_ms(render_started)
 
+    _ensure_source_unchanged(source, source_fingerprint)
     timings["total"] = _elapsed_ms(started)
     return FileAnalysis(
         source_path=str(source),
@@ -260,6 +296,12 @@ def _detect_block(
     timings["detect"] += _elapsed_ms(detect_started)
 
     prepared_block = prepared_for("trajectory")
+    if prepared_block.backend_name != "cpu":
+        prepared_block = replace(
+            prepared_block,
+            data=np.asarray(backend.asnumpy(prepared_block.data), dtype=np.float32),
+            backend_name="cpu",
+        )
     detect_started = time.perf_counter()
     found.extend(detect_trajectories(prepared_block, profile))
     timings["detect"] += _elapsed_ms(detect_started)
@@ -331,13 +373,133 @@ def _event_window(
     return start, stop
 
 
-def _rule_output(result: RuleResult) -> dict[str, Any]:
+def _rule_output(
+    result: RuleResult, context: AnalysisContext
+) -> dict[str, Any]:
     return {
         "scores": {label.value: score for label, score in result.scores.items()},
         "reasons": {
             label.value: reasons for label, reasons in result.reasons.items()
         },
+        "rule_profile": dict(context.rule_profile),
+        "profile_version": context.profile_version,
+        "rule_profile_sha256": context.rule_profile_sha256,
     }
+
+
+def _deduplicate_candidates(
+    candidates: list[Candidate],
+    profile: ProcessingProfile,
+    sample_rate_hz: float,
+) -> list[Candidate]:
+    peak_tolerance = max(1, round(profile.merge_gap_seconds * sample_rate_hz))
+    remaining = sorted(
+        candidates,
+        key=lambda item: (
+            item.detector,
+            item.peak_sample,
+            item.start_sample,
+            item.channel_start,
+        ),
+    )
+    selected: list[Candidate] = []
+    while remaining:
+        group = [remaining.pop(0)]
+        index = 0
+        while index < len(remaining):
+            candidate = remaining[index]
+            if any(
+                _overlap_copy(candidate, member, peak_tolerance)
+                for member in group
+            ):
+                group.append(remaining.pop(index))
+                index = 0
+            else:
+                index += 1
+        selected.append(
+            min(
+                group,
+                key=lambda item: (
+                    bool(item.quality_flags),
+                    -item.score,
+                    item.peak_sample,
+                    item.start_sample,
+                    item.end_sample,
+                    item.channel_start,
+                    item.channel_stop,
+                ),
+            )
+        )
+    return sorted(
+        selected,
+        key=lambda item: (
+            item.start_sample,
+            item.end_sample,
+            item.channel_start,
+            item.detector,
+            item.peak_sample,
+        ),
+    )
+
+
+def _overlap_copy(
+    left: Candidate, right: Candidate, peak_tolerance: int
+) -> bool:
+    return (
+        left.detector == right.detector
+        and abs(left.peak_sample - right.peak_sample) <= peak_tolerance
+        and max(left.start_sample, right.start_sample)
+        <= min(left.end_sample, right.end_sample)
+        and max(left.channel_start, right.channel_start)
+        < min(left.channel_stop, right.channel_stop)
+    )
+
+
+def _validate_metadata(
+    profile: ProcessingProfile, sample_rate_hz: float
+) -> None:
+    if not np.isfinite(sample_rate_hz) or sample_rate_hz <= 0:
+        raise ValueError("metadata sample rate must be positive and finite")
+    nyquist = sample_rate_hz / 2.0
+    bands = (
+        ("STA/LTA", profile.stalta_freq_low_hz, profile.stalta_freq_high_hz),
+        (
+            "coherence",
+            profile.coherence_freq_low_hz,
+            profile.coherence_freq_high_hz,
+        ),
+        (
+            "trajectory",
+            profile.trajectory_freq_low_hz,
+            profile.trajectory_freq_high_hz,
+        ),
+        *(
+            (f"energy[{index}]", low, high)
+            for index, (low, high) in enumerate(profile.energy_bands_hz)
+        ),
+    )
+    if not profile.energy_bands_hz:
+        raise ValueError("at least one energy band is required")
+    for name, low, high in bands:
+        if (
+            not np.isfinite(low)
+            or not np.isfinite(high)
+            or low <= 0
+            or high <= low
+            or high > nyquist
+        ):
+            raise ValueError(
+                f"{name} band must satisfy 0 < low < high <= Nyquist ({nyquist:g} Hz)"
+            )
+
+
+def _ensure_source_unchanged(path: Path, expected: str) -> None:
+    try:
+        current = _source_fingerprint(path)
+    except OSError as error:
+        raise SourceChangedError("DAS source changed during analysis") from error
+    if current != expected:
+        raise SourceChangedError("DAS source changed during analysis")
 
 
 def _source_fingerprint(path: Path) -> str:

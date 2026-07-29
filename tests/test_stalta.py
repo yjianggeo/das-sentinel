@@ -69,3 +69,21 @@ def test_stalta_ignores_bad_channel_when_selecting_peak(profile):
     assert len(candidates) == 1
     assert candidates[0].peak_sample < 1_110
     assert candidates[0].metrics["peak_coincidence"] == 4.0
+
+
+def test_default_twenty_second_block_detects_event_after_complete_lta():
+    sample_rate_hz = 200.0
+    profile = ProcessingProfile()
+    data = np.zeros((round(profile.block_seconds * sample_rate_hz), 8), dtype=np.float32)
+    event_start = round(15.0 * sample_rate_hz)
+    event_samples = round(0.3 * sample_rate_hz)
+    burst = np.hanning(event_samples).astype(np.float32) * 20.0
+    data[event_start : event_start + event_samples, :4] = burst[:, None]
+
+    candidates = detect_stalta(
+        preprocessed_block(data, sample_offset=0, sample_rate_hz=sample_rate_hz),
+        profile,
+    )
+
+    assert len(candidates) == 1
+    assert event_start <= candidates[0].peak_sample < event_start + event_samples

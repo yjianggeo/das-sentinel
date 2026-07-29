@@ -44,7 +44,8 @@ def detect_stalta(block: PreprocessedBlock, profile: ProcessingProfile) -> list[
     samples, channels = data.shape
     sta = max(1, round(profile.sta_seconds * block.sample_rate_hz))
     lta = max(sta + 1, round(profile.lta_seconds * block.sample_rate_hz))
-    if samples <= 2 * lta or channels == 0:
+    min_duration = max(1, round(profile.min_duration_seconds * block.sample_rate_hz))
+    if samples - lta + 1 < min_duration or channels == 0:
         return []
 
     power = xp.square(data)
@@ -58,10 +59,7 @@ def detect_stalta(block: PreprocessedBlock, profile: ProcessingProfile) -> list[
     coincidence = xp.sum(active_channels, axis=1)
     active = coincidence >= profile.min_coincidence
 
-    margin = lta
-    active[-margin:] = False
     active_cpu = _to_numpy(active, block.backend_name)
-    min_duration = max(1, round(profile.min_duration_seconds * block.sample_rate_hz))
     candidates: list[Candidate] = []
     for start, stop in _runs(active_cpu):
         if stop - start < min_duration:

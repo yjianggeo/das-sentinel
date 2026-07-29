@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -37,6 +38,34 @@ def _write_boundary_file(path: Path) -> np.ndarray:
     return raw_data
 
 
+def _write_default_stalta_file(path: Path) -> None:
+    sample_rate_hz = 200.0
+    sample_count = round(20.0 * sample_rate_hz)
+    start = datetime(2026, 7, 26, tzinfo=UTC)
+    rng = np.random.default_rng(20260730)
+    raw_data = rng.normal(0.0, 0.02, (sample_count, 8)).astype(np.float32)
+    event_start = round(15.0 * sample_rate_hz)
+    event_samples = round(0.3 * sample_rate_hz)
+    burst = (
+        np.hanning(event_samples)
+        * np.sin(2 * np.pi * 10.0 * np.arange(event_samples) / sample_rate_hz)
+        * 20.0
+    ).astype(np.float32)
+    raw_data[event_start : event_start + event_samples, :4] += burst[:, None]
+    times = (
+        start.timestamp() * 1_000_000
+        + np.arange(sample_count) * 1_000_000 / sample_rate_hz
+    )
+    with h5py.File(path, "w") as handle:
+        raw = handle.create_group("Acquisition").create_group("Raw[0]")
+        raw.create_dataset("RawData", data=raw_data)
+        raw.create_dataset("RawDataTime", data=times.astype(np.int64))
+        raw.attrs["OutputDataRate"] = sample_rate_hz
+        raw.attrs["SpatialSamplingInterval"] = 4.0
+        raw.attrs["StartLocusIndex"] = 2
+        raw.attrs["RawDataUnit"] = "strain_rate"
+
+
 def _profile() -> ProcessingProfile:
     return ProcessingProfile(
         block_seconds=20.0,
@@ -56,7 +85,7 @@ def _fixed_stalta(block, profile):
     del profile
     candidates = []
     block_stop = block.sample_offset + block.data.shape[0]
-    if block.sample_offset <= 190 < block_stop:
+    if block.sample_offset in {0, 150} and block.sample_offset <= 190 < block_stop:
         candidates.append(
             Candidate(
                 detector="stalta",
@@ -65,7 +94,8 @@ def _fixed_stalta(block, profile):
                 peak_sample=190,
                 channel_start=1,
                 channel_stop=5,
-                score=0.95,
+                score=0.99 if block.sample_offset == 0 else 0.90,
+                quality_flags=("edge_only",) if block.sample_offset == 0 else (),
             )
         )
     if block.sample_offset == 300:
@@ -81,6 +111,23 @@ def _fixed_stalta(block, profile):
             )
         )
     return candidates
+
+
+def _fixed_energy(block, profile):
+    del profile
+    if block.sample_offset != 150:
+        return []
+    return [
+        Candidate(
+            detector="energy",
+            start_sample=184,
+            end_sample=197,
+            peak_sample=191,
+            channel_start=1,
+            channel_stop=5,
+            score=0.80,
+        )
+    ]
 
 
 def _no_candidates(*args):
@@ -103,7 +150,7 @@ def test_pipeline_merges_cross_block_event_and_preserves_artifact_inputs(
         return ArtifactManifest(event.event_id, {})
 
     monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
-    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_energy", _fixed_energy)
     monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
     monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
     monkeypatch.setattr(pipeline, "render_event_artifacts", capture_artifacts)
@@ -127,8 +174,12 @@ def test_pipeline_merges_cross_block_event_and_preserves_artifact_inputs(
 
     assert len(result.events) == 1
     event = result.events[0]
-    assert (event.start_sample, event.end_sample, event.peak_sample) == (185, 196, 190)
+    assert (event.start_sample, event.end_sample, event.peak_sample) == (184, 197, 190)
     assert len(event.evidence) == 2
+    assert {candidate.detector for candidate in event.evidence} == {"stalta", "energy"}
+    assert next(
+        candidate for candidate in event.evidence if candidate.detector == "stalta"
+    ).quality_flags == ()
     assert result.audit_candidate_count == 3
     assert result.actual_backend == "cpu"
     assert result.backend_fallback_reason is None
@@ -155,8 +206,8 @@ def test_pipeline_merges_cross_block_event_and_preserves_artifact_inputs(
 
     artifact_data, rendered_event = captured[0]
     assert rendered_event == event
-    assert artifact_data.sample_offset == 135
-    np.testing.assert_array_equal(artifact_data.raw_data, expected_raw[135:246])
+    assert artifact_data.sample_offset == 134
+    np.testing.assert_array_equal(artifact_data.raw_data, expected_raw[134:247])
     assert artifact_data.filtered_data.shape == artifact_data.raw_data.shape
     assert not np.array_equal(artifact_data.filtered_data, artifact_data.raw_data)
     assert artifact_data.profile_version == "profile-7"
@@ -164,9 +215,47 @@ def test_pipeline_merges_cross_block_event_and_preserves_artifact_inputs(
     assert artifact_data.model_version == "rules-only"
     assert artifact_data.backend_name == "cpu"
     assert artifact_data.site_timezone == "Asia/Shanghai"
+    assert artifact_data.profile["rule_profile"] == {
+        "traffic_velocity_mps": [3.0, 45.0]
+    }
+    assert artifact_data.profile["profile_version"] == "profile-7"
+    assert artifact_data.profile["rule_profile_sha256"]
+    assert artifact_data.rule_output["rule_profile"] == {
+        "traffic_velocity_mps": [3.0, 45.0]
+    }
+    assert (
+        artifact_data.rule_output["rule_profile_sha256"]
+        == artifact_data.profile["rule_profile_sha256"]
+    )
     assert event.features["site_id"] == "well-a"
     assert event.features["cable_type"] == "downhole"
     assert event.features["device_config"] == "interrogator-a"
+
+
+def test_pipeline_default_block_and_lta_detect_real_stalta_event(tmp_path, monkeypatch):
+    from das_sentinel import pipeline
+
+    source_path = tmp_path / "default-stalta.h5"
+    _write_default_stalta_file(source_path)
+    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
+    monkeypatch.setattr(
+        pipeline,
+        "render_event_artifacts",
+        lambda data, event, features, out_dir: ArtifactManifest(event.event_id, {}),
+    )
+
+    result = pipeline.analyze_file(
+        source_path,
+        ZdHdf5Reader(),
+        ProcessingProfile(),
+        select_backend("cpu"),
+        tmp_path / "artifacts",
+    )
+
+    assert len(result.events) == 1
+    assert any(candidate.detector == "stalta" for candidate in result.events[0].evidence)
 
 
 def test_pipeline_result_is_stable_except_for_recorded_timings(tmp_path, monkeypatch):
@@ -249,6 +338,10 @@ class _NoImplicitNumpyConversion:
         del dtype, copy
         raise TypeError("implicit device-to-host conversion is forbidden")
 
+    @property
+    def shape(self):
+        return self.values.shape
+
 
 class _NumpyCudaBackend:
     name = "cuda"
@@ -274,10 +367,10 @@ def test_pipeline_explicitly_transfers_event_window_before_cpu_features(
     source_path = tmp_path / "cuda.h5"
     _write_boundary_file(source_path)
     captured = []
-    original_preprocess = pipeline._preprocess_for_detector
+    original_preprocess = pipeline.preprocess_block
 
-    def device_preprocess(block, profile, backend, detector):
-        prepared = original_preprocess(block, profile, backend, detector)
+    def device_preprocess(block, profile, backend):
+        prepared = original_preprocess(block, profile, backend)
         return PreprocessedBlock(
             data=_NoImplicitNumpyConversion(prepared.data),
             bad_channel_mask=prepared.bad_channel_mask,
@@ -290,8 +383,7 @@ def test_pipeline_explicitly_transfers_event_window_before_cpu_features(
     monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
     monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
     monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
-    monkeypatch.setattr(pipeline, "_preprocess_for_detector", device_preprocess)
+    monkeypatch.setattr(pipeline, "preprocess_block", device_preprocess)
     monkeypatch.setattr(
         pipeline,
         "render_event_artifacts",
@@ -332,6 +424,195 @@ def test_analysis_context_rejects_non_mapping_rule_profile():
 
     with pytest.raises(TypeError, match="rule_profile"):
         AnalysisContext(rule_profile=[])  # type: ignore[arg-type]
+
+
+def test_analysis_context_snapshots_canonical_rule_profile():
+    from das_sentinel.pipeline import AnalysisContext
+
+    source_profile = {"traffic_velocity_mps": (3.0, 45.0)}
+    context = AnalysisContext(rule_profile=source_profile)
+    source_profile["traffic_velocity_mps"] = (1.0, 2.0)
+    canonical = b'{"traffic_velocity_mps":[3.0,45.0]}'
+
+    assert context.rule_profile == {"traffic_velocity_mps": [3.0, 45.0]}
+    assert context.rule_profile_sha256 == hashlib.sha256(canonical).hexdigest()
+
+
+@pytest.mark.parametrize(
+    "rule_profile",
+    [{"threshold": float("nan")}, {"unsupported": object()}],
+)
+def test_analysis_context_rejects_noncanonical_rule_profile(rule_profile):
+    from das_sentinel.pipeline import AnalysisContext
+
+    with pytest.raises(ValueError, match="canonical JSON"):
+        AnalysisContext(rule_profile=rule_profile)
+
+
+def test_pipeline_evidence_records_reproducible_rule_identity(tmp_path, monkeypatch):
+    from das_sentinel import pipeline
+
+    source_path = tmp_path / "rule-evidence.h5"
+    _write_boundary_file(source_path)
+    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
+    monkeypatch.setattr(pipeline, "detect_energy", _fixed_energy)
+    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
+    context = pipeline.AnalysisContext(
+        profile_version="profile-reviewed-2",
+        rule_profile={"traffic_velocity_mps": (3.0, 45.0)},
+    )
+
+    result = pipeline.analyze_file(
+        source_path,
+        ZdHdf5Reader(),
+        _profile(),
+        select_backend("cpu"),
+        tmp_path / "artifacts",
+        context,
+    )
+
+    evidence_path = result.artifacts[0].files["evidence"].path
+    evidence = json.loads(evidence_path.read_text(encoding="utf-8"))
+    assert evidence["profile"]["rule_profile"] == {
+        "traffic_velocity_mps": [3.0, 45.0]
+    }
+    assert evidence["profile"]["profile_version"] == "profile-reviewed-2"
+    assert evidence["rule_output"]["rule_profile_sha256"] == (
+        context.rule_profile_sha256
+    )
+
+
+class _MutatingReader:
+    def __init__(self, path):
+        self.delegate = ZdHdf5Reader()
+        self.path = path
+        self.mutated = False
+
+    def probe(self, path):
+        return self.delegate.probe(path)
+
+    def sample_count(self, path):
+        return self.delegate.sample_count(path)
+
+    def read_metadata(self, path):
+        return self.delegate.read_metadata(path)
+
+    def read_block(self, path, sample_start, sample_stop, channel_slice=slice(None)):
+        block = self.delegate.read_block(
+            path, sample_start, sample_stop, channel_slice
+        )
+        if not self.mutated:
+            stat = self.path.stat()
+            os.utime(
+                self.path,
+                ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
+            )
+            self.mutated = True
+        return block
+
+
+def test_pipeline_rejects_source_changed_during_block_reads(tmp_path, monkeypatch):
+    from das_sentinel import pipeline
+
+    source_path = tmp_path / "changing-read.h5"
+    _write_boundary_file(source_path)
+    monkeypatch.setattr(pipeline, "detect_stalta", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
+
+    with pytest.raises(pipeline.SourceChangedError, match="changed"):
+        pipeline.analyze_file(
+            source_path,
+            _MutatingReader(source_path),
+            _profile(),
+            select_backend("cpu"),
+            tmp_path / "artifacts",
+        )
+
+
+def test_pipeline_rejects_source_changed_while_rendering(tmp_path, monkeypatch):
+    from das_sentinel import pipeline
+
+    source_path = tmp_path / "changing-render.h5"
+    _write_boundary_file(source_path)
+    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
+    monkeypatch.setattr(pipeline, "detect_energy", _fixed_energy)
+    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
+
+    def changing_render(data, event, features, out_dir):
+        del data, features, out_dir
+        stat = source_path.stat()
+        os.utime(
+            source_path,
+            ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
+        )
+        return ArtifactManifest(event.event_id, {})
+
+    monkeypatch.setattr(pipeline, "render_event_artifacts", changing_render)
+
+    with pytest.raises(pipeline.SourceChangedError, match="changed"):
+        pipeline.analyze_file(
+            source_path,
+            ZdHdf5Reader(),
+            _profile(),
+            select_backend("cpu"),
+            tmp_path / "artifacts",
+        )
+
+
+@pytest.mark.parametrize("sample_rate_hz", [float("nan"), 0.0, -1.0])
+def test_pipeline_rejects_invalid_metadata_sample_rate(
+    tmp_path, monkeypatch, sample_rate_hz
+):
+    from das_sentinel import pipeline
+
+    source_path = tmp_path / "invalid-rate.h5"
+    _write_boundary_file(source_path)
+    with h5py.File(source_path, "r+") as handle:
+        handle["Acquisition/Raw[0]"].attrs["OutputDataRate"] = sample_rate_hz
+
+    with pytest.raises(ValueError, match="sample rate"):
+        pipeline.analyze_file(
+            source_path,
+            ZdHdf5Reader(),
+            _profile(),
+            select_backend("cpu"),
+            tmp_path / "artifacts",
+        )
+
+
+@pytest.mark.parametrize(
+    "profile",
+    [
+        _profile().model_copy(
+            update={"stalta_freq_low_hz": 5.1, "stalta_freq_high_hz": 6.0}
+        ),
+        _profile().model_copy(update={"coherence_freq_high_hz": 5.1}),
+        _profile().model_copy(
+            update={"trajectory_freq_low_hz": 5.1, "trajectory_freq_high_hz": 6.0}
+        ),
+        _profile().model_copy(
+            update={"energy_bands_hz": ((0.5, 1.0), (1.0, 5.1))}
+        ),
+    ],
+)
+def test_pipeline_rejects_detector_band_outside_nyquist(tmp_path, profile):
+    from das_sentinel import pipeline
+
+    source_path = tmp_path / "invalid-band.h5"
+    _write_boundary_file(source_path)
+
+    with pytest.raises(ValueError, match="Nyquist"):
+        pipeline.analyze_file(
+            source_path,
+            ZdHdf5Reader(),
+            profile,
+            select_backend("cpu"),
+            tmp_path / "artifacts",
+        )
 
 
 def test_pipeline_propagates_reader_warning_and_selected_backend_reason(

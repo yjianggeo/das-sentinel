@@ -10,7 +10,8 @@ import h5py
 import numpy as np
 import pytest
 from das_sentinel.config import ProcessingProfile
-from das_sentinel.pipeline import analyze_file
+from das_sentinel.domain import Candidate
+from das_sentinel.pipeline import FileAnalysis, analyze_file
 from das_sentinel.readers.zd_hdf5 import ZdHdf5Reader
 from das_sentinel.signal.backend import select_backend
 
@@ -19,12 +20,17 @@ from das_sentinel.signal.backend import select_backend
 class PerformanceResult:
     peak_rss_bytes: int
     wall_time_seconds: float
+    analysis: FileAnalysis
 
 
 def measure_analysis(path: Path, profile: ProcessingProfile, artifact_root: Path):
     started = time.perf_counter()
-    analyze_file(path, ZdHdf5Reader(), profile, select_backend("cpu"), artifact_root)
-    return PerformanceResult(_peak_rss_bytes(), time.perf_counter() - started)
+    analysis = analyze_file(
+        path, ZdHdf5Reader(), profile, select_backend("cpu"), artifact_root
+    )
+    return PerformanceResult(
+        _peak_rss_bytes(), time.perf_counter() - started, analysis
+    )
 
 
 def _peak_rss_bytes() -> int:
@@ -71,15 +77,26 @@ def _peak_rss_bytes() -> int:
 
 
 def _write_baseline_h5(path: Path) -> None:
-    sample_rate_hz = 20.0
-    sample_count = 400
+    sample_rate_hz = 1_000.0
+    sample_count = 60_000
+    channel_count = 1_000
     start = datetime(2026, 7, 26, tzinfo=UTC)
-    rng = np.random.default_rng(110)
-    values = rng.normal(0.0, 0.1, (sample_count, 8)).astype(np.float32)
-    times = start.timestamp() * 1_000_000 + np.arange(sample_count) * 1_000_000 / sample_rate_hz
+    times = (
+        start.timestamp() * 1_000_000
+        + np.arange(sample_count) * 1_000_000 / sample_rate_hz
+    )
     with h5py.File(path, "w") as handle:
         raw = handle.create_group("Acquisition").create_group("Raw[0]")
-        raw.create_dataset("RawData", data=values)
+        data = raw.create_dataset(
+            "RawData",
+            shape=(sample_count, channel_count),
+            dtype=np.float32,
+            chunks=(1_000, 100),
+            fillvalue=0.0,
+        )
+        data[30_000:30_200, :8] = np.hanning(200).astype(np.float32)[
+            :, None
+        ]
         raw.create_dataset("RawDataTime", data=times.astype(np.int64))
         raw.attrs["OutputDataRate"] = sample_rate_hz
         raw.attrs["SpatialSamplingInterval"] = 4.0
@@ -87,32 +104,76 @@ def _write_baseline_h5(path: Path) -> None:
         raw.attrs["RawDataUnit"] = "strain_rate"
 
 
+def _fixed_capacity_event(block, profile):
+    del profile
+    if not (
+        block.sample_offset <= 30_100
+        < block.sample_offset + block.data.shape[0]
+    ):
+        return []
+    return [
+        Candidate(
+            detector="stalta",
+            start_sample=30_000,
+            end_sample=30_200,
+            peak_sample=30_100,
+            channel_start=0,
+            channel_stop=8,
+            score=0.95,
+        )
+    ]
+
+
+def _no_candidates(*args):
+    del args
+    return []
+
+
 @pytest.mark.performance
-def test_baseline_file_stays_under_memory_budget(tmp_path):
+def test_baseline_file_stays_under_memory_budget(tmp_path, monkeypatch):
+    from das_sentinel import pipeline
+
     baseline_h5 = tmp_path / "baseline.h5"
     _write_baseline_h5(baseline_h5)
+    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_capacity_event)
+    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
     profile = ProcessingProfile(
         block_seconds=20.0,
         overlap_seconds=5.0,
-        stalta_freq_low_hz=0.5,
-        stalta_freq_high_hz=8.0,
-        coherence_freq_low_hz=0.5,
-        coherence_freq_high_hz=8.0,
-        trajectory_freq_low_hz=0.5,
-        trajectory_freq_high_hz=8.0,
-        energy_bands_hz=((0.5, 2.0), (2.0, 5.0), (5.0, 8.0)),
-        sta_seconds=0.25,
-        lta_seconds=2.0,
-        min_coincidence=4,
-        stalta_threshold=100.0,
-        energy_ratio_threshold=100.0,
-        coherence_threshold=1.0,
-        trajectory_threshold=1.0,
+        stalta_freq_low_hz=2.0,
+        stalta_freq_high_hz=40.0,
+        coherence_freq_low_hz=2.0,
+        coherence_freq_high_hz=40.0,
+        trajectory_freq_low_hz=2.0,
+        trajectory_freq_high_hz=40.0,
+        energy_bands_hz=((2.0, 40.0),),
+        artifact_pad_seconds=0.1,
     )
 
     result = measure_analysis(baseline_h5, profile, tmp_path / "artifacts")
 
+    assert ZdHdf5Reader().sample_count(baseline_h5) == 60_000
+    assert len(ZdHdf5Reader().read_metadata(baseline_h5).channel_distance_m) == 1_000
+    assert len(result.analysis.events) == 1
+    assert len(result.analysis.artifacts) == 1
+    assert set(result.analysis.artifacts[0].files) == {
+        "waterfall_raw",
+        "waterfall_filtered",
+        "waveform",
+        "psd",
+        "stft",
+        "evidence",
+    }
+    assert all(
+        artifact.path.exists()
+        for artifact in result.analysis.artifacts[0].files.values()
+    )
     assert result.peak_rss_bytes < 4 * 1024**3
     assert result.wall_time_seconds > 0
     if os.environ.get("DAS_PERFORMANCE_REPORT"):
-        print(f"baseline wall time: {result.wall_time_seconds:.3f}s")
+        print(
+            f"baseline peak RSS: {result.peak_rss_bytes / 1024**3:.3f} GiB; "
+            f"wall time: {result.wall_time_seconds:.3f}s"
+        )
