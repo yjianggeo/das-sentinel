@@ -1239,7 +1239,9 @@ remains under `Settings.data_root` without writing to it. Site edits create a ne
 validator rejects non-finite values, non-positive counts/windows/frequency thresholds,
 invalid probability-like scores, negative merge/artifact padding, non-positive slowness,
 unordered trajectory velocities, and unordered normal/strong fusion thresholds, so both
-site creation and merged PATCH payloads persist only runnable configurations.
+site creation and merged PATCH payloads persist only runnable configurations. Require at
+least two ordered, non-overlapping energy bands because normalized band entropy divides
+by `log(number_of_bands)`.
 
 - [ ] **Step 4: Run API tests**
 
