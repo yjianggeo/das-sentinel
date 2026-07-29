@@ -999,9 +999,10 @@ git commit -m "feat(artifacts): render waterfall and spectral products"
   `pipeline-v1`, unknown cable/device, and an empty rule profile), so the original
   five-argument call remains valid. Task 11 is rules-only and records model version
   `rules-only`; later worker/model tasks may extend model inputs explicitly.
-- Canonicalize and snapshot `rule_profile` at context construction. Artifact evidence
-  records the rule profile itself, `profile_version`, and its canonical SHA-256 so the
-  rules-only decision can be reproduced.
+- Canonicalize and recursively freeze `rule_profile` at context construction, including
+  nested lists and objects. Artifact evidence records the rule profile itself,
+  `profile_version`, and its canonical SHA-256 so the rules-only decision can be
+  reproduced.
 
 - [ ] **Step 1: Add failing cross-block and idempotent-result tests**
 
@@ -1041,13 +1042,17 @@ class FileAnalysis:
 ```
 
 Use `reader.sample_count(path)` to include the final partial block without bypassing the
-reader abstraction. Read 20-second blocks with 5-second overlap, preprocess once per
-detector frequency bank, run the enabled detectors, translate to file-global indexes,
-deduplicate same-detector overlap copies before audit/fusion (prefer unflagged, then
-higher-score evidence), fuse after all blocks, extract features from event windows,
-classify, and render only fused review events. CUDA arrays entering CPU-only trajectory,
-feature, or artifact paths use an explicit backend transfer. For each rendered event,
-assemble one `EventArtifactData` from the
+reader abstraction. Use 20-second logical blocks at a 15-second step, but prepend the
+required LTA history when reading internal blocks. Keep only candidates whose peak belongs
+to that block's canonical `[logical_start, next_logical_start)` interval, with the last
+block owning through EOF; this prevents both boundary blind zones and overlap duplicates.
+Process one distinct detector frequency bank at a time, reuse it for detectors sharing
+that band, then release it before the next band to bound memory. Run the enabled detectors,
+translate to file-global indexes, apply deterministic same-detector safety deduplication
+before audit/fusion (prefer unflagged, then higher-score evidence), fuse after all blocks,
+extract features from event windows, classify, and render only fused review events. CUDA
+arrays entering CPU-only trajectory, feature, or artifact paths use an explicit backend
+transfer. For each rendered event, assemble one `EventArtifactData` from the
 true raw samples and the matching filtered samples, preserving their shared sample/channel
 coordinates plus UTC and site timezone metadata from `AnalysisContext`. Return audit
 candidates separately from review events. `FileAnalysis` contains source fingerprint,
@@ -1059,6 +1064,9 @@ file size, and nanosecond modification time. Pass it into fusion and verify it a
 reads and before/following artifact rendering; fail the run if it changes. Do not hash the
 complete DAS payload a second time. Validate the metadata sample rate as finite and
 positive, and reject detector/energy bands outside its Nyquist range before processing.
+Render every run into a private staging directory, revalidate the source, then atomically
+promote complete event directories. On failure, remove staging and only final directories
+newly promoted by that failed run; never leave unregistered partial artifacts.
 
 - [ ] **Step 4: Run pipeline and opt-in performance tests**
 
@@ -1070,7 +1078,10 @@ Run: `python -m pytest tests/test_performance.py -m performance -q`
 
 Expected: PASS on the configured baseline host for the approved logical baseline
 `60 s x 1 kHz x 1000 channels`, including at least one bounded event artifact, with peak
-RSS below 4 GiB. Record wall time rather than asserting a universal GPU speedup.
+RSS below 4 GiB. Use distinct approved frequency banks and execute real
+energy/coherence/trajectory detector workspaces; a fixed detector may supply the single
+bounded artifact event. Assert the configured CPU baseline wall-time ceiling, while not
+asserting a universal GPU speedup.
 
 - [ ] **Step 5: Commit**
 
