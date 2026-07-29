@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
+import weakref
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -66,6 +68,39 @@ def _write_default_stalta_file(path: Path) -> None:
         raw.attrs["RawDataUnit"] = "strain_rate"
 
 
+def _write_history_stalta_file(path: Path) -> None:
+    sample_rate_hz = 200.0
+    sample_count = round(50.0 * sample_rate_hz)
+    start = datetime(2026, 7, 26, tzinfo=UTC)
+    rng = np.random.default_rng(20260731)
+    raw_data = rng.normal(0.0, 0.02, (sample_count, 8)).astype(np.float32)
+    for event_seconds in (22.0, 37.0):
+        event_start = round(event_seconds * sample_rate_hz)
+        event_samples = round(0.3 * sample_rate_hz)
+        burst = (
+            np.hanning(event_samples)
+            * np.sin(
+                2 * np.pi * 10.0 * np.arange(event_samples) / sample_rate_hz
+            )
+            * 20.0
+        ).astype(np.float32)
+        raw_data[event_start : event_start + event_samples, :4] += burst[
+            :, None
+        ]
+    times = (
+        start.timestamp() * 1_000_000
+        + np.arange(sample_count) * 1_000_000 / sample_rate_hz
+    )
+    with h5py.File(path, "w") as handle:
+        raw = handle.create_group("Acquisition").create_group("Raw[0]")
+        raw.create_dataset("RawData", data=raw_data)
+        raw.create_dataset("RawDataTime", data=times.astype(np.int64))
+        raw.attrs["OutputDataRate"] = sample_rate_hz
+        raw.attrs["SpatialSamplingInterval"] = 4.0
+        raw.attrs["StartLocusIndex"] = 2
+        raw.attrs["RawDataUnit"] = "strain_rate"
+
+
 def _profile() -> ProcessingProfile:
     return ProcessingProfile(
         block_seconds=20.0,
@@ -85,7 +120,7 @@ def _fixed_stalta(block, profile):
     del profile
     candidates = []
     block_stop = block.sample_offset + block.data.shape[0]
-    if block.sample_offset in {0, 150} and block.sample_offset <= 190 < block_stop:
+    if block.sample_offset <= 190 < block_stop:
         candidates.append(
             Candidate(
                 detector="stalta",
@@ -98,7 +133,7 @@ def _fixed_stalta(block, profile):
                 quality_flags=("edge_only",) if block.sample_offset == 0 else (),
             )
         )
-    if block.sample_offset == 300:
+    if block.sample_offset <= 322 < block_stop:
         candidates.append(
             Candidate(
                 detector="stalta",
@@ -115,7 +150,10 @@ def _fixed_stalta(block, profile):
 
 def _fixed_energy(block, profile):
     del profile
-    if block.sample_offset != 150:
+    if not (
+        block.sample_offset <= 191
+        < block.sample_offset + block.data.shape[0]
+    ):
         return []
     return [
         Candidate(
@@ -135,6 +173,12 @@ def _no_candidates(*args):
     return []
 
 
+def _empty_artifact_manifest(data, event, features, out_dir):
+    del data, features
+    (Path(out_dir) / event.event_id).mkdir(parents=True)
+    return ArtifactManifest(event.event_id, {})
+
+
 def test_pipeline_merges_cross_block_event_and_preserves_artifact_inputs(
     tmp_path, monkeypatch
 ):
@@ -145,8 +189,9 @@ def test_pipeline_merges_cross_block_event_and_preserves_artifact_inputs(
     captured = []
 
     def capture_artifacts(data, event, features, out_dir):
-        del features, out_dir
+        del features
         captured.append((data, event))
+        (Path(out_dir) / event.event_id).mkdir(parents=True)
         return ArtifactManifest(event.event_id, {})
 
     monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
@@ -216,12 +261,12 @@ def test_pipeline_merges_cross_block_event_and_preserves_artifact_inputs(
     assert artifact_data.backend_name == "cpu"
     assert artifact_data.site_timezone == "Asia/Shanghai"
     assert artifact_data.profile["rule_profile"] == {
-        "traffic_velocity_mps": [3.0, 45.0]
+        "traffic_velocity_mps": (3.0, 45.0)
     }
     assert artifact_data.profile["profile_version"] == "profile-7"
     assert artifact_data.profile["rule_profile_sha256"]
     assert artifact_data.rule_output["rule_profile"] == {
-        "traffic_velocity_mps": [3.0, 45.0]
+        "traffic_velocity_mps": (3.0, 45.0)
     }
     assert (
         artifact_data.rule_output["rule_profile_sha256"]
@@ -243,7 +288,7 @@ def test_pipeline_default_block_and_lta_detect_real_stalta_event(tmp_path, monke
     monkeypatch.setattr(
         pipeline,
         "render_event_artifacts",
-        lambda data, event, features, out_dir: ArtifactManifest(event.event_id, {}),
+        _empty_artifact_manifest,
     )
 
     result = pipeline.analyze_file(
@@ -258,6 +303,58 @@ def test_pipeline_default_block_and_lta_detect_real_stalta_event(tmp_path, monke
     assert any(candidate.detector == "stalta" for candidate in result.events[0].evidence)
 
 
+class _RecordingReader:
+    def __init__(self):
+        self.delegate = ZdHdf5Reader()
+        self.block_ranges = []
+
+    def probe(self, path):
+        return self.delegate.probe(path)
+
+    def sample_count(self, path):
+        return self.delegate.sample_count(path)
+
+    def read_metadata(self, path):
+        return self.delegate.read_metadata(path)
+
+    def read_block(self, path, sample_start, sample_stop, channel_slice=slice(None)):
+        self.block_ranges.append((sample_start, sample_stop))
+        return self.delegate.read_block(
+            path, sample_start, sample_stop, channel_slice
+        )
+
+
+def test_pipeline_prepends_lta_history_and_canonically_owns_gap_events(
+    tmp_path, monkeypatch
+):
+    from das_sentinel import pipeline
+
+    source_path = tmp_path / "history-stalta.h5"
+    _write_history_stalta_file(source_path)
+    reader = _RecordingReader()
+    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
+    monkeypatch.setattr(
+        pipeline,
+        "render_event_artifacts",
+        _empty_artifact_manifest,
+    )
+
+    result = pipeline.analyze_file(
+        source_path,
+        reader,
+        ProcessingProfile(),
+        select_backend("cpu"),
+        tmp_path / "artifacts",
+    )
+
+    assert reader.block_ranges[:3] == [(0, 4_000), (1_000, 7_000), (4_000, 10_000)]
+    assert len(result.events) == 2
+    assert result.audit_candidate_count == 2
+    assert [event.peak_sample // 200 for event in result.events] == [22, 37]
+
+
 def test_pipeline_result_is_stable_except_for_recorded_timings(tmp_path, monkeypatch):
     from das_sentinel import pipeline
 
@@ -270,7 +367,7 @@ def test_pipeline_result_is_stable_except_for_recorded_timings(tmp_path, monkeyp
     monkeypatch.setattr(
         pipeline,
         "render_event_artifacts",
-        lambda data, event, features, out_dir: ArtifactManifest(event.event_id, {}),
+        _empty_artifact_manifest,
     )
 
     first = pipeline.analyze_file(
@@ -308,7 +405,7 @@ def test_pipeline_event_identity_distinguishes_source_files(tmp_path, monkeypatc
     monkeypatch.setattr(
         pipeline,
         "render_event_artifacts",
-        lambda data, event, features, out_dir: ArtifactManifest(event.event_id, {}),
+        _empty_artifact_manifest,
     )
 
     first = pipeline.analyze_file(
@@ -384,12 +481,12 @@ def test_pipeline_explicitly_transfers_event_window_before_cpu_features(
     monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
     monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
     monkeypatch.setattr(pipeline, "preprocess_block", device_preprocess)
+    def capture_device_artifacts(data, event, features, out_dir):
+        captured.append(data)
+        return _empty_artifact_manifest(data, event, features, out_dir)
+
     monkeypatch.setattr(
-        pipeline,
-        "render_event_artifacts",
-        lambda data, event, features, out_dir: (
-            captured.append(data) or ArtifactManifest(event.event_id, {})
-        ),
+        pipeline, "render_event_artifacts", capture_device_artifacts
     )
 
     result = pipeline.analyze_file(
@@ -434,8 +531,29 @@ def test_analysis_context_snapshots_canonical_rule_profile():
     source_profile["traffic_velocity_mps"] = (1.0, 2.0)
     canonical = b'{"traffic_velocity_mps":[3.0,45.0]}'
 
-    assert context.rule_profile == {"traffic_velocity_mps": [3.0, 45.0]}
+    assert context.rule_profile == {"traffic_velocity_mps": (3.0, 45.0)}
     assert context.rule_profile_sha256 == hashlib.sha256(canonical).hexdigest()
+
+
+def test_analysis_context_recursively_freezes_nested_rule_profile():
+    from das_sentinel.pipeline import AnalysisContext
+
+    source_profile = {
+        "nested": {"thresholds": [1.0, {"minimum": 2.0}]}
+    }
+    context = AnalysisContext(rule_profile=source_profile)
+    original_hash = context.rule_profile_sha256
+
+    with pytest.raises(TypeError):
+        context.rule_profile["nested"]["new"] = 3.0
+    with pytest.raises(TypeError):
+        context.rule_profile["nested"]["thresholds"][1]["minimum"] = 9.0
+
+    assert context.rule_profile_sha256 == original_hash
+    assert context.rule_profile["nested"]["thresholds"] == (
+        1.0,
+        {"minimum": 2.0},
+    )
 
 
 @pytest.mark.parametrize(
@@ -542,14 +660,17 @@ def test_pipeline_rejects_source_changed_while_rendering(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
     monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
 
+    artifact_root = tmp_path / "artifacts"
+    original_render = pipeline.render_event_artifacts
+
     def changing_render(data, event, features, out_dir):
-        del data, features, out_dir
+        manifest = original_render(data, event, features, out_dir)
         stat = source_path.stat()
         os.utime(
             source_path,
             ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
         )
-        return ArtifactManifest(event.event_id, {})
+        return manifest
 
     monkeypatch.setattr(pipeline, "render_event_artifacts", changing_render)
 
@@ -559,8 +680,180 @@ def test_pipeline_rejects_source_changed_while_rendering(tmp_path, monkeypatch):
             ZdHdf5Reader(),
             _profile(),
             select_backend("cpu"),
-            tmp_path / "artifacts",
+            artifact_root,
         )
+    assert not [path for path in artifact_root.iterdir() if path.is_dir()]
+    assert not list(artifact_root.glob(".das-staging-*"))
+
+
+def _two_review_events(block, profile):
+    del profile
+    candidates = []
+    for peak in (190, 320):
+        if block.sample_offset <= peak < block.sample_offset + block.data.shape[0]:
+            candidates.append(
+                Candidate(
+                    detector="stalta",
+                    start_sample=peak - 5,
+                    end_sample=peak + 6,
+                    peak_sample=peak,
+                    channel_start=1,
+                    channel_stop=5,
+                    score=0.95,
+                )
+            )
+    return candidates
+
+
+def test_pipeline_rolls_back_only_newly_promoted_event_directories(
+    tmp_path, monkeypatch
+):
+    from das_sentinel import pipeline
+
+    source_path = tmp_path / "promotion-change.h5"
+    artifact_root = tmp_path / "artifacts"
+    _write_boundary_file(source_path)
+    monkeypatch.setattr(pipeline, "detect_stalta", _two_review_events)
+    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
+    original_promote = pipeline._promote_event_directory
+    promoted = 0
+
+    def changing_promote(*args, **kwargs):
+        nonlocal promoted
+        result = original_promote(*args, **kwargs)
+        promoted += 1
+        if promoted == 1:
+            stat = source_path.stat()
+            os.utime(
+                source_path,
+                ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
+            )
+        return result
+
+    monkeypatch.setattr(pipeline, "_promote_event_directory", changing_promote)
+
+    with pytest.raises(pipeline.SourceChangedError, match="changed"):
+        pipeline.analyze_file(
+            source_path,
+            ZdHdf5Reader(),
+            _profile(),
+            select_backend("cpu"),
+            artifact_root,
+        )
+
+    assert not [path for path in artifact_root.iterdir() if path.is_dir()]
+    assert not list(artifact_root.glob(".das-staging-*"))
+
+
+def test_pipeline_reuses_and_never_rolls_back_preexisting_artifacts(
+    tmp_path, monkeypatch
+):
+    from das_sentinel import pipeline
+
+    source_path = tmp_path / "preexisting.h5"
+    artifact_root = tmp_path / "artifacts"
+    _write_boundary_file(source_path)
+    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
+    monkeypatch.setattr(pipeline, "detect_energy", _fixed_energy)
+    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
+
+    first = pipeline.analyze_file(
+        source_path,
+        ZdHdf5Reader(),
+        _profile(),
+        select_backend("cpu"),
+        artifact_root,
+    )
+    second = pipeline.analyze_file(
+        source_path,
+        ZdHdf5Reader(),
+        _profile(),
+        select_backend("cpu"),
+        artifact_root,
+    )
+    original_files = {
+        kind: (artifact.path, artifact.sha256)
+        for kind, artifact in first.artifacts[0].files.items()
+    }
+    assert {
+        kind: (artifact.path, artifact.sha256)
+        for kind, artifact in second.artifacts[0].files.items()
+    } == original_files
+
+    original_render = pipeline.render_event_artifacts
+
+    def changing_render(data, event, features, out_dir):
+        manifest = original_render(data, event, features, out_dir)
+        stat = source_path.stat()
+        os.utime(
+            source_path,
+            ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
+        )
+        return manifest
+
+    monkeypatch.setattr(pipeline, "render_event_artifacts", changing_render)
+    with pytest.raises(pipeline.SourceChangedError, match="changed"):
+        pipeline.analyze_file(
+            source_path,
+            ZdHdf5Reader(),
+            _profile(),
+            select_backend("cpu"),
+            artifact_root,
+        )
+
+    assert all(
+        path.exists() and hashlib.sha256(path.read_bytes()).hexdigest() == digest
+        for path, digest in original_files.values()
+    )
+    assert not list(artifact_root.glob(".das-staging-*"))
+
+
+def test_detect_block_releases_each_distinct_band_before_next(
+    tmp_path, monkeypatch
+):
+    from das_sentinel import pipeline
+
+    source_path = tmp_path / "bands.h5"
+    _write_boundary_file(source_path)
+    block = ZdHdf5Reader().read_block(source_path, 0, 200)
+    profile = _profile().model_copy(
+        update={
+            "coherence_freq_low_hz": 0.5,
+            "coherence_freq_high_hz": 4.0,
+            "energy_bands_hz": ((1.0, 3.0),),
+            "trajectory_freq_low_hz": 2.0,
+            "trajectory_freq_high_hz": 4.0,
+        }
+    )
+    references = []
+    bands = []
+    original_preprocess = pipeline._preprocess_for_band
+
+    def tracked_preprocess(block, profile, backend, band):
+        gc.collect()
+        assert all(reference() is None for reference in references)
+        prepared = original_preprocess(block, profile, backend, band)
+        references.append(weakref.ref(prepared))
+        bands.append(band)
+        return prepared
+
+    monkeypatch.setattr(pipeline, "_preprocess_for_band", tracked_preprocess)
+    monkeypatch.setattr(pipeline, "detect_stalta", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
+
+    pipeline._detect_block(
+        block,
+        profile,
+        select_backend("cpu"),
+        {name: 0.0 for name in pipeline._TIMING_NAMES},
+    )
+
+    assert bands == [(0.5, 4.0), (1.0, 3.0), (2.0, 4.0)]
 
 
 @pytest.mark.parametrize("sample_rate_hz", [float("nan"), 0.0, -1.0])

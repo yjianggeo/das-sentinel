@@ -1,3 +1,5 @@
+import warnings
+
 import numpy as np
 import pytest
 from das_sentinel.config import ProcessingProfile
@@ -125,6 +127,20 @@ def test_moveout_semblance_excludes_truncated_alignment_windows():
 
     np.testing.assert_allclose(semblance[:3], 0.5)
     np.testing.assert_array_equal(semblance[3:], 0.0)
+
+
+def test_coherence_zero_energy_workspace_emits_no_runtime_warning(
+    profile, cpu_backend
+):
+    block = preprocessed_block(
+        np.zeros((600, 6), dtype=np.float32), sample_rate_hz=100.0
+    )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", RuntimeWarning)
+        candidates = detect_coherence(block, profile, cpu_backend)
+
+    assert candidates == []
 
 
 def test_coherence_cuda_matches_cpu_or_skips_when_unavailable(moving_wavefront, profile, cpu_backend):

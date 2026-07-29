@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import shutil
+import tempfile
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
@@ -9,13 +12,17 @@ from datetime import timedelta
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
+from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import numpy as np
 
 from das_sentinel.artifacts import (
+    ArtifactConflictError,
+    ArtifactFile,
     ArtifactManifest,
     EventArtifactData,
+    _process_lock,
     render_event_artifacts,
 )
 from das_sentinel.classifiers.fusion import fuse_classification
@@ -78,7 +85,7 @@ class AnalysisContext:
             snapshot = json.loads(canonical)
         except (TypeError, ValueError) as error:
             raise ValueError("rule_profile must be canonical JSON data") from error
-        object.__setattr__(self, "rule_profile", MappingProxyType(snapshot))
+        object.__setattr__(self, "rule_profile", _freeze_json(snapshot))
         object.__setattr__(
             self,
             "rule_profile_sha256",
@@ -129,12 +136,23 @@ def analyze_file(
     if step_samples <= 0:
         raise ValueError("block overlap leaves no forward progress")
 
-    for sample_start in range(0, sample_count, step_samples):
-        sample_stop = min(sample_count, sample_start + block_samples)
+    lta_history = round(profile.lta_seconds * metadata.sample_rate_hz)
+    for logical_start in range(0, sample_count, step_samples):
+        sample_start = max(0, logical_start - lta_history)
+        sample_stop = min(sample_count, logical_start + block_samples)
+        canonical_stop = (
+            sample_count
+            if sample_stop == sample_count
+            else min(sample_count, logical_start + step_samples)
+        )
         read_started = time.perf_counter()
         block = reader.read_block(source, sample_start, sample_stop)
         timings["read"] += _elapsed_ms(read_started)
-        candidates.extend(_detect_block(block, profile, backend, timings))
+        candidates.extend(
+            candidate
+            for candidate in _detect_block(block, profile, backend, timings)
+            if logical_start <= candidate.peak_sample < canonical_stop
+        )
         if sample_stop == sample_count:
             break
 
@@ -155,100 +173,124 @@ def analyze_file(
 
     events: list[EventRecord] = []
     artifacts: list[ArtifactManifest] = []
+    transaction = (
+        _ArtifactTransaction(Path(artifact_root), source, source_fingerprint)
+        if review_events
+        else None
+    )
     profile_payload = {
         **profile.model_dump(mode="json"),
         "rule_profile": dict(run_context.rule_profile),
         "profile_version": run_context.profile_version,
         "rule_profile_sha256": run_context.rule_profile_sha256,
     }
-    for event in review_events:
-        window_start, window_stop = _event_window(
-            event,
-            sample_count,
-            profile.artifact_pad_seconds,
-            metadata.sample_rate_hz,
-        )
-        read_started = time.perf_counter()
-        raw_block = reader.read_block(source, window_start, window_stop)
-        timings["read"] += _elapsed_ms(read_started)
-
-        primary_detector = _primary_detector(event)
-        preprocess_started = time.perf_counter()
-        filtered_block = _preprocess_for_detector(
-            raw_block, profile, backend, primary_detector
-        )
-        filtered_data = np.asarray(
-            backend.asnumpy(filtered_block.data), dtype=np.float32
-        )
-        feature_block = replace(
-            filtered_block, data=filtered_data, backend_name="cpu"
-        )
-        timings["preprocess"] += _elapsed_ms(preprocess_started)
-
-        classify_started = time.perf_counter()
-        event_start_utc = raw_block.metadata.start_time_utc + timedelta(
-            seconds=(event.start_sample - raw_block.sample_offset)
-            / metadata.sample_rate_hz
-        )
-        features = extract_features(
-            feature_block,
-            event,
-            context={
-                "site_id": run_context.site_id,
-                "cable_type": run_context.cable_type,
-                "device_config": run_context.device_config,
-                "start_time_utc": event_start_utc,
-            },
-        )
-        rule_result = score_rules(features, run_context.rule_profile)
-        quality_flags = tuple(
-            sorted(
-                {
-                    flag
-                    for evidence in event.evidence
-                    for flag in evidence.quality_flags
-                }
+    try:
+        for event in review_events:
+            window_start, window_stop = _event_window(
+                event,
+                sample_count,
+                profile.artifact_pad_seconds,
+                metadata.sample_rate_hz,
             )
-        )
-        decision = fuse_classification(rule_result.scores, None, quality_flags)
-        classified = replace(
-            event,
-            features=dict(features),
-            label=decision.label,
-            decision_score=decision.decision_score,
-            reasons=decision.reasons,
-        )
-        timings["classify"] += _elapsed_ms(classify_started)
-        events.append(classified)
+            read_started = time.perf_counter()
+            raw_block = reader.read_block(source, window_start, window_stop)
+            timings["read"] += _elapsed_ms(read_started)
 
-        render_started = time.perf_counter()
-        artifact_data = EventArtifactData(
-            raw_data=raw_block.data,
-            filtered_data=filtered_data,
-            sample_offset=raw_block.sample_offset,
-            sample_rate_hz=raw_block.metadata.sample_rate_hz,
-            channel_distance_m=raw_block.metadata.channel_distance_m,
-            bad_channel_mask=filtered_block.bad_channel_mask,
-            start_time_utc=raw_block.metadata.start_time_utc,
-            site_timezone=run_context.site_timezone,
-            profile=profile_payload,
-            profile_version=run_context.profile_version,
-            pipeline_version=run_context.pipeline_version,
-            model_version="rules-only",
-            backend_name=backend.name,
-            rule_output=_rule_output(rule_result, run_context),
-            model_output=None,
-        )
-        _ensure_source_unchanged(source, source_fingerprint)
-        artifacts.append(
-            render_event_artifacts(
-                artifact_data, classified, features, Path(artifact_root)
+            primary_detector = _primary_detector(event)
+            preprocess_started = time.perf_counter()
+            filtered_block = _preprocess_for_detector(
+                raw_block, profile, backend, primary_detector
             )
-        )
-        _ensure_source_unchanged(source, source_fingerprint)
-        timings["render"] += _elapsed_ms(render_started)
+            filtered_data = np.asarray(
+                backend.asnumpy(filtered_block.data), dtype=np.float32
+            )
+            feature_block = replace(
+                filtered_block, data=filtered_data, backend_name="cpu"
+            )
+            timings["preprocess"] += _elapsed_ms(preprocess_started)
 
-    _ensure_source_unchanged(source, source_fingerprint)
+            classify_started = time.perf_counter()
+            event_start_utc = raw_block.metadata.start_time_utc + timedelta(
+                seconds=(event.start_sample - raw_block.sample_offset)
+                / metadata.sample_rate_hz
+            )
+            features = extract_features(
+                feature_block,
+                event,
+                context={
+                    "site_id": run_context.site_id,
+                    "cable_type": run_context.cable_type,
+                    "device_config": run_context.device_config,
+                    "start_time_utc": event_start_utc,
+                },
+            )
+            rule_result = score_rules(features, run_context.rule_profile)
+            quality_flags = tuple(
+                sorted(
+                    {
+                        flag
+                        for evidence in event.evidence
+                        for flag in evidence.quality_flags
+                    }
+                )
+            )
+            decision = fuse_classification(rule_result.scores, None, quality_flags)
+            classified = replace(
+                event,
+                features=dict(features),
+                label=decision.label,
+                decision_score=decision.decision_score,
+                reasons=decision.reasons,
+            )
+            timings["classify"] += _elapsed_ms(classify_started)
+            events.append(classified)
+
+            render_started = time.perf_counter()
+            artifact_data = EventArtifactData(
+                raw_data=raw_block.data,
+                filtered_data=filtered_data,
+                sample_offset=raw_block.sample_offset,
+                sample_rate_hz=raw_block.metadata.sample_rate_hz,
+                channel_distance_m=raw_block.metadata.channel_distance_m,
+                bad_channel_mask=filtered_block.bad_channel_mask,
+                start_time_utc=raw_block.metadata.start_time_utc,
+                site_timezone=run_context.site_timezone,
+                profile=profile_payload,
+                profile_version=run_context.profile_version,
+                pipeline_version=run_context.pipeline_version,
+                model_version="rules-only",
+                backend_name=backend.name,
+                rule_output=_rule_output(rule_result, run_context),
+                model_output=None,
+            )
+            _ensure_source_unchanged(source, source_fingerprint)
+            if transaction is None:
+                raise RuntimeError("artifact transaction is unavailable")
+            transaction.add(
+                render_event_artifacts(
+                    artifact_data,
+                    classified,
+                    features,
+                    transaction.staging_root,
+                )
+            )
+            _ensure_source_unchanged(source, source_fingerprint)
+            timings["render"] += _elapsed_ms(render_started)
+        if transaction is not None:
+            artifacts.extend(transaction.commit())
+        _ensure_source_unchanged(source, source_fingerprint)
+    except BaseException:
+        if transaction is not None:
+            transaction._rollback()
+        raise
+    finally:
+        if transaction is not None:
+            try:
+                transaction.close()
+            except BaseException:
+                transaction._rollback()
+                raise
+
     timings["total"] = _elapsed_ms(started)
     return FileAnalysis(
         source_path=str(source),
@@ -269,43 +311,51 @@ def _detect_block(
     backend: ArrayBackend,
     timings: dict[str, float],
 ) -> list[Candidate]:
-    prepared: dict[tuple[float, float], PreprocessedBlock] = {}
-
-    def prepared_for(detector: str) -> PreprocessedBlock:
-        band = _detector_band(profile, detector)
-        if band not in prepared:
-            preprocess_started = time.perf_counter()
-            prepared[band] = _preprocess_for_band(block, profile, backend, band)
-            timings["preprocess"] += _elapsed_ms(preprocess_started)
-        return prepared[band]
-
     found: list[Candidate] = []
-    prepared_block = prepared_for("stalta")
-    detect_started = time.perf_counter()
-    found.extend(detect_stalta(prepared_block, profile))
-    timings["detect"] += _elapsed_ms(detect_started)
-
-    prepared_block = prepared_for("energy")
-    detect_started = time.perf_counter()
-    found.extend(detect_energy(prepared_block, profile))
-    timings["detect"] += _elapsed_ms(detect_started)
-
-    prepared_block = prepared_for("coherence")
-    detect_started = time.perf_counter()
-    found.extend(detect_coherence(prepared_block, profile, backend))
-    timings["detect"] += _elapsed_ms(detect_started)
-
-    prepared_block = prepared_for("trajectory")
-    if prepared_block.backend_name != "cpu":
-        prepared_block = replace(
-            prepared_block,
-            data=np.asarray(backend.asnumpy(prepared_block.data), dtype=np.float32),
-            backend_name="cpu",
-        )
-    detect_started = time.perf_counter()
-    found.extend(detect_trajectories(prepared_block, profile))
-    timings["detect"] += _elapsed_ms(detect_started)
+    grouped: dict[tuple[float, float], list[str]] = {}
+    for detector in ("stalta", "energy", "coherence", "trajectory"):
+        grouped.setdefault(_detector_band(profile, detector), []).append(detector)
+    for band, detectors in grouped.items():
+        preprocess_started = time.perf_counter()
+        prepared_block = _preprocess_for_band(block, profile, backend, band)
+        timings["preprocess"] += _elapsed_ms(preprocess_started)
+        for detector in detectors:
+            detector_block = prepared_block
+            if detector == "trajectory" and detector_block.backend_name != "cpu":
+                detector_block = replace(
+                    detector_block,
+                    data=np.asarray(
+                        backend.asnumpy(detector_block.data), dtype=np.float32
+                    ),
+                    backend_name="cpu",
+                )
+            detect_started = time.perf_counter()
+            found.extend(
+                _run_detector(detector, detector_block, profile, backend)
+            )
+            timings["detect"] += _elapsed_ms(detect_started)
+            del detector_block
+        del prepared_block
+        if hasattr(backend, "clear_cache"):
+            backend.clear_cache()
     return found
+
+
+def _run_detector(
+    detector: str,
+    block: PreprocessedBlock,
+    profile: ProcessingProfile,
+    backend: ArrayBackend,
+) -> list[Candidate]:
+    if detector == "stalta":
+        return detect_stalta(block, profile)
+    if detector == "energy":
+        return detect_energy(block, profile)
+    if detector == "coherence":
+        return detect_coherence(block, profile, backend)
+    if detector == "trajectory":
+        return detect_trajectories(block, profile)
+    raise ValueError(f"unknown detector: {detector}")
 
 
 def _detector_band(
@@ -385,6 +435,143 @@ def _rule_output(
         "profile_version": context.profile_version,
         "rule_profile_sha256": context.rule_profile_sha256,
     }
+
+
+def _freeze_json(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {key: _freeze_json(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_json(item) for item in value)
+    return value
+
+
+class _ArtifactTransaction:
+    def __init__(
+        self, artifact_root: Path, source: Path, source_fingerprint: str
+    ) -> None:
+        artifact_root.mkdir(parents=True, exist_ok=True)
+        self.final_root = artifact_root.resolve(strict=True)
+        self.source = source
+        self.source_fingerprint = source_fingerprint
+        self.staging_root = Path(
+            tempfile.mkdtemp(prefix=".das-staging-", dir=self.final_root)
+        ).resolve(strict=True)
+        if self.staging_root.parent != self.final_root:
+            raise ValueError("artifact staging path escapes final root")
+        self._staged: list[ArtifactManifest] = []
+        self._promoted: list[Path] = []
+
+    def add(self, manifest: ArtifactManifest) -> None:
+        self._staged.append(manifest)
+
+    def commit(self) -> list[ArtifactManifest]:
+        completed: list[ArtifactManifest] = []
+        lock_path = self.final_root / ".pipeline-promote.lock"
+        with _process_lock(lock_path):
+            try:
+                _ensure_source_unchanged(
+                    self.source, self.source_fingerprint
+                )
+                for manifest in self._staged:
+                    final_manifest, created = _promote_event_directory(
+                        manifest, self.staging_root, self.final_root
+                    )
+                    if created:
+                        self._promoted.append(
+                            self.final_root / manifest.event_id
+                        )
+                    completed.append(final_manifest)
+                    _ensure_source_unchanged(
+                        self.source, self.source_fingerprint
+                    )
+                _ensure_source_unchanged(
+                    self.source, self.source_fingerprint
+                )
+            except BaseException:
+                self._rollback()
+                raise
+        return completed
+
+    def close(self) -> None:
+        _remove_staging_directory(self.staging_root, self.final_root)
+
+    def _rollback(self) -> None:
+        for event_dir in reversed(self._promoted):
+            _remove_promoted_directory(event_dir, self.final_root)
+        self._promoted.clear()
+
+
+def _promote_event_directory(
+    manifest: ArtifactManifest, staging_root: Path, final_root: Path
+) -> tuple[ArtifactManifest, bool]:
+    event_id = str(UUID(manifest.event_id))
+    staging_event = (staging_root / event_id).resolve(strict=True)
+    if staging_event.parent != staging_root:
+        raise ValueError("staged artifact path escapes staging root")
+    final_event = final_root / event_id
+    if final_event.exists():
+        return _manifest_at_final(manifest, final_event, final_root), False
+    created = False
+    try:
+        os.replace(staging_event, final_event)
+        created = True
+    except OSError:
+        if not final_event.exists():
+            raise
+        return _manifest_at_final(manifest, final_event, final_root), False
+    try:
+        return _manifest_at_final(manifest, final_event, final_root), True
+    except BaseException:
+        if created:
+            _remove_promoted_directory(final_event, final_root)
+        raise
+
+
+def _manifest_at_final(
+    staged: ArtifactManifest, final_event: Path, final_root: Path
+) -> ArtifactManifest:
+    resolved_event = final_event.resolve(strict=True)
+    if resolved_event != final_event or resolved_event.parent != final_root:
+        raise ValueError("final artifact path escapes final root")
+    files: dict[str, ArtifactFile] = {}
+    for kind, staged_file in staged.files.items():
+        final_file = (resolved_event / staged_file.path.name).resolve(strict=True)
+        if final_file.parent != resolved_event:
+            raise ValueError("final artifact file escapes event directory")
+        digest = hashlib.sha256(final_file.read_bytes()).hexdigest()
+        if digest != staged_file.sha256:
+            raise ArtifactConflictError(
+                f"artifact already exists with different bytes: {kind}"
+            )
+        files[kind] = ArtifactFile(
+            kind=kind,
+            path=final_file,
+            media_type=staged_file.media_type,
+            sha256=digest,
+        )
+    return ArtifactManifest(staged.event_id, files)
+
+
+def _remove_staging_directory(staging_root: Path, final_root: Path) -> None:
+    if not staging_root.exists():
+        return
+    if (
+        staging_root.parent != final_root
+        or not staging_root.name.startswith(".das-staging-")
+    ):
+        raise ValueError("refusing to remove unvalidated artifact staging path")
+    shutil.rmtree(staging_root)
+
+
+def _remove_promoted_directory(event_dir: Path, final_root: Path) -> None:
+    if not event_dir.exists():
+        return
+    if event_dir.parent != final_root:
+        raise ValueError("refusing to remove artifact outside final root")
+    UUID(event_dir.name)
+    shutil.rmtree(event_dir)
 
 
 def _deduplicate_candidates(

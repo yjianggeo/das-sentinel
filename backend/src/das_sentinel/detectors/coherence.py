@@ -52,9 +52,10 @@ def _moveout_semblance(data: Any, delays: Any, width: int, xp: Any) -> tuple[Any
     denominator = valid_channels * individual_energy
     window_numerator = _trailing_sum(xp.square(stack), width, xp)
     window_denominator = _trailing_sum(denominator, width, xp)
+    epsilon = xp.finfo(data.dtype).eps
     raw = xp.where(
-        window_denominator > xp.finfo(data.dtype).eps,
-        window_numerator / window_denominator,
+        window_denominator > epsilon,
+        window_numerator / xp.maximum(window_denominator, epsilon),
         0.0,
     )
     valid_windows = _trailing_sum((valid_channels == channels).astype(data.dtype), width, xp) == width

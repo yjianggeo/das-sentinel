@@ -135,20 +135,37 @@ def test_baseline_file_stays_under_memory_budget(tmp_path, monkeypatch):
 
     baseline_h5 = tmp_path / "baseline.h5"
     _write_baseline_h5(baseline_h5)
+    detector_calls = {"energy": 0, "coherence": 0, "trajectory": 0}
+    preprocess_bands = []
+    original_energy = pipeline.detect_energy
+    original_coherence = pipeline.detect_coherence
+    original_trajectory = pipeline.detect_trajectories
+    original_preprocess = pipeline._preprocess_for_band
+
+    def tracked_energy(*args):
+        detector_calls["energy"] += 1
+        return original_energy(*args)
+
+    def tracked_coherence(*args):
+        detector_calls["coherence"] += 1
+        return original_coherence(*args)
+
+    def tracked_trajectory(*args):
+        detector_calls["trajectory"] += 1
+        return original_trajectory(*args)
+
+    def tracked_preprocess(block, profile, backend, band):
+        preprocess_bands.append(band)
+        return original_preprocess(block, profile, backend, band)
+
     monkeypatch.setattr(pipeline, "detect_stalta", _fixed_capacity_event)
-    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_energy", tracked_energy)
+    monkeypatch.setattr(pipeline, "detect_coherence", tracked_coherence)
+    monkeypatch.setattr(pipeline, "detect_trajectories", tracked_trajectory)
+    monkeypatch.setattr(pipeline, "_preprocess_for_band", tracked_preprocess)
     profile = ProcessingProfile(
         block_seconds=20.0,
         overlap_seconds=5.0,
-        stalta_freq_low_hz=2.0,
-        stalta_freq_high_hz=40.0,
-        coherence_freq_low_hz=2.0,
-        coherence_freq_high_hz=40.0,
-        trajectory_freq_low_hz=2.0,
-        trajectory_freq_high_hz=40.0,
-        energy_bands_hz=((2.0, 40.0),),
         artifact_pad_seconds=0.1,
     )
 
@@ -158,6 +175,11 @@ def test_baseline_file_stays_under_memory_budget(tmp_path, monkeypatch):
     assert len(ZdHdf5Reader().read_metadata(baseline_h5).channel_distance_m) == 1_000
     assert len(result.analysis.events) == 1
     assert len(result.analysis.artifacts) == 1
+    assert detector_calls == {"energy": 4, "coherence": 4, "trajectory": 4}
+    assert preprocess_bands.count((2.0, 40.0)) == 5
+    assert preprocess_bands.count((0.5, 80.0)) == 4
+    assert preprocess_bands.count((1.0, 40.0)) == 4
+    assert preprocess_bands.count((1.0, 30.0)) == 4
     assert set(result.analysis.artifacts[0].files) == {
         "waterfall_raw",
         "waterfall_filtered",
@@ -171,7 +193,7 @@ def test_baseline_file_stays_under_memory_budget(tmp_path, monkeypatch):
         for artifact in result.analysis.artifacts[0].files.values()
     )
     assert result.peak_rss_bytes < 4 * 1024**3
-    assert result.wall_time_seconds > 0
+    assert 0 < result.wall_time_seconds < 120
     if os.environ.get("DAS_PERFORMANCE_REPORT"):
         print(
             f"baseline peak RSS: {result.peak_rss_bytes / 1024**3:.3f} GiB; "
