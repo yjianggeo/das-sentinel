@@ -1268,7 +1268,9 @@ git commit -m "feat(api): add admin session and site management"
 - Create: `tests/test_worker_protocol.py`
 
 **Interfaces:**
-- Produces: `JobService.enqueue/claim/heartbeat/complete/fail/recover_stale`, public job routes, internal worker routes.
+- Produces: `JobService.enqueue/claim/heartbeat/complete/fail/retry/cancel/recover_stale`;
+  authenticated public enqueue/list/detail/retry/cancel routes; and worker-token internal
+  claim/heartbeat/complete/fail routes.
 
 - [ ] **Step 1: Add failing atomic-claim and stale-recovery tests**
 
@@ -1300,6 +1302,32 @@ Use states `queued/running/succeeded/failed/cancelled`, an attempt counter, hear
 progress numerator/denominator, error code/message, and retry eligibility. Claim and state
 transitions execute under the API write lock. Internal submission validates worker token,
 job ownership, pipeline/profile versions, and artifact paths below the configured root.
+
+Repository/service methods flush but never commit; the caller owns a short transaction.
+Enqueue validates that source and immutable profile belong to the same enabled site and is
+idempotent for an existing source/profile/pipeline job. Claim selects the oldest eligible
+queued job, increments its attempt count, assigns exactly one non-empty worker ID, records
+a UTC heartbeat, and returns the immutable source path/fingerprint, site
+timezone/cable type, profile version/payload, and pipeline version needed by Task 16.
+The one application writer lock serializes claim/cancel/retry/heartbeat/final transitions.
+Synchronous SQLite and filesystem checks run in a worker thread rather than the Uvicorn
+event loop.
+
+Heartbeats require the owning worker and validate `0 <= numerator <= denominator`.
+Completion/failure require `running` plus the owning worker. Completion also requires exact
+profile and pipeline versions and resolves every existing regular artifact path below
+`Settings.app_data_dir / "artifacts"` without following an escape. Failure stores bounded
+structured error fields. Retry only changes an eligible failed job back to queued while
+below a fixed three-attempt limit; cancellation is allowed only before a terminal state.
+Stale running jobs older than two minutes return to queued while attempts remain, otherwise
+become non-retryable failed jobs. API startup invokes stale recovery after the database
+safety check.
+
+Authenticate internal routes only with a non-empty `X-Worker-Token` compared in constant
+time to `Settings.worker_token`; never accept browser session/CSRF as a substitute and
+never expose the token. Public job writes use the existing enabled-admin session and CSRF
+requirements. Return 404 for missing jobs, 409 for invalid state/owner/version transitions,
+422 for malformed progress or unsafe artifact paths, and 401 for a wrong worker token.
 
 - [ ] **Step 4: Run job tests**
 
