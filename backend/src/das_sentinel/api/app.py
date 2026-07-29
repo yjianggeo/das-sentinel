@@ -5,12 +5,15 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.requests import Request
 from starlette.responses import Response
 
 from das_sentinel.api.routes.auth import router as auth_router
+from das_sentinel.api.routes.internal import router as internal_router
+from das_sentinel.api.routes.jobs import router as jobs_router
 from das_sentinel.api.routes.sites import router as sites_router
 from das_sentinel.config import Settings
 from das_sentinel.persistence import (
@@ -19,6 +22,7 @@ from das_sentinel.persistence import (
     create_local_engine,
     session_factory,
 )
+from das_sentinel.services.jobs import JobService
 
 
 class ApiSessionSecurityMiddleware(BaseHTTPMiddleware):
@@ -43,6 +47,11 @@ def create_app(settings: Settings) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         try:
             check_database_startup(engine)
+            await run_in_threadpool(
+                _recover_stale_jobs,
+                app.state.session_factory,
+                settings.app_data_dir / "artifacts",
+            )
             yield
         finally:
             engine.dispose()
@@ -63,4 +72,11 @@ def create_app(settings: Settings) -> FastAPI:
     )
     app.include_router(auth_router, prefix="/api/v1")
     app.include_router(sites_router, prefix="/api/v1")
+    app.include_router(jobs_router, prefix="/api/v1")
+    app.include_router(internal_router, prefix="/api/v1")
     return app
+
+
+def _recover_stale_jobs(sessions, artifact_root) -> list[str]:
+    with sessions.begin() as session:
+        return JobService(session, artifact_root).recover_stale()

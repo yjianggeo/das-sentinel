@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
@@ -9,6 +9,7 @@ from pydantic import (
     ConfigDict,
     Field,
     SecretStr,
+    StringConstraints,
     field_validator,
     model_validator,
 )
@@ -18,6 +19,16 @@ from das_sentinel.config import ProcessingProfile
 
 class StrictSchema(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+WorkerId = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
+]
+PipelineVersion = Annotated[
+    str,
+    StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
+]
 
 
 class LoginRequest(StrictSchema):
@@ -138,6 +149,80 @@ class SiteResponse(StrictSchema):
     enabled: bool
     created_at: datetime
     current_profile: ProfileResponse
+
+
+class JobEnqueueRequest(StrictSchema):
+    source_file_id: str = Field(min_length=1, max_length=36)
+    processing_profile_id: str = Field(min_length=1, max_length=36)
+    pipeline_version: PipelineVersion
+
+
+class JobResponse(StrictSchema):
+    id: str
+    source_file_id: str
+    processing_profile_id: str
+    pipeline_version: str
+    status: Literal["queued", "running", "succeeded", "failed", "cancelled"]
+    attempt_count: int
+    worker_id: str | None
+    heartbeat_at: datetime | None
+    progress_numerator: int
+    progress_denominator: int
+    error_code: str | None
+    error_message: str | None
+    retry_eligible: bool
+    created_at: datetime
+    updated_at: datetime
+
+
+class WorkerClaimRequest(StrictSchema):
+    worker_id: WorkerId
+
+
+class JobClaimResponse(StrictSchema):
+    id: str
+    source_file_id: str
+    source_path: str
+    source_fingerprint: str
+    site_id: str
+    site_timezone: str
+    cable_type: str
+    processing_profile_id: str
+    profile_version: int
+    profile_payload: dict[str, Any]
+    pipeline_version: str
+    attempt_count: int
+    worker_id: str
+    heartbeat_at: datetime
+
+
+class WorkerHeartbeatRequest(StrictSchema):
+    worker_id: WorkerId
+    numerator: int = Field(ge=0)
+    denominator: int = Field(ge=0)
+
+    @model_validator(mode="after")
+    def validate_progress(self) -> WorkerHeartbeatRequest:
+        if self.numerator > self.denominator:
+            raise ValueError("numerator must not exceed denominator")
+        return self
+
+
+ArtifactPath = Annotated[str, Field(min_length=1, max_length=4096)]
+
+
+class WorkerCompleteRequest(StrictSchema):
+    worker_id: WorkerId
+    profile_version: int = Field(ge=1)
+    pipeline_version: PipelineVersion
+    artifact_paths: list[ArtifactPath] = Field(default_factory=list, max_length=1000)
+
+
+class WorkerFailRequest(StrictSchema):
+    worker_id: WorkerId
+    error_code: str = Field(min_length=1, max_length=128)
+    error_message: str = Field(min_length=1, max_length=4096)
+    retry_eligible: bool = True
 
 
 def _iana_timezone(value: str) -> str:
