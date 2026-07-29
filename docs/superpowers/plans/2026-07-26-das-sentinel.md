@@ -577,9 +577,12 @@ Expected: FAIL importing detector modules.
 - [ ] **Step 3: Implement detector-specific evidence**
 
 STA/LTA uses squared signal, cumulative-window means, a safe epsilon, channel coincidence,
-edge suppression equal to the longer filter/STA margin, and run grouping. Energy detection
-computes window RMS ratio, excess kurtosis, peak/median, normalized Welch band powers, and
-spectral entropy. Each detector returns global sample indexes by adding
+and run grouping. Its trailing windows use only past samples: the leading LTA eligibility
+already supplies edge protection, so do not discard a second full LTA window at the right
+edge. A default 20-second block with a 10-second LTA must retain enough eligible samples
+for the configured minimum event duration. Energy detection computes window RMS ratio,
+excess kurtosis, peak/median, normalized Welch band powers, and spectral entropy. Each
+detector returns global sample indexes by adding
 `PreprocessedBlock.sample_offset`. For an accepted raw ratio `r` and detector threshold
 `t`, normalize the candidate score as `0.60 + 0.40 * clip((r - t) / t, 0, 1)`;
 retain the unmodified raw ratio in candidate metrics.
@@ -996,6 +999,9 @@ git commit -m "feat(artifacts): render waterfall and spectral products"
   `pipeline-v1`, unknown cable/device, and an empty rule profile), so the original
   five-argument call remains valid. Task 11 is rules-only and records model version
   `rules-only`; later worker/model tasks may extend model inputs explicitly.
+- Canonicalize and snapshot `rule_profile` at context construction. Artifact evidence
+  records the rule profile itself, `profile_version`, and its canonical SHA-256 so the
+  rules-only decision can be reproduced.
 
 - [ ] **Step 1: Add failing cross-block and idempotent-result tests**
 
@@ -1037,8 +1043,11 @@ class FileAnalysis:
 Use `reader.sample_count(path)` to include the final partial block without bypassing the
 reader abstraction. Read 20-second blocks with 5-second overlap, preprocess once per
 detector frequency bank, run the enabled detectors, translate to file-global indexes,
-fuse after all blocks, extract features from event windows, classify, and render only
-fused review events. For each rendered event, assemble one `EventArtifactData` from the
+deduplicate same-detector overlap copies before audit/fusion (prefer unflagged, then
+higher-score evidence), fuse after all blocks, extract features from event windows,
+classify, and render only fused review events. CUDA arrays entering CPU-only trajectory,
+feature, or artifact paths use an explicit backend transfer. For each rendered event,
+assemble one `EventArtifactData` from the
 true raw samples and the matching filtered samples, preserving their shared sample/channel
 coordinates plus UTC and site timezone metadata from `AnalysisContext`. Return audit
 candidates separately from review events. `FileAnalysis` contains source fingerprint,
@@ -1046,8 +1055,10 @@ metadata warnings, events, audit candidate count, timings, actual backend, and a
 manifests.
 
 The source fingerprint is SHA-256 over a canonical JSON tuple of the resolved source path,
-file size, and nanosecond modification time. Pass it into fusion. Do not hash the complete
-DAS payload a second time.
+file size, and nanosecond modification time. Pass it into fusion and verify it after block
+reads and before/following artifact rendering; fail the run if it changes. Do not hash the
+complete DAS payload a second time. Validate the metadata sample rate as finite and
+positive, and reject detector/energy bands outside its Nyquist range before processing.
 
 - [ ] **Step 4: Run pipeline and opt-in performance tests**
 
@@ -1057,8 +1068,9 @@ Expected: PASS.
 
 Run: `python -m pytest tests/test_performance.py -m performance -q`
 
-Expected: PASS on the configured baseline host; record wall time rather than asserting a
-universal GPU speedup.
+Expected: PASS on the configured baseline host for the approved logical baseline
+`60 s x 1 kHz x 1000 channels`, including at least one bounded event artifact, with peak
+RSS below 4 GiB. Record wall time rather than asserting a universal GPU speedup.
 
 - [ ] **Step 5: Commit**
 
