@@ -181,6 +181,8 @@ def test_enqueue_claim_heartbeat_complete_protocol_and_no_token_leak(api_client)
     )
     assert claim.status_code == 200
     assert claim.json()["id"] == job_id
+    assert claim.json()["source_size_bytes"] == 1
+    assert claim.json()["source_mtime_ns"] == 2
     assert claim.json()["profile_version"] == 4
     assert claim.json()["profile_payload"] == {"device": "auto"}
 
@@ -250,6 +252,40 @@ def test_protocol_maps_not_found_conflict_and_validation(api_client):
 
     missing_public = client.get("/api/v1/jobs/missing")
     assert missing_public.status_code == 404
+
+
+@pytest.mark.parametrize(
+    "progress",
+    [
+        {"numerator": "1", "denominator": 1},
+        {"numerator": 1.0, "denominator": 1},
+        {"numerator": True, "denominator": 1},
+        {"numerator": 0, "denominator": 2**63},
+    ],
+)
+def test_heartbeat_api_rejects_non_strict_or_sqlite_overflow_progress(
+    api_client,
+    progress,
+):
+    client, _, token, source_id, profile_id = api_client
+    job_id = _enqueue(client, token, source_id, profile_id).json()["id"]
+    client.post(
+        "/api/v1/internal/jobs/claim",
+        json={"worker_id": "worker-a"},
+        headers={"X-Worker-Token": WORKER_TOKEN},
+    )
+
+    response = client.post(
+        f"/api/v1/internal/jobs/{job_id}/heartbeat",
+        json={"worker_id": "worker-a", **progress},
+        headers={"X-Worker-Token": WORKER_TOKEN},
+    )
+
+    assert response.status_code == 422
+    unchanged = client.get(f"/api/v1/jobs/{job_id}")
+    assert unchanged.json()["status"] == "running"
+    assert unchanged.json()["progress_numerator"] == 0
+    assert unchanged.json()["progress_denominator"] == 0
 
 
 def test_public_retry_cancel_state_rules(api_client):

@@ -199,6 +199,8 @@ def claim_response(claim: JobClaim) -> JobClaimResponse:
         source_file_id=claim.source_file_id,
         source_path=claim.source_path,
         source_fingerprint=claim.source_fingerprint,
+        source_size_bytes=claim.source_size_bytes,
+        source_mtime_ns=claim.source_mtime_ns,
         site_id=claim.site_id,
         site_timezone=claim.site_timezone,
         cable_type=claim.cable_type,

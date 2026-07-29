@@ -9,6 +9,7 @@ from pydantic import (
     ConfigDict,
     Field,
     SecretStr,
+    StrictInt,
     StringConstraints,
     field_validator,
     model_validator,
@@ -25,6 +26,7 @@ WorkerId = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
 ]
+ProgressInteger = Annotated[StrictInt, Field(ge=0, le=2**63 - 1)]
 PipelineVersion = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=128),
@@ -184,6 +186,8 @@ class JobClaimResponse(StrictSchema):
     source_file_id: str
     source_path: str
     source_fingerprint: str
+    source_size_bytes: int
+    source_mtime_ns: int
     site_id: str
     site_timezone: str
     cable_type: str
@@ -198,8 +202,8 @@ class JobClaimResponse(StrictSchema):
 
 class WorkerHeartbeatRequest(StrictSchema):
     worker_id: WorkerId
-    numerator: int = Field(ge=0)
-    denominator: int = Field(ge=0)
+    numerator: ProgressInteger
+    denominator: ProgressInteger
 
     @model_validator(mode="after")
     def validate_progress(self) -> WorkerHeartbeatRequest:

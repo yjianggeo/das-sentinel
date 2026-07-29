@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import subprocess
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -14,6 +16,7 @@ from das_sentinel.persistence import (
 )
 from das_sentinel.persistence.models import Job
 from das_sentinel.services.jobs import (
+    MAX_SQLITE_INTEGER,
     JobConflictError,
     JobNotFoundError,
     JobService,
@@ -154,6 +157,13 @@ def test_claim_selects_oldest_and_returns_deeply_immutable_snapshot(job_database
         assert claim.worker_id == "worker-a"
         assert claim.source_path == "C:/das/raw/a.h5"
         assert claim.source_fingerprint == "a" * 64
+        assert claim.source_size_bytes == 123
+        assert claim.source_mtime_ns == 456
+        source.size_bytes = 999
+        source.mtime_ns = 999
+        service.session.flush()
+        assert claim.source_size_bytes == 123
+        assert claim.source_mtime_ns == 456
         assert claim.site_timezone == "Asia/Shanghai"
         assert claim.cable_type == "urban"
         assert claim.profile_version == 7
@@ -197,6 +207,32 @@ def test_heartbeat_requires_owner_and_valid_progress_without_partial_change(
         assert (updated.progress_numerator, updated.progress_denominator) == (2, 3)
         assert updated.heartbeat_at == heartbeat
         assert updated.heartbeat_at.utcoffset() == timedelta(0)
+
+
+@pytest.mark.parametrize(
+    ("numerator", "denominator"),
+    [
+        ("1", 1),
+        (1.0, 1),
+        (True, 1),
+        (0, MAX_SQLITE_INTEGER + 1),
+    ],
+)
+def test_heartbeat_requires_strict_sqlite_range_integers_without_partial_change(
+    job_database,
+    numerator,
+    denominator,
+):
+    with seeded_service(job_database) as (service, _, _, profile, source):
+        job = service.enqueue(source.id, profile.id, "pipeline-v1")
+        service.claim("worker-a")
+
+        with pytest.raises(JobValidationError, match="progress"):
+            service.heartbeat(job.id, "worker-a", numerator, denominator)
+
+        unchanged = service.get(job.id)
+        assert unchanged.status == "running"
+        assert (unchanged.progress_numerator, unchanged.progress_denominator) == (0, 0)
 
 
 def test_complete_requires_owner_and_exact_versions(job_database, tmp_path: Path):
@@ -271,6 +307,127 @@ def test_complete_rejects_unsafe_artifacts_without_changing_job(
                 profile.version,
                 "pipeline-v1",
                 [unsafe],
+            )
+
+        assert service.get(job.id).status == "running"
+
+
+def test_complete_rejects_symlinked_artifact_root_even_for_resolved_file(
+    job_database,
+    tmp_path: Path,
+):
+    with seeded_service(job_database) as (service, _, _, profile, source):
+        job = service.enqueue(source.id, profile.id, "pipeline-v1")
+        service.claim("worker-a")
+        outside = tmp_path / "outside-root"
+        outside.mkdir()
+        artifact = outside / "waterfall.png"
+        artifact.write_bytes(b"png")
+        service.artifact_root.rmdir()
+        try:
+            service.artifact_root.symlink_to(outside, target_is_directory=True)
+        except OSError as error:
+            pytest.skip(f"directory symlink unavailable: {error}")
+
+        with pytest.raises(JobValidationError, match="artifact root"):
+            service.complete(
+                job.id,
+                "worker-a",
+                profile.version,
+                "pipeline-v1",
+                [artifact],
+            )
+
+        assert service.get(job.id).status == "running"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows junction regression")
+def test_complete_rejects_junction_artifact_root_even_for_resolved_file(
+    job_database,
+    tmp_path: Path,
+):
+    with seeded_service(job_database) as (service, _, _, profile, source):
+        job = service.enqueue(source.id, profile.id, "pipeline-v1")
+        service.claim("worker-a")
+        outside = tmp_path / "outside-junction"
+        outside.mkdir()
+        artifact = outside / "waterfall.png"
+        artifact.write_bytes(b"png")
+        service.artifact_root.rmdir()
+        created = subprocess.run(
+            [
+                "cmd",
+                "/c",
+                "mklink",
+                "/J",
+                str(service.artifact_root),
+                str(outside),
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        if created.returncode != 0:
+            pytest.skip(f"junction unavailable: {created.stderr or created.stdout}")
+
+        with pytest.raises(JobValidationError, match="artifact root"):
+            service.complete(
+                job.id,
+                "worker-a",
+                profile.version,
+                "pipeline-v1",
+                [artifact],
+            )
+
+        assert service.get(job.id).status == "running"
+
+
+def test_complete_parent_replacement_cannot_redirect_validation(
+    job_database,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import das_sentinel.services.jobs as job_module
+
+    with seeded_service(job_database) as (service, _, _, profile, source):
+        job = service.enqueue(source.id, profile.id, "pipeline-v1")
+        service.claim("worker-a")
+        parent = service.artifact_root / "run"
+        parent.mkdir()
+        artifact = parent / "waterfall.png"
+        artifact.write_bytes(b"trusted")
+        moved = service.artifact_root / "run-original"
+        outside = tmp_path / "attacker"
+        outside.mkdir()
+        (outside / "waterfall.png").write_bytes(b"outside")
+        original_open = job_module._open_artifact_component
+        replaced = False
+
+        def replace_before_open(path, parent_handle, *, expect_directory):
+            nonlocal replaced
+            if path == parent and not replaced:
+                replaced = True
+                parent.rename(moved)
+                path.symlink_to(outside, target_is_directory=True)
+            return original_open(
+                path,
+                parent_handle,
+                expect_directory=expect_directory,
+            )
+
+        monkeypatch.setattr(
+            job_module,
+            "_open_artifact_component",
+            replace_before_open,
+        )
+
+        with pytest.raises(JobValidationError, match="artifact"):
+            service.complete(
+                job.id,
+                "worker-a",
+                profile.version,
+                "pipeline-v1",
+                [artifact],
             )
 
         assert service.get(job.id).status == "running"
