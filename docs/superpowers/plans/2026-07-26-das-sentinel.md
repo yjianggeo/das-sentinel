@@ -1212,8 +1212,19 @@ Expected: FAIL importing `create_app`.
 - [ ] **Step 3: Implement single-admin sessions and site profile versions**
 
 Hash with `argon2.PasswordHasher`; never return password hashes. Store admin ID and random
-CSRF token in signed sessions. Require `X-CSRF-Token` for POST/PATCH/DELETE. Resolve site
-paths and ensure they remain under `Settings.data_root`. Site edits create a new immutable
+CSRF token in signed sessions. Clear any prior session on login, return the token in the
+`X-CSRF-Token` response header, and let authenticated `GET /api/v1/session` recover the
+same token. Session cookies are `HttpOnly`, `SameSite=Strict`, use the configured secure
+flag, and never contain credentials or hashes. Except for the login endpoint, require an
+authenticated, enabled admin and constant-time `X-CSRF-Token` validation for every
+POST/PATCH/DELETE, including logout. Serialize write transactions through the one
+application-scoped `AsyncWriteCoordinator`.
+
+At application startup, validate the already-migrated local database with
+`check_database_startup`; the web process does not silently run migrations or bypass the
+SQLite safety gate. Resolve the configured data root and submitted site path with existing
+filesystem entries, reject non-directories and symlink escapes, and ensure the result
+remains under `Settings.data_root` without writing to it. Site edits create a new immutable
 `ProcessingProfile` row and atomically mark it current.
 
 - [ ] **Step 4: Run API tests**
