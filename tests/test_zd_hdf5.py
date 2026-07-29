@@ -23,6 +23,13 @@ def test_reads_metadata_and_slice(tmp_path):
     assert block.metadata.start_time_utc.isoformat() == "2026-07-26T00:00:00.100000+00:00"
 
 
+def test_reports_total_sample_count_without_reading_outside_file(tmp_path):
+    path = tmp_path / "sample.h5"
+    write_zd_h5(path, n_time=237)
+
+    assert ZdHdf5Reader().sample_count(path) == 237
+
+
 def test_normalizes_transposed_data_to_time_channel_order(tmp_path):
     path = tmp_path / "transposed.h5"
     write_zd_h5(path, transpose=True)

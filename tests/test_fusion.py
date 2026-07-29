@@ -62,6 +62,25 @@ def test_event_id_is_deterministic(profile):
     assert first.event_id == second.event_id
 
 
+def test_source_fingerprint_namespaces_event_id_without_breaking_legacy_calls(profile):
+    evidence = [candidate("stalta", 100, 180, 0.95)]
+
+    legacy = fuse_candidates(evidence, profile, 100.0, "s", "v1")[0]
+    first = fuse_candidates(
+        evidence, profile, 100.0, "s", "v1", source_fingerprint="source-a"
+    )[0]
+    repeated = fuse_candidates(
+        evidence, profile, 100.0, "s", "v1", source_fingerprint="source-a"
+    )[0]
+    second = fuse_candidates(
+        evidence, profile, 100.0, "s", "v1", source_fingerprint="source-b"
+    )[0]
+
+    assert first.event_id == repeated.event_id
+    assert first.event_id != second.event_id
+    assert legacy.event_id not in {first.event_id, second.event_id}
+
+
 def test_candidates_merge_across_offsets_when_gap_is_within_sample_rate_window(profile):
     events = fuse_candidates(
         [candidate("stalta", 10_000, 10_050, 0.70), candidate("energy", 10_150, 10_210, 0.70)],

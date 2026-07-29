@@ -53,7 +53,10 @@ def _passes_gate(evidence: tuple[Candidate, ...], profile: ProcessingProfile) ->
 
 
 def _event_from_evidence(
-    evidence: tuple[Candidate, ...], site_id: str, pipeline_version: str
+    evidence: tuple[Candidate, ...],
+    site_id: str,
+    pipeline_version: str,
+    source_fingerprint: str | None,
 ) -> EventRecord:
     ordered_evidence = tuple(sorted(evidence, key=_evidence_key))
     peak_candidate = min(
@@ -65,6 +68,8 @@ def _event_from_evidence(
     channel_start = min(candidate.channel_start for candidate in ordered_evidence)
     channel_stop = max(candidate.channel_stop for candidate in ordered_evidence)
     event_name = f"{site_id}|{pipeline_version}|{peak_candidate.peak_sample}|{channel_start}|{channel_stop}"
+    if source_fingerprint is not None:
+        event_name = f"{event_name}|source_fingerprint={source_fingerprint}"
     return EventRecord(
         event_id=str(uuid5(NAMESPACE_URL, event_name)),
         start_sample=start_sample,
@@ -82,6 +87,8 @@ def fuse_candidates(
     sample_rate_hz: float,
     site_id: str,
     pipeline_version: str,
+    *,
+    source_fingerprint: str | None = None,
 ) -> list[EventRecord]:
     """Merge compatible detector evidence into stable, reviewable event records."""
     if not math.isfinite(sample_rate_hz) or sample_rate_hz <= 0:
@@ -105,7 +112,9 @@ def fuse_candidates(
         groups.append(tuple(group))
 
     events = [
-        _event_from_evidence(group, site_id, pipeline_version)
+        _event_from_evidence(
+            group, site_id, pipeline_version, source_fingerprint
+        )
         for group in groups
         if _passes_gate(group, profile)
     ]

@@ -40,3 +40,5 @@ where = ["backend/src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["backend/src"]
+addopts = "-m 'not performance'"
+markers = ["performance: opt-in single-file CPU benchmark"]

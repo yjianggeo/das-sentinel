@@ -66,6 +66,12 @@ class ZdHdf5Reader:
                 self._required_attr(raw, self.ATTR_UNIT),
             )
 
+    def sample_count(self, path: Path) -> int:
+        with h5py.File(path, "r") as handle:
+            _, data, times = self._required_datasets(handle)
+            n_time, _, _ = self._dimensions(data, times)
+            return n_time
+
     def read_block(
         self,
         path: Path,
