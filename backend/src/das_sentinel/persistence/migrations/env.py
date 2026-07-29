@@ -14,9 +14,9 @@ target_metadata = Base.metadata
 
 
 def _database_url() -> str:
-    database_url = os.environ.get("DAS_DATABASE_URL") or configuration.get_main_option(
-        "sqlalchemy.url"
-    )
+    database_url = configuration.get_main_option("sqlalchemy.url").strip()
+    if not database_url:
+        database_url = os.environ.get("DAS_DATABASE_URL", "")
     if not database_url:
         raise RuntimeError("DAS_DATABASE_URL or sqlalchemy.url is required")
     return database_url

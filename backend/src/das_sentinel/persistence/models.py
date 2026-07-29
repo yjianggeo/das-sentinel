@@ -255,12 +255,12 @@ class Event(Base):
     )
     classifications: Mapped[list[Classification]] = relationship(
         back_populates="event",
-        cascade="all, delete-orphan",
+        passive_deletes=True,
         order_by=lambda: (Classification.created_at, Classification.id),
     )
     reviews: Mapped[list[Review]] = relationship(
         back_populates="event",
-        cascade="all, delete-orphan",
+        passive_deletes=True,
         order_by=lambda: (Review.created_at, Review.id),
     )
     artifacts: Mapped[list[Artifact]] = relationship(
@@ -312,7 +312,7 @@ class Classification(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    event_id: Mapped[str] = mapped_column(ForeignKey("events.id", ondelete="CASCADE"))
+    event_id: Mapped[str] = mapped_column(ForeignKey("events.id"))
     label: Mapped[str] = mapped_column(String(16))
     decision_score: Mapped[float] = mapped_column(Float)
     method: Mapped[str] = mapped_column(String(64))
@@ -336,7 +336,7 @@ class Review(Base):
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    event_id: Mapped[str] = mapped_column(ForeignKey("events.id", ondelete="CASCADE"))
+    event_id: Mapped[str] = mapped_column(ForeignKey("events.id"))
     admin_id: Mapped[int | None] = mapped_column(ForeignKey("admins.id"), nullable=True)
     label: Mapped[str] = mapped_column(String(16))
     note: Mapped[str | None] = mapped_column(Text, nullable=True)

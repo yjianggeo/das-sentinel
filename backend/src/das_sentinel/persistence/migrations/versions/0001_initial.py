@@ -60,6 +60,18 @@ def upgrade() -> None:
         unique=True,
         sqlite_where=sa.text("is_current = 1"),
     )
+    op.execute(
+        """
+        CREATE TRIGGER processing_profiles_immutable
+        BEFORE UPDATE OF site_id, version, payload_json ON processing_profiles
+        WHEN NEW.site_id IS NOT OLD.site_id
+          OR NEW.version IS NOT OLD.version
+          OR NEW.payload_json IS NOT OLD.payload_json
+        BEGIN
+            SELECT RAISE(ABORT, 'processing profile identity and payload are immutable');
+        END
+        """
+    )
     op.create_table(
         "model_versions",
         sa.Column("id", sa.String(length=36), nullable=False),
@@ -246,7 +258,7 @@ def upgrade() -> None:
             "label IN ('earthquake','blast','traffic','noise','unknown')",
             name="ck_classification_label",
         ),
-        sa.ForeignKeyConstraint(["event_id"], ["events.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["event_id"], ["events.id"]),
         sa.ForeignKeyConstraint(["model_version_id"], ["model_versions.id"]),
         sa.PrimaryKeyConstraint("id"),
     )
@@ -255,6 +267,24 @@ def upgrade() -> None:
         "classifications",
         ["event_id", "created_at", "id"],
         unique=False,
+    )
+    op.execute(
+        """
+        CREATE TRIGGER classifications_append_only_update
+        BEFORE UPDATE ON classifications
+        BEGIN
+            SELECT RAISE(ABORT, 'classifications are append-only');
+        END
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER classifications_append_only_delete
+        BEFORE DELETE ON classifications
+        BEGIN
+            SELECT RAISE(ABORT, 'classifications are append-only');
+        END
+        """
     )
     op.create_table(
         "reviews",
@@ -269,7 +299,7 @@ def upgrade() -> None:
             name="ck_review_label",
         ),
         sa.ForeignKeyConstraint(["admin_id"], ["admins.id"]),
-        sa.ForeignKeyConstraint(["event_id"], ["events.id"], ondelete="CASCADE"),
+        sa.ForeignKeyConstraint(["event_id"], ["events.id"]),
         sa.PrimaryKeyConstraint("id"),
     )
     op.create_index(
@@ -277,6 +307,24 @@ def upgrade() -> None:
         "reviews",
         ["event_id", "created_at", "id"],
         unique=False,
+    )
+    op.execute(
+        """
+        CREATE TRIGGER reviews_append_only_update
+        BEFORE UPDATE ON reviews
+        BEGIN
+            SELECT RAISE(ABORT, 'reviews are append-only');
+        END
+        """
+    )
+    op.execute(
+        """
+        CREATE TRIGGER reviews_append_only_delete
+        BEFORE DELETE ON reviews
+        BEGIN
+            SELECT RAISE(ABORT, 'reviews are append-only');
+        END
+        """
     )
     op.create_table(
         "artifacts",
@@ -298,6 +346,11 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    op.execute("DROP TRIGGER IF EXISTS reviews_append_only_delete")
+    op.execute("DROP TRIGGER IF EXISTS reviews_append_only_update")
+    op.execute("DROP TRIGGER IF EXISTS classifications_append_only_delete")
+    op.execute("DROP TRIGGER IF EXISTS classifications_append_only_update")
+    op.execute("DROP TRIGGER IF EXISTS processing_profiles_immutable")
     op.drop_table("artifacts")
     op.drop_index("ix_reviews_event_created", table_name="reviews")
     op.drop_table("reviews")

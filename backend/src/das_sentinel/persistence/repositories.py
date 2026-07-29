@@ -36,6 +36,7 @@ def canonical_json(value: Any) -> str:
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
+        allow_nan=False,
     )
 
 
@@ -112,6 +113,7 @@ class SiteRepository(_Repository):
         )
         for current in self.session.scalars(statement):
             current.is_current = False
+        self.session.flush()
         profile.is_current = True
         self.session.flush()
         return site
