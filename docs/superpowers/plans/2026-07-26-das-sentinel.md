@@ -1218,14 +1218,28 @@ same token. Session cookies are `HttpOnly`, `SameSite=Strict`, use the configure
 flag, and never contain credentials or hashes. Except for the login endpoint, require an
 authenticated, enabled admin and constant-time `X-CSRF-Token` validation for every
 POST/PATCH/DELETE, including logout. Serialize write transactions through the one
-application-scoped `AsyncWriteCoordinator`.
+application-scoped `AsyncWriteCoordinator`. Clear POST `/api/v1/session` state in
+middleware inside `SessionMiddleware`, before FastAPI body parsing, so malformed JSON and
+every 422 login attempt also invalidate any old session. Add `Cache-Control: no-store` to
+every session-bearing API response.
+
+Bound login password length. Execute Argon2 behind one application-scoped concurrency
+limiter and move Argon2 plus its synchronous database lookup to a worker thread. Make
+synchronous read routes normal `def` handlers so FastAPI offloads them. For write routes,
+acquire the async application write lock and then run the entire synchronous path
+resolution/database transaction in a worker thread; neither SQLite's busy timeout nor slow
+NAS metadata I/O may block the single Uvicorn event loop.
 
 At application startup, validate the already-migrated local database with
 `check_database_startup`; the web process does not silently run migrations or bypass the
 SQLite safety gate. Resolve the configured data root and submitted site path with existing
 filesystem entries, reject non-directories and symlink escapes, and ensure the result
 remains under `Settings.data_root` without writing to it. Site edits create a new immutable
-`ProcessingProfile` row and atomically mark it current.
+`ProcessingProfile` row and atomically mark it current. The shared `ProcessingProfile`
+validator rejects non-finite values, non-positive counts/windows/frequency thresholds,
+invalid probability-like scores, negative merge/artifact padding, non-positive slowness,
+unordered trajectory velocities, and unordered normal/strong fusion thresholds, so both
+site creation and merged PATCH payloads persist only runnable configurations.
 
 - [ ] **Step 4: Run API tests**
 
