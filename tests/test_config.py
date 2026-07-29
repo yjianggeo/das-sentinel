@@ -110,3 +110,8 @@ def test_profile_rejects_non_finite_numeric_fields(field, value):
 def test_profile_rejects_non_runnable_values(overrides):
     with pytest.raises(ValidationError):
         ProcessingProfile(**overrides)
+
+
+def test_profile_rejects_single_energy_band():
+    with pytest.raises(ValidationError):
+        ProcessingProfile(energy_bands_hz=((1.0, 5.0),))

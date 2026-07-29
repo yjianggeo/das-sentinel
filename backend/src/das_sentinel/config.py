@@ -108,8 +108,8 @@ class ProcessingProfile(BaseModel):
             raise ValueError("fusion_normal_score must not exceed fusion_strong_score")
         if self.merge_gap_seconds < 0 or self.artifact_pad_seconds < 0:
             raise ValueError("merge and artifact padding must be nonnegative")
-        if not self.energy_bands_hz:
-            raise ValueError("energy_bands_hz must not be empty")
+        if len(self.energy_bands_hz) < 2:
+            raise ValueError("energy_bands_hz must contain at least two bands")
         previous_high = 0.0
         for low, high in self.energy_bands_hz:
             if low <= 0 or high <= low:

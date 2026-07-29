@@ -642,3 +642,61 @@ def test_site_create_and_patch_reject_non_runnable_profiles(
 
     assert create.status_code == 422
     assert patch.status_code == 422
+
+
+def test_site_create_rejects_single_energy_band_without_persisting_profile(
+    csrf_client: tuple[TestClient, str, Settings],
+):
+    client, token, settings = csrf_client
+    payload = _site_payload(settings)
+    payload["profile"]["energy_bands_hz"] = [[1.0, 5.0]]
+
+    response = client.post(
+        "/api/v1/sites",
+        json=payload,
+        headers={"X-CSRF-Token": token},
+    )
+
+    assert response.status_code == 422
+    engine = create_local_engine(settings.database_url)
+    try:
+        sessions = session_factory(engine)
+        with sessions() as session:
+            assert session.scalar(select(func.count()).select_from(Site)) == 0
+            assert (
+                session.scalar(
+                    select(func.count()).select_from(ProcessingProfile)
+                )
+                == 0
+            )
+    finally:
+        engine.dispose()
+
+
+def test_site_patch_rejects_single_energy_band_without_new_profile(
+    csrf_client: tuple[TestClient, str, Settings],
+):
+    client, token, settings = csrf_client
+    created = _create_site(client, token, settings).json()
+
+    response = client.patch(
+        f"/api/v1/sites/{created['id']}",
+        json={"profile": {"energy_bands_hz": [[1.0, 5.0]]}},
+        headers={"X-CSRF-Token": token},
+    )
+
+    assert response.status_code == 422
+    unchanged = client.get(f"/api/v1/sites/{created['id']}").json()
+    assert unchanged["current_profile"]["version"] == 1
+    engine = create_local_engine(settings.database_url)
+    try:
+        sessions = session_factory(engine)
+        with sessions() as session:
+            assert (
+                session.scalar(
+                    select(func.count()).select_from(ProcessingProfile)
+                )
+                == 1
+            )
+    finally:
+        engine.dispose()
