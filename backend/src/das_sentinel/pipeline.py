@@ -150,7 +150,13 @@ def analyze_file(
         timings["read"] += _elapsed_ms(read_started)
         candidates.extend(
             candidate
-            for candidate in _detect_block(block, profile, backend, timings)
+            for candidate in _detect_block(
+                block,
+                profile,
+                backend,
+                timings,
+                logical_start=logical_start,
+            )
             if logical_start <= candidate.peak_sample < canonical_stop
         )
         if sample_stop == sample_count:
@@ -278,7 +284,6 @@ def analyze_file(
             timings["render"] += _elapsed_ms(render_started)
         if transaction is not None:
             artifacts.extend(transaction.commit())
-        _ensure_source_unchanged(source, source_fingerprint)
     except BaseException:
         if transaction is not None:
             transaction._rollback()
@@ -310,14 +315,31 @@ def _detect_block(
     profile: ProcessingProfile,
     backend: ArrayBackend,
     timings: dict[str, float],
+    *,
+    logical_start: int | None = None,
 ) -> list[Candidate]:
     found: list[Candidate] = []
-    grouped: dict[tuple[float, float], list[str]] = {}
+    logical_block = _logical_detector_block(block, logical_start)
+    grouped: dict[
+        tuple[tuple[float, float], int, int],
+        tuple[DasBlock, list[str]],
+    ] = {}
     for detector in ("stalta", "energy", "coherence", "trajectory"):
-        grouped.setdefault(_detector_band(profile, detector), []).append(detector)
-    for band, detectors in grouped.items():
+        detector_source = block if detector == "stalta" else logical_block
+        band = _detector_band(profile, detector)
+        key = (
+            band,
+            detector_source.sample_offset,
+            detector_source.data.shape[0],
+        )
+        if key not in grouped:
+            grouped[key] = (detector_source, [])
+        grouped[key][1].append(detector)
+    for (band, _, _), (detector_source, detectors) in grouped.items():
         preprocess_started = time.perf_counter()
-        prepared_block = _preprocess_for_band(block, profile, backend, band)
+        prepared_block = _preprocess_for_band(
+            detector_source, profile, backend, band
+        )
         timings["preprocess"] += _elapsed_ms(preprocess_started)
         for detector in detectors:
             detector_block = prepared_block
@@ -339,6 +361,29 @@ def _detect_block(
         if hasattr(backend, "clear_cache"):
             backend.clear_cache()
     return found
+
+
+def _logical_detector_block(
+    block: DasBlock, logical_start: int | None
+) -> DasBlock:
+    if logical_start is None or logical_start == block.sample_offset:
+        return block
+    block_stop = block.sample_offset + block.data.shape[0]
+    if not block.sample_offset <= logical_start < block_stop:
+        raise ValueError("logical block start is outside the read block")
+    relative_start = logical_start - block.sample_offset
+    return replace(
+        block,
+        data=block.data[relative_start:],
+        metadata=replace(
+            block.metadata,
+            start_time_utc=block.metadata.start_time_utc
+            + timedelta(
+                seconds=relative_start / block.metadata.sample_rate_hz
+            ),
+        ),
+        sample_offset=logical_start,
+    )
 
 
 def _run_detector(
@@ -489,6 +534,7 @@ class _ArtifactTransaction:
                 _ensure_source_unchanged(
                     self.source, self.source_fingerprint
                 )
+                self._promoted.clear()
             except BaseException:
                 self._rollback()
                 raise

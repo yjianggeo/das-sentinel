@@ -193,7 +193,7 @@ def test_baseline_file_stays_under_memory_budget(tmp_path, monkeypatch):
         for artifact in result.analysis.artifacts[0].files.values()
     )
     assert result.peak_rss_bytes < 4 * 1024**3
-    assert 0 < result.wall_time_seconds < 120
+    assert 0 < result.wall_time_seconds < 60
     if os.environ.get("DAS_PERFORMANCE_REPORT"):
         print(
             f"baseline peak RSS: {result.peak_rss_bytes / 1024**3:.3f} GiB; "

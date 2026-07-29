@@ -5,9 +5,11 @@ import hashlib
 import json
 import os
 import weakref
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Event
 
 import h5py
 import numpy as np
@@ -87,6 +89,28 @@ def _write_history_stalta_file(path: Path) -> None:
         raw_data[event_start : event_start + event_samples, :4] += burst[
             :, None
         ]
+    times = (
+        start.timestamp() * 1_000_000
+        + np.arange(sample_count) * 1_000_000 / sample_rate_hz
+    )
+    with h5py.File(path, "w") as handle:
+        raw = handle.create_group("Acquisition").create_group("Raw[0]")
+        raw.create_dataset("RawData", data=raw_data)
+        raw.create_dataset("RawDataTime", data=times.astype(np.int64))
+        raw.attrs["OutputDataRate"] = sample_rate_hz
+        raw.attrs["SpatialSamplingInterval"] = 4.0
+        raw.attrs["StartLocusIndex"] = 2
+        raw.attrs["RawDataUnit"] = "strain_rate"
+
+
+def _write_history_dominance_file(path: Path) -> None:
+    sample_rate_hz = 10.0
+    sample_count = 420
+    channel_count = 6
+    start = datetime(2026, 7, 26, tzinfo=UTC)
+    raw_data = np.zeros((sample_count, channel_count), dtype=np.float32)
+    raw_data[100, :4] = 20.0
+    raw_data[200, :4] = 5.0
     times = (
         start.timestamp() * 1_000_000
         + np.arange(sample_count) * 1_000_000 / sample_rate_hz
@@ -353,6 +377,78 @@ def test_pipeline_prepends_lta_history_and_canonically_owns_gap_events(
     assert len(result.events) == 2
     assert result.audit_candidate_count == 2
     assert [event.peak_sample // 200 for event in result.events] == [22, 37]
+
+
+@pytest.mark.parametrize(
+    ("detector_name", "detector_attribute"),
+    [
+        ("coherence", "detect_coherence"),
+        ("trajectory", "detect_trajectories"),
+    ],
+)
+def test_non_stalta_detectors_search_only_the_logical_block(
+    tmp_path,
+    monkeypatch,
+    detector_name,
+    detector_attribute,
+):
+    from das_sentinel import pipeline
+
+    source_path = tmp_path / f"history-{detector_name}.h5"
+    _write_history_dominance_file(source_path)
+
+    def identity_preprocess(block, profile, backend, band):
+        del profile, band
+        return PreprocessedBlock(
+            data=backend.asarray(block.data),
+            bad_channel_mask=np.zeros(block.data.shape[1], dtype=bool),
+            backend_name=backend.name,
+            sample_offset=block.sample_offset,
+            sample_rate_hz=block.metadata.sample_rate_hz,
+            channel_distance_m=block.metadata.channel_distance_m,
+        )
+
+    def strongest_signal(block, *args):
+        del args
+        strength = np.max(np.abs(block.data), axis=1)
+        peak = int(np.argmax(strength))
+        if strength[peak] == 0:
+            return []
+        peak += block.sample_offset
+        return [
+            Candidate(
+                detector=detector_name,
+                start_sample=peak,
+                end_sample=peak + 1,
+                peak_sample=peak,
+                channel_start=0,
+                channel_stop=4,
+                score=0.95,
+            )
+        ]
+
+    monkeypatch.setattr(pipeline, "_preprocess_for_band", identity_preprocess)
+    monkeypatch.setattr(pipeline, "detect_stalta", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
+    monkeypatch.setattr(pipeline, detector_attribute, strongest_signal)
+    monkeypatch.setattr(
+        pipeline,
+        "render_event_artifacts",
+        _empty_artifact_manifest,
+    )
+
+    result = pipeline.analyze_file(
+        source_path,
+        ZdHdf5Reader(),
+        _profile(),
+        select_backend("cpu"),
+        tmp_path / "artifacts",
+    )
+
+    assert result.audit_candidate_count == 2
+    assert [event.peak_sample for event in result.events] == [100, 200]
 
 
 def test_pipeline_result_is_stable_except_for_recorded_timings(tmp_path, monkeypatch):
@@ -807,6 +903,79 @@ def test_pipeline_reuses_and_never_rolls_back_preexisting_artifacts(
     assert all(
         path.exists() and hashlib.sha256(path.read_bytes()).hexdigest() == digest
         for path, digest in original_files.values()
+    )
+    assert not list(artifact_root.glob(".das-staging-*"))
+
+
+def test_post_commit_failure_cannot_delete_artifacts_reused_by_another_run(
+    tmp_path, monkeypatch
+):
+    from das_sentinel import pipeline
+
+    source_path = tmp_path / "post-commit-race.h5"
+    artifact_root = tmp_path / "artifacts"
+    _write_boundary_file(source_path)
+    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
+    monkeypatch.setattr(pipeline, "detect_energy", _fixed_energy)
+    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
+
+    original_commit = pipeline._ArtifactTransaction.commit
+    first_committed = Event()
+    second_finished = Event()
+
+    def fail_first_after_commit(transaction):
+        manifests = original_commit(transaction)
+        if not first_committed.is_set():
+            first_committed.set()
+            if not second_finished.wait(timeout=20):
+                raise TimeoutError("second run did not reuse committed artifacts")
+            stat = source_path.stat()
+            os.utime(
+                source_path,
+                ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000),
+            )
+            raise pipeline.SourceChangedError(
+                "source changed after artifact commit"
+            )
+        return manifests
+
+    monkeypatch.setattr(
+        pipeline._ArtifactTransaction,
+        "commit",
+        fail_first_after_commit,
+    )
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        first = executor.submit(
+            pipeline.analyze_file,
+            source_path,
+            ZdHdf5Reader(),
+            _profile(),
+            select_backend("cpu"),
+            artifact_root,
+        )
+        assert first_committed.wait(timeout=20)
+        try:
+            second = pipeline.analyze_file(
+                source_path,
+                ZdHdf5Reader(),
+                _profile(),
+                select_backend("cpu"),
+                artifact_root,
+            )
+        finally:
+            second_finished.set()
+        with pytest.raises(pipeline.SourceChangedError, match="after artifact"):
+            first.result(timeout=20)
+
+    assert len(second.artifacts) == 1
+    assert len(second.artifacts[0].files) == 6
+    assert all(
+        artifact.path.exists()
+        and hashlib.sha256(artifact.path.read_bytes()).hexdigest()
+        == artifact.sha256
+        for artifact in second.artifacts[0].files.values()
     )
     assert not list(artifact_root.glob(".das-staging-*"))
 
