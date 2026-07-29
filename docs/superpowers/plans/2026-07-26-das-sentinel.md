@@ -1396,11 +1396,23 @@ observations spanning 10 seconds and a successful lightweight `probe`. Persist d
 files through the API repository and enqueue only missing `(fingerprint, profile_version,
 pipeline_version)` run keys.
 
+Load the current persisted profile through the complete `config.ProcessingProfile`
+validator before scanning; a malformed non-discovery field must fail discovery rather
+than enqueue work that can only fail later. Bind the final metadata snapshot and HDF5
+probe to a regular file opened beneath a held no-follow site-root/component chain (or an
+equivalent handle-relative reader input). A parent directory replaced after enumeration
+must not cause the reader to open any file outside the configured site root; validation
+only after a path-based probe is insufficient.
+
 - [ ] **Step 4: Run discovery tests**
 
 Run: `python -m pytest tests/test_discovery.py -q`
 
 Expected: PASS, including partial HDF5 and symlink-escape rejection.
+
+Also include malformed non-discovery profile values and a deterministic
+enumeration-to-probe parent-replacement race proving that no root-external HDF5 file is
+opened.
 
 - [ ] **Step 5: Commit**
 
