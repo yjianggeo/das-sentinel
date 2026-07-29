@@ -1144,7 +1144,17 @@ append-only reviews/classifications, UTC strings or timezone-aware conversion, a
 transaction-scoped repository methods. On startup check SQLite version, set
 `journal_mode=WAL`, `foreign_keys=ON`, `busy_timeout=5000`, and reject remote-looking
 database URLs/paths. Model-version rows store the complete model-bundle SHA-256 separately
-from the artifact path. Protect all writes with one async application lock in the API layer.
+from the artifact path. Enforce append-only classifications/reviews and immutable profile
+identity/payload in SQLite itself, not only through repository method omissions: database
+triggers reject updates/deletes of classification/review rows and reject changes to a
+profile's site, version, or payload while still allowing `is_current` to change. Removing a
+parent must not silently cascade-delete append-only audit rows. Switching a site's current
+profile clears and flushes the previous flag before setting the new flag, within the same
+caller transaction, so SQLite's partial unique index cannot observe two current rows.
+Canonical JSON rejects non-finite numbers. A programmatic migration URL takes precedence
+over an ambient environment variable; the environment variable is only a CLI fallback when
+the Alembic configuration URL is empty. Protect all writes with one async application lock
+in the API layer.
 
 - [ ] **Step 4: Run migrations twice and repository tests**
 
