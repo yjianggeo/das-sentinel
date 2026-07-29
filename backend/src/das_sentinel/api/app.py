@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.requests import Request
+from starlette.responses import Response
 
 from das_sentinel.api.routes.auth import router as auth_router
 from das_sentinel.api.routes.sites import router as sites_router
@@ -15,6 +19,21 @@ from das_sentinel.persistence import (
     create_local_engine,
     session_factory,
 )
+
+
+class ApiSessionSecurityMiddleware(BaseHTTPMiddleware):
+    async def dispatch(
+        self,
+        request: Request,
+        call_next: RequestResponseEndpoint,
+    ) -> Response:
+        path = request.url.path
+        if path == "/api/v1/session" and request.method == "POST":
+            request.session.clear()
+        response = await call_next(request)
+        if path.startswith("/api/v1"):
+            response.headers["Cache-Control"] = "no-store"
+        return response
 
 
 def create_app(settings: Settings) -> FastAPI:
@@ -33,6 +52,8 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.engine = engine
     app.state.session_factory = session_factory(engine)
     app.state.write_coordinator = AsyncWriteCoordinator()
+    app.state.auth_limiter = asyncio.Semaphore(1)
+    app.add_middleware(ApiSessionSecurityMiddleware)
     app.add_middleware(
         SessionMiddleware,
         secret_key=settings.session_secret,

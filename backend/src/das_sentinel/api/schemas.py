@@ -21,7 +21,7 @@ class StrictSchema(BaseModel):
 
 
 class LoginRequest(StrictSchema):
-    password: SecretStr
+    password: SecretStr = Field(max_length=1024)
 
 
 class SessionResponse(StrictSchema):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from pathlib import Path
+from threading import Event, Thread
 
 import pytest
 from argon2 import PasswordHasher
@@ -14,6 +15,7 @@ from das_sentinel.persistence import (
     upgrade_database,
 )
 from das_sentinel.persistence.models import ProcessingProfile, Site
+from das_sentinel.persistence.repositories import ProfileRepository, SiteRepository
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
@@ -484,3 +486,159 @@ def test_failed_patch_rolls_back_site_and_profile_switch(
     assert unchanged["enabled"] is True
     assert unchanged["current_profile"]["version"] == 1
     assert unchanged["current_profile"]["payload"]["device"] == "cpu"
+
+
+@pytest.mark.parametrize("operation", ["list", "detail"])
+def test_site_reads_do_not_block_event_loop(
+    csrf_client: tuple[TestClient, str, Settings],
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+):
+    client, token, settings = csrf_client
+    created = _create_site(client, token, settings).json()
+    entered = Event()
+    release = Event()
+    ticked = Event()
+
+    @client.app.get(f"/api/v1/site-read-tick-{operation}")
+    async def tick():
+        ticked.set()
+        return {"ok": True}
+
+    target = "list" if operation == "list" else "get"
+    original = getattr(SiteRepository, target)
+
+    def blocking(repository, *args, **kwargs):
+        entered.set()
+        release.wait(5)
+        return original(repository, *args, **kwargs)
+
+    monkeypatch.setattr(SiteRepository, target, blocking)
+    url = "/api/v1/sites" if operation == "list" else f"/api/v1/sites/{created['id']}"
+    request = Thread(target=lambda: client.get(url))
+    request.start()
+    assert entered.wait(2)
+    tick_request = Thread(
+        target=lambda: client.get(f"/api/v1/site-read-tick-{operation}")
+    )
+    tick_request.start()
+    try:
+        assert ticked.wait(0.5)
+    finally:
+        release.set()
+        request.join(5)
+        tick_request.join(5)
+
+
+@pytest.mark.parametrize("operation", ["create", "patch"])
+def test_site_writes_run_complete_sync_transaction_off_event_loop(
+    csrf_client: tuple[TestClient, str, Settings],
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+):
+    client, token, settings = csrf_client
+    created = (
+        _create_site(client, token, settings).json()
+        if operation == "patch"
+        else None
+    )
+    entered = Event()
+    release = Event()
+    ticked = Event()
+
+    @client.app.get(f"/api/v1/site-write-tick-{operation}")
+    async def tick():
+        ticked.set()
+        return {"ok": True}
+
+    original = ProfileRepository.add
+
+    def blocking_add(repository, **kwargs):
+        entered.set()
+        release.wait(5)
+        return original(repository, **kwargs)
+
+    monkeypatch.setattr(ProfileRepository, "add", blocking_add)
+    if operation == "create":
+        payload = _site_payload(
+            settings,
+            name="threaded-create",
+            data_path="threaded-create",
+        )
+        request_call = lambda: client.post(
+            "/api/v1/sites",
+            json=payload,
+            headers={"X-CSRF-Token": token},
+        )
+    else:
+        request_call = lambda: client.patch(
+            f"/api/v1/sites/{created['id']}",
+            json={"enabled": False},
+            headers={"X-CSRF-Token": token},
+        )
+
+    request = Thread(target=request_call)
+    request.start()
+    assert entered.wait(2)
+    tick_request = Thread(
+        target=lambda: client.get(f"/api/v1/site-write-tick-{operation}")
+    )
+    tick_request.start()
+    try:
+        assert ticked.wait(0.5)
+    finally:
+        release.set()
+        request.join(5)
+        tick_request.join(5)
+
+
+@pytest.mark.parametrize(
+    "profile_overrides",
+    [
+        {"coherence_threshold": "NaN"},
+        {"coherence_threshold": "Infinity"},
+        {"min_coincidence": 0},
+        {"energy_window_seconds": 0.0},
+        {"stalta_threshold": 0.0},
+        {"slowness_max_s_per_m": 0.0},
+        {"coherence_threshold": 0.0},
+        {"trajectory_threshold": 1.01},
+        {"trajectory_velocity_min_mps": 60.0, "trajectory_velocity_max_mps": 60.0},
+        {"fusion_normal_score": 0.9, "fusion_strong_score": 0.8},
+        {"merge_gap_seconds": -0.1},
+        {"artifact_pad_seconds": -0.1},
+        {"energy_bands_hz": []},
+        {"energy_bands_hz": [[5.0, 10.0], [1.0, 2.0]]},
+    ],
+)
+def test_site_create_and_patch_reject_non_runnable_profiles(
+    csrf_client: tuple[TestClient, str, Settings],
+    profile_overrides,
+):
+    client, token, settings = csrf_client
+    create_payload = _site_payload(settings)
+    create_payload["profile"].update(profile_overrides)
+    create = client.post(
+        "/api/v1/sites",
+        json=create_payload,
+        headers={"X-CSRF-Token": token},
+    )
+
+    valid_payload = _site_payload(
+        settings,
+        name="valid-for-patch",
+        data_path="valid-for-patch",
+    )
+    valid = client.post(
+        "/api/v1/sites",
+        json=valid_payload,
+        headers={"X-CSRF-Token": token},
+    )
+    patch = client.patch(
+        f"/api/v1/sites/{valid.json()['id']}",
+        json={"profile": profile_overrides},
+        headers={"X-CSRF-Token": token},
+    )
+
+    assert create.status_code == 422
+    assert patch.status_code == 422
