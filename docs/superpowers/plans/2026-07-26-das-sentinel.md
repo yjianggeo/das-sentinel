@@ -714,9 +714,13 @@ git commit -m "feat(detect): add traffic trajectories and templates"
 - Create: `tests/test_fusion.py`
 
 **Interfaces:**
-- Produces: `fuse_candidates(candidates, profile, sample_rate_hz, site_id, pipeline_version) -> list[EventRecord]`.
+- Produces:
+  `fuse_candidates(candidates, profile, sample_rate_hz, site_id, pipeline_version, source_fingerprint=None) -> list[EventRecord]`.
 - `sample_rate_hz` is explicit so `merge_gap_seconds` is converted to samples without
   hiding structural timing data inside detector metrics.
+- `source_fingerprint` is optional for backward-compatible detector-unit use. File
+  pipelines must provide it so two source files with the same sample/channel coordinates
+  cannot generate the same event UUID.
 
 - [ ] **Step 1: Write failing balanced-gate tests**
 
@@ -750,8 +754,9 @@ Expected: FAIL importing `fuse_candidates`.
 
 Use temporal overlap plus channel-range overlap, allow the profile merge gap, merge across
 block boundaries, and require either two ordinary detectors or one strong, quality-valid
-detector. Generate UUID5 from site ID, pipeline version, merged peak sample, and merged
-channel interval. Preserve every evidence object sorted by detector and peak.
+detector. Generate UUID5 from site ID, pipeline version, optional source fingerprint,
+merged peak sample, and merged channel interval. Preserve every evidence object sorted by
+detector and peak.
 
 - [ ] **Step 4: Run fusion tests**
 
@@ -1039,6 +1044,10 @@ coordinates plus UTC and site timezone metadata from `AnalysisContext`. Return a
 candidates separately from review events. `FileAnalysis` contains source fingerprint,
 metadata warnings, events, audit candidate count, timings, actual backend, and artifact
 manifests.
+
+The source fingerprint is SHA-256 over a canonical JSON tuple of the resolved source path,
+file size, and nanosecond modification time. Pass it into fusion. Do not hash the complete
+DAS payload a second time.
 
 - [ ] **Step 4: Run pipeline and opt-in performance tests**
 
