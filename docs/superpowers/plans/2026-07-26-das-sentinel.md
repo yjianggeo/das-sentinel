@@ -1399,10 +1399,13 @@ pipeline_version)` run keys.
 Load the current persisted profile through the complete `config.ProcessingProfile`
 validator before scanning; a malformed non-discovery field must fail discovery rather
 than enqueue work that can only fail later. Bind the final metadata snapshot and HDF5
-probe to a regular file opened beneath a held no-follow site-root/component chain (or an
-equivalent handle-relative reader input). A parent directory replaced after enumeration
-must not cause the reader to open any file outside the configured site root; validation
-only after a path-based probe is insufficient.
+probe to a regular file opened through a held no-follow chain that starts at a trusted
+filesystem anchor and includes every ancestor of the configured site root as well as
+every source component (or an equivalent handle-relative reader input). On POSIX, walk
+from `/` with relative `openat`; on Windows, hold the volume/share root and each
+non-reparse component without delete sharing. A root ancestor or source parent replaced
+after validation/enumeration must not cause the reader to open any file outside the
+configured site root; validation only after a path-based probe is insufficient.
 
 - [ ] **Step 4: Run discovery tests**
 
@@ -1410,9 +1413,9 @@ Run: `python -m pytest tests/test_discovery.py -q`
 
 Expected: PASS, including partial HDF5 and symlink-escape rejection.
 
-Also include malformed non-discovery profile values and a deterministic
-enumeration-to-probe parent-replacement race proving that no root-external HDF5 file is
-opened.
+Also include malformed non-discovery profile values, a deterministic
+enumeration-to-probe parent-replacement race, and a root-validation-to-open ancestor
+replacement race proving that no root-external HDF5 file is opened.
 
 - [ ] **Step 5: Commit**
 
