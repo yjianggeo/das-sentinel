@@ -1307,21 +1307,27 @@ Repository/service methods flush but never commit; the caller owns a short trans
 Enqueue validates that source and immutable profile belong to the same enabled site and is
 idempotent for an existing source/profile/pipeline job. Claim selects the oldest eligible
 queued job, increments its attempt count, assigns exactly one non-empty worker ID, records
-a UTC heartbeat, and returns the immutable source path/fingerprint, site
+a UTC heartbeat, and returns the immutable source path/fingerprint/size/mtime, site
 timezone/cable type, profile version/payload, and pipeline version needed by Task 16.
 The one application writer lock serializes claim/cancel/retry/heartbeat/final transitions.
 Synchronous SQLite and filesystem checks run in a worker thread rather than the Uvicorn
 event loop.
 
-Heartbeats require the owning worker and validate `0 <= numerator <= denominator`.
+Heartbeats require the owning worker and validate strict integer values satisfying
+`0 <= numerator <= denominator <= 2**63 - 1`, so an otherwise valid JSON integer cannot
+overflow SQLite and become a 500 response.
 Completion/failure require `running` plus the owning worker. Completion also requires exact
 profile and pipeline versions and resolves every existing regular artifact path below
-`Settings.app_data_dir / "artifacts"` without following an escape. Failure stores bounded
-structured error fields. Retry only changes an eligible failed job back to queued while
-below a fixed three-attempt limit; cancellation is allowed only before a terminal state.
-Stale running jobs older than two minutes return to queued while attempts remain, otherwise
-become non-retryable failed jobs. API startup invokes stale recovery after the database
-safety check.
+`Settings.app_data_dir / "artifacts"` without following an escape. Reject an artifact root
+that is itself a symlink, junction, or other reparse point. Validate the root, every parent,
+and the final ordinary file through held no-follow handles (or an equivalently atomic safe
+handoff) so concurrent path replacement cannot redirect validation outside the trusted
+root; a failed validation leaves the job running. Failure stores bounded structured error
+fields. Retry only changes an eligible failed job back to queued while below a fixed
+three-attempt limit; cancellation is allowed only before a terminal state. Stale running
+jobs older than two minutes return to queued while attempts remain, otherwise become
+non-retryable failed jobs. API startup invokes stale recovery after the database safety
+check.
 
 Authenticate internal routes only with a non-empty `X-Worker-Token` compared in constant
 time to `Settings.worker_token`; never accept browser session/CSRF as a substitute and
@@ -1334,6 +1340,10 @@ requirements. Return 404 for missing jobs, 409 for invalid state/owner/version t
 Run: `python -m pytest tests/test_jobs.py tests/test_worker_protocol.py -q`
 
 Expected: PASS, including retry limit and cancellation tests.
+
+Also cover the complete frozen source metadata, signed-64-bit progress bounds, rejection
+of a reparse-point artifact root, and a deterministic parent-replacement race proving that
+unsafe completion is rejected without changing the running job.
 
 - [ ] **Step 5: Commit**
 
