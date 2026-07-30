@@ -22,6 +22,7 @@ from das_sentinel.api.schemas import (
     WorkerCompleteRequest,
     WorkerFailRequest,
     WorkerHeartbeatRequest,
+    WorkerResultRequest,
 )
 from das_sentinel.services.jobs import (
     JobClaim,
@@ -29,6 +30,7 @@ from das_sentinel.services.jobs import (
     JobServiceError,
     JobSnapshot,
 )
+from das_sentinel.services.results import ResultService
 
 router = APIRouter(prefix="/internal/jobs", tags=["internal-jobs"])
 
@@ -141,6 +143,28 @@ async def fail_job(
     return job_response(result)
 
 
+@router.post("/{job_id}/result", response_model=JobResponse)
+async def submit_job_result(
+    job_id: str,
+    payload: WorkerResultRequest,
+    request: Request,
+    worker_token: WorkerToken,
+) -> JobResponse:
+    del worker_token
+    try:
+        async with request.app.state.write_coordinator.lock:
+            result = await run_in_threadpool(
+                _persist_result,
+                request.app.state.session_factory,
+                request.app.state.settings.app_data_dir / "artifacts",
+                job_id,
+                payload,
+            )
+    except JobServiceError as error:
+        raise job_http_exception(error) from error
+    return job_response(result)
+
+
 def _claim(sessions, artifact_root, worker_id: str) -> JobClaim | None:
     with sessions.begin() as session:
         return JobService(session, artifact_root).claim(worker_id)
@@ -191,6 +215,16 @@ def _fail(
             error_message=payload.error_message,
             retry_eligible=payload.retry_eligible,
         )
+
+
+def _persist_result(
+    sessions,
+    artifact_root,
+    job_id: str,
+    payload: WorkerResultRequest,
+) -> JobSnapshot:
+    with sessions.begin() as session:
+        return ResultService(session, artifact_root).persist(job_id, payload)
 
 
 def claim_response(claim: JobClaim) -> JobClaimResponse:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import datetime
+import json
+from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -8,6 +9,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    FiniteFloat,
     SecretStr,
     StrictInt,
     StringConstraints,
@@ -229,9 +231,268 @@ class WorkerFailRequest(StrictSchema):
     retry_eligible: bool = True
 
 
+class WorkerEvidenceResult(StrictSchema):
+    detector: str = Field(min_length=1, max_length=64)
+    score: FiniteFloat = Field(ge=0, le=1)
+    payload: dict[str, Any] = Field(default_factory=dict, max_length=128)
+
+    @field_validator("payload")
+    @classmethod
+    def validate_payload(cls, value: dict[str, Any]) -> dict[str, Any]:
+        return _bounded_json(value, field="evidence payload", maximum=32_768)
+
+
+class WorkerClassificationResult(StrictSchema):
+    label: Literal["earthquake", "blast", "traffic", "noise", "unknown"]
+    decision_score: FiniteFloat = Field(ge=0, le=1)
+    method: str = Field(min_length=1, max_length=64)
+    reasons: list[str] = Field(default_factory=list, max_length=64)
+
+    @field_validator("method")
+    @classmethod
+    def validate_method(cls, value: str) -> str:
+        return _nonblank(value, field="classification method")
+
+    @field_validator("reasons")
+    @classmethod
+    def validate_reasons(cls, value: list[str]) -> list[str]:
+        return [
+            _nonblank(item, field="classification reason", maximum=512)
+            for item in value
+        ]
+
+
+class WorkerEventResult(StrictSchema):
+    event_uid: str = Field(min_length=1, max_length=128)
+    start_sample: StrictInt = Field(ge=0, le=2**63 - 2)
+    end_sample: StrictInt = Field(ge=1, le=2**63 - 1)
+    channel_start: StrictInt = Field(ge=0, le=2**31 - 2)
+    channel_stop: StrictInt = Field(ge=1, le=2**31 - 1)
+    features: dict[str, FiniteFloat] = Field(default_factory=dict, max_length=512)
+    evidence: list[WorkerEvidenceResult] = Field(
+        default_factory=list,
+        max_length=64,
+    )
+    classification: WorkerClassificationResult
+
+    @field_validator("event_uid")
+    @classmethod
+    def validate_event_uid(cls, value: str) -> str:
+        return _nonblank(value, field="event UID", maximum=128)
+
+    @model_validator(mode="after")
+    def validate_ranges(self) -> WorkerEventResult:
+        if self.end_sample <= self.start_sample:
+            raise ValueError("event end_sample must exceed start_sample")
+        if self.channel_stop <= self.channel_start:
+            raise ValueError("event channel_stop must exceed channel_start")
+        return self
+
+
+class WorkerArtifactResult(StrictSchema):
+    event_uid: str = Field(min_length=1, max_length=128)
+    kind: Literal[
+        "waterfall_raw",
+        "waterfall_filtered",
+        "waveform",
+        "psd",
+        "stft",
+        "evidence",
+    ]
+    path: str = Field(min_length=1, max_length=4096)
+    media_type: Literal["image/png", "application/json"]
+    sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    @field_validator("event_uid", "path")
+    @classmethod
+    def validate_nonblank_fields(cls, value: str) -> str:
+        return _nonblank(value, field="artifact field", maximum=4096)
+
+
+class WorkerResultRequest(StrictSchema):
+    worker_id: WorkerId
+    source_file_id: str = Field(min_length=1, max_length=36)
+    processing_profile_id: str = Field(min_length=1, max_length=36)
+    profile_version: StrictInt = Field(ge=1, le=2**31 - 1)
+    pipeline_version: PipelineVersion
+    source_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")
+    source_start_time_utc: datetime
+    sample_rate_hz: FiniteFloat = Field(gt=0, le=10_000_000)
+    requested_backend: Literal["auto", "cpu", "cuda"]
+    actual_backend: Literal["cpu", "cuda"]
+    backend_fallback_reason: Literal[
+        "cuda_unavailable",
+        "cuda_out_of_memory",
+    ] | None = None
+    timings_ms: dict[str, FiniteFloat] = Field(default_factory=dict, max_length=64)
+    events: list[WorkerEventResult] = Field(default_factory=list, max_length=10_000)
+    artifacts: list[WorkerArtifactResult] = Field(
+        default_factory=list,
+        max_length=60_000,
+    )
+
+    @field_validator("source_start_time_utc")
+    @classmethod
+    def validate_source_time(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("source_start_time_utc must be timezone-aware")
+        return value.astimezone(UTC)
+
+    @field_validator("timings_ms")
+    @classmethod
+    def validate_timings(cls, value: dict[str, float]) -> dict[str, float]:
+        for name, duration in value.items():
+            _nonblank(name, field="timing name", maximum=64)
+            if duration < 0:
+                raise ValueError("timings must be nonnegative")
+        return value
+
+    @model_validator(mode="after")
+    def validate_total_bounds(self) -> WorkerResultRequest:
+        maximum_offset_seconds = 366 * 24 * 60 * 60
+        if any(
+            event.end_sample / self.sample_rate_hz > maximum_offset_seconds
+            for event in self.events
+        ):
+            raise ValueError("event sample offsets exceed the bounded source duration")
+        encoded = json.dumps(
+            self.model_dump(mode="json"),
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        ).encode()
+        if len(encoded) > 16 * 1024 * 1024:
+            raise ValueError("worker result exceeds the maximum encoded size")
+        return self
+
+
+class ReviewCreate(StrictSchema):
+    label: Literal["earthquake", "blast", "traffic", "noise"]
+    note: str | None = Field(default=None, max_length=2000)
+
+    @field_validator("note")
+    @classmethod
+    def validate_note(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        stripped = value.strip()
+        return stripped or None
+
+
+class ReviewResponse(StrictSchema):
+    id: int
+    label: Literal["earthquake", "blast", "traffic", "noise"]
+    note: str | None
+    created_at: datetime
+
+
+class EventSummaryResponse(StrictSchema):
+    id: str
+    event_uid: str
+    site_id: str
+    occurred_at: datetime
+    start_sample: int
+    end_sample: int
+    channel_start: int
+    channel_stop: int
+    machine_label: Literal[
+        "earthquake",
+        "blast",
+        "traffic",
+        "noise",
+        "unknown",
+    ]
+    latest_review: ReviewResponse | None
+
+
+class EventEvidenceResponse(StrictSchema):
+    detector: str
+    score: float
+    payload: dict[str, Any]
+
+
+class MachineClassificationResponse(StrictSchema):
+    id: int
+    label: Literal[
+        "earthquake",
+        "blast",
+        "traffic",
+        "noise",
+        "unknown",
+    ]
+    decision_score: float
+    method: str
+    reasons: list[str]
+    model_version_id: str | None
+    created_at: datetime
+
+
+class EventArtifactResponse(StrictSchema):
+    id: str
+    kind: str
+    media_type: str
+
+
+class EventRunResponse(StrictSchema):
+    id: str
+    source_file_id: str
+    source_fingerprint: str
+    processing_profile_id: str
+    requested_backend: str
+    actual_backend: str
+    backend_fallback_reason: str | None
+    profile_version: int
+    pipeline_version: str
+    model_version_id: str | None
+    timings_ms: dict[str, float]
+    started_at: datetime | None
+    finished_at: datetime | None
+
+
+class EventDetailResponse(EventSummaryResponse):
+    features: dict[str, Any]
+    evidence: list[EventEvidenceResponse]
+    machine_history: list[MachineClassificationResponse]
+    review_history: list[ReviewResponse]
+    artifacts: list[EventArtifactResponse]
+    run: EventRunResponse
+
+
 def _iana_timezone(value: str) -> str:
     try:
         ZoneInfo(value)
     except (ZoneInfoNotFoundError, ValueError) as error:
         raise ValueError("timezone must be a valid IANA timezone") from error
+    return value
+
+
+def _nonblank(
+    value: str,
+    *,
+    field: str,
+    maximum: int = 64,
+) -> str:
+    stripped = value.strip()
+    if not stripped or len(stripped) > maximum:
+        raise ValueError(f"{field} must be nonblank and at most {maximum} characters")
+    return stripped
+
+
+def _bounded_json(
+    value: dict[str, Any],
+    *,
+    field: str,
+    maximum: int,
+) -> dict[str, Any]:
+    try:
+        encoded = json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field} must contain finite JSON values") from error
+    if len(encoded.encode()) > maximum:
+        raise ValueError(f"{field} is too large")
     return value
