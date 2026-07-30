@@ -191,6 +191,7 @@ class JobClaimResponse(StrictSchema):
     source_size_bytes: int
     source_mtime_ns: int
     site_id: str
+    site_data_root: str
     site_timezone: str
     cable_type: str
     processing_profile_id: str

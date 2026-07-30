@@ -183,6 +183,7 @@ def test_enqueue_claim_heartbeat_complete_protocol_and_no_token_leak(api_client)
     assert claim.json()["id"] == job_id
     assert claim.json()["source_size_bytes"] == 1
     assert claim.json()["source_mtime_ns"] == 2
+    assert claim.json()["site_data_root"] == str(settings.data_root)
     assert claim.json()["profile_version"] == 4
     assert claim.json()["profile_payload"] == {"device": "auto"}
 

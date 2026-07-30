@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol
+from typing import BinaryIO, Protocol
 
 from das_sentinel.domain import DasBlock, DasMetadata
 
@@ -13,15 +13,15 @@ class ProbeResult:
 
 
 class DasReader(Protocol):
-    def probe(self, path: Path) -> ProbeResult: ...
+    def probe(self, path: Path | BinaryIO) -> ProbeResult: ...
 
-    def sample_count(self, path: Path) -> int: ...
+    def sample_count(self, path: Path | BinaryIO) -> int: ...
 
-    def read_metadata(self, path: Path) -> DasMetadata: ...
+    def read_metadata(self, path: Path | BinaryIO) -> DasMetadata: ...
 
     def read_block(
         self,
-        path: Path,
+        path: Path | BinaryIO,
         sample_start: int,
         sample_stop: int,
         channel_slice: slice = slice(None),
@@ -32,7 +32,7 @@ class ReaderRegistry:
     def __init__(self, readers: list[DasReader]) -> None:
         self._readers = readers
 
-    def resolve(self, path: Path) -> DasReader:
+    def resolve(self, path: Path | BinaryIO) -> DasReader:
         for reader in self._readers:
             if reader.probe(path).supported:
                 return reader

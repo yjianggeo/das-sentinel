@@ -398,11 +398,19 @@ class _SourceHandle:
 def _open_anchored_source(
     root: Path,
     path: Path,
+    *,
+    required_suffix: str | None = ".h5",
+    hold_ancestors: bool = True,
 ) -> Iterator[_AnchoredSource]:
     candidate = Path(path)
     _require_lexical_absolute(candidate, field="source path")
-    if candidate.suffix.lower() != ".h5":
-        raise DiscoveryPathError("source path must have an .h5 extension")
+    if (
+        required_suffix is not None
+        and candidate.suffix.lower() != required_suffix.lower()
+    ):
+        raise DiscoveryPathError(
+            f"source path must have an {required_suffix} extension"
+        )
     try:
         relative = candidate.relative_to(root)
     except ValueError as error:
@@ -412,7 +420,7 @@ def _open_anchored_source(
     if not relative.parts:
         raise DiscoveryPathError("source path must identify a regular file")
 
-    with ExitStack() as stack:
+    with ExitStack() as handles, ExitStack() as streams:
         try:
             parent_handle: _SourceHandle | None = None
             for root_component in _absolute_path_chain(root):
@@ -421,7 +429,7 @@ def _open_anchored_source(
                     parent_handle,
                     expect_directory=True,
                 )
-                stack.callback(opened.close)
+                handles.callback(opened.close)
                 parent_handle = opened
             current = root
             final_handle: _SourceHandle | None = None
@@ -433,18 +441,20 @@ def _open_anchored_source(
                     parent_handle,
                     expect_directory=expect_directory,
                 )
-                stack.callback(opened.close)
+                handles.callback(opened.close)
                 parent_handle = opened
                 final_handle = opened
             if final_handle is None:
                 raise OSError("source path is missing a final component")
-            stream = stack.enter_context(_source_stream(final_handle))
+            stream = streams.enter_context(_source_stream(final_handle))
             source = _AnchoredSource(candidate, stream)
             source.snapshot()
         except OSError as error:
             raise DiscoveryPathError(
                 "source path must use an existing no-follow regular file chain"
             ) from error
+        if not hold_ancestors:
+            handles.close()
         yield source
 
 
@@ -514,7 +524,12 @@ def _open_posix_source_component(
     parent_handle: _SourceHandle | None,
     expect_directory: bool,
 ) -> _SourceHandle:
-    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    flags = (
+        os.O_RDONLY
+        | os.O_CLOEXEC
+        | os.O_NOFOLLOW
+        | getattr(os, "O_NONBLOCK", 0)
+    )
     if expect_directory:
         flags |= os.O_DIRECTORY
     opened: str | Path = path

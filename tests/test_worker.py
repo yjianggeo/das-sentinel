@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import threading
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -25,8 +26,9 @@ from das_sentinel.worker.main import (
 
 
 class FakeReader:
-    def probe(self, path: Path) -> ProbeResult:
-        return ProbeResult(path.suffix == ".h5", "fake")
+    def probe(self, path) -> ProbeResult:
+        del path
+        return ProbeResult(True, "fake")
 
     def read_metadata(self, path: Path) -> DasMetadata:
         return DasMetadata(
@@ -114,6 +116,7 @@ def _claim(
             stat_result.st_mtime_ns if source_mtime_ns is None else source_mtime_ns
         ),
         site_id="site-1",
+        site_data_root=str(source.parent.resolve()),
         site_timezone="UTC",
         cable_type="urban",
         processing_profile_id="profile-1",
@@ -435,6 +438,40 @@ def test_non_cuda_exception_is_failed_without_cpu_retry_and_next_job_runs(
     assert len(protocol.failures[0][3]) <= 1024
 
 
+def test_worker_releases_claimed_source_handle_after_analysis_failure(
+    tmp_path: Path,
+):
+    source = tmp_path / "input.h5"
+    source.write_bytes(b"stable")
+    protocol = FakeProtocol([_claim(source)])
+    claimed_streams = []
+
+    class TrackingRegistry(ReaderRegistry):
+        def resolve(self, value):
+            claimed_streams.append(value)
+            return super().resolve(value)
+
+    def fail_analysis(*args):
+        del args
+        raise OSError("analysis failed")
+
+    worker = Worker(
+        settings=_settings(tmp_path),
+        client=protocol,
+        worker_id="worker-a",
+        readers=TrackingRegistry([FakeReader()]),
+        analyzer=fail_analysis,
+        backend_selector=lambda device: ArrayBackend("cpu", np),
+        heartbeat_interval_seconds=0.01,
+    )
+
+    outcome = worker.run_once()
+
+    assert outcome.status == "failed"
+    assert claimed_streams
+    assert all(stream.closed for stream in claimed_streams)
+
+
 def test_result_submission_failure_is_structured_and_stops_heartbeat(
     tmp_path: Path,
 ):
@@ -484,6 +521,106 @@ def test_worker_rejects_analyzer_backend_identity_mismatch(tmp_path: Path):
     assert outcome.status == "failed"
     assert outcome.error_code == "analysis_failed"
     assert protocol.results == []
+
+
+@pytest.mark.parametrize("replacement_kind", ["file", "ancestor"])
+def test_worker_binds_reader_and_analysis_to_claimed_source_handle(
+    tmp_path: Path,
+    replacement_kind: str,
+):
+    site_root = tmp_path / "site"
+    site_root.mkdir()
+    source = site_root / "input.h5"
+    source.write_bytes(b"internal")
+    outside_root = tmp_path / "outside"
+    outside_root.mkdir()
+    outside_source = outside_root / "input.h5"
+    outside_source.write_bytes(b"external")
+    timestamp_ns = 1_800_000_000_000_000_000
+    os.utime(source, ns=(timestamp_ns, timestamp_ns))
+    os.utime(outside_source, ns=(timestamp_ns, timestamp_ns))
+    claim = _claim(source)
+    protocol = FakeProtocol([claim])
+    observed: list[bytes] = []
+    claimed_streams = []
+    replaced = False
+
+    def replace_claim_path() -> None:
+        nonlocal replaced
+        if replaced:
+            return
+        replaced = True
+        if replacement_kind == "file":
+            try:
+                source.rename(site_root / "original.h5")
+            except OSError:
+                # A held Windows file handle deliberately blocks replacement.
+                return
+            outside_source.rename(source)
+            return
+        try:
+            site_root.rename(tmp_path / "site-original")
+        except OSError:
+            # A held Windows directory handle deliberately blocks replacement.
+            return
+        try:
+            site_root.symlink_to(outside_root, target_is_directory=True)
+        except OSError:
+            # A held Windows directory handle deliberately blocks replacement.
+            (tmp_path / "site-original").rename(site_root)
+
+    def read_marker(value) -> bytes:
+        stream = getattr(value, "stream", value)
+        if hasattr(stream, "read"):
+            position = stream.tell()
+            stream.seek(0)
+            content = stream.read()
+            stream.seek(position)
+            return content
+        return Path(stream).read_bytes()
+
+    class ReplacingRegistry:
+        def resolve(self, value):
+            claimed_streams.append(value)
+            replace_claim_path()
+            observed.append(read_marker(value))
+            return reader
+
+    class TrackingReader(FakeReader):
+        def read_metadata(self, value):
+            observed.append(read_marker(value))
+            return super().read_metadata(source)
+
+    reader = TrackingReader()
+    stable_helper = tmp_path / "stable.h5"
+    stable_helper.write_bytes(b"stable")
+
+    def analyze(value, reader, profile, backend, artifact_root, context):
+        del reader, profile, context
+        observed.append(read_marker(value))
+        result = _analysis(stable_helper, backend, Path(artifact_root))
+        return replace(
+            result,
+            source_path=claim.source_path,
+            source_fingerprint=claim.source_fingerprint,
+        )
+
+    worker = Worker(
+        settings=_settings(tmp_path),
+        client=protocol,
+        worker_id="worker-a",
+        readers=ReplacingRegistry(),
+        analyzer=analyze,
+        backend_selector=lambda device: ArrayBackend("cpu", np),
+        heartbeat_interval_seconds=0.01,
+    )
+
+    outcome = worker.run_once()
+
+    assert outcome.status == "succeeded"
+    assert observed == [b"internal", b"internal", b"internal"]
+    assert all(stream.closed for stream in claimed_streams)
+    assert b"external" not in observed
 
 
 @pytest.mark.parametrize(

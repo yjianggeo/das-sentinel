@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import io
+import os
+from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -24,7 +27,9 @@ from das_sentinel.persistence.models import (
     Review,
 )
 from das_sentinel.services.discovery import fingerprint
+from das_sentinel.services.jobs import JobValidationError
 from fastapi.testclient import TestClient
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import func, select
 
 PASSWORD = "correct horse"
@@ -254,6 +259,70 @@ def test_event_list_filters_and_stable_bounded_pagination(event_api):
     ).status_code == 422
 
 
+def test_event_list_select_count_is_constant_across_page_sizes(event_api):
+    client, _, _, _, _ = event_api
+    engine = client.app.state.engine
+    select_counts = []
+
+    for limit in (1, 3, 100):
+        statements = []
+
+        def count_selects(
+            connection,
+            cursor,
+            statement,
+            parameters,
+            context,
+            executemany,
+            captured=statements,
+        ):
+            del connection, cursor, parameters, context, executemany
+            if statement.lstrip().upper().startswith("SELECT"):
+                captured.append(statement)
+
+        sqlalchemy_event.listen(engine, "before_cursor_execute", count_selects)
+        try:
+            response = client.get("/api/v1/events", params={"limit": limit})
+        finally:
+            sqlalchemy_event.remove(
+                engine,
+                "before_cursor_execute",
+                count_selects,
+            )
+        assert response.status_code == 200
+        select_counts.append(len(statements))
+
+    assert select_counts[0] == select_counts[1] == select_counts[2]
+    assert select_counts[0] <= 3
+
+
+def test_event_list_uses_created_at_then_id_for_latest_machine_label(event_api):
+    client, _, sessions, _, ids = event_api
+    with sessions.begin() as session:
+        Repositories(session).events.add_classification(
+            ids["event_1"],
+            label="traffic",
+            decision_score=0.99,
+            method="backdated",
+            created_at=datetime(2020, 1, 1, tzinfo=UTC),
+        )
+
+    traffic = client.get(
+        "/api/v1/events",
+        params={"machine_label": "traffic"},
+    )
+    unknown = client.get(
+        "/api/v1/events",
+        params={"machine_label": "unknown"},
+    )
+
+    assert traffic.status_code == 200
+    assert unknown.status_code == 200
+    assert "event-1" not in [item["event_uid"] for item in traffic.json()]
+    event = next(item for item in unknown.json() if item["event_uid"] == "event-1")
+    assert event["machine_label"] == "unknown"
+
+
 def test_event_detail_contains_audit_history_and_no_local_paths(event_api):
     client, settings, _, _, ids = event_api
     response = client.get(f"/api/v1/events/{ids['event_1']}")
@@ -479,6 +548,289 @@ def test_rejected_result_rolls_back_every_row_and_keeps_job_running(event_api):
         ) == 0
 
 
+def test_result_hashes_artifacts_without_materializing_paths(
+    event_api,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    client, settings, _, _, _ = event_api
+    job_id, payload = _claim_result_job(event_api)
+    artifact_root = settings.app_data_dir / "artifacts"
+    original_read_bytes = Path.read_bytes
+
+    def reject_artifact_path_reads(path: Path):
+        if path.is_relative_to(artifact_root):
+            raise AssertionError("result validation must use a held file handle")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", reject_artifact_path_reads)
+    response = client.post(
+        f"/api/v1/internal/jobs/{job_id}/result",
+        json=payload,
+        headers={"X-Worker-Token": WORKER_TOKEN},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "succeeded"
+
+
+def test_result_holds_same_artifact_handles_through_job_completion(
+    event_api,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import das_sentinel.services.results as results_module
+
+    client, _, _, _, _ = event_api
+    job_id, payload = _claim_result_job(event_api)
+    original_hash = results_module._stream_sha256
+    original_complete = results_module.JobService.complete
+    hashed_streams = []
+
+    def record_hash(stream):
+        hashed_streams.append(stream)
+        return original_hash(stream)
+
+    def assert_held_during_complete(service, *args, **kwargs):
+        assert len(hashed_streams) == 6
+        assert all(not stream.closed for stream in hashed_streams)
+        return original_complete(service, *args, **kwargs)
+
+    monkeypatch.setattr(results_module, "_stream_sha256", record_hash)
+    monkeypatch.setattr(
+        results_module.JobService,
+        "complete",
+        assert_held_during_complete,
+    )
+    response = client.post(
+        f"/api/v1/internal/jobs/{job_id}/result",
+        json=payload,
+        headers={"X-Worker-Token": WORKER_TOKEN},
+    )
+
+    assert response.status_code == 200
+    assert len(hashed_streams) == 12
+    assert all(
+        first is second
+        for first, second in zip(
+            hashed_streams[:6],
+            hashed_streams[6:],
+            strict=True,
+        )
+    )
+    assert all(stream.closed for stream in hashed_streams)
+
+
+def test_result_change_after_job_completion_rolls_back_atomically(
+    event_api,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import das_sentinel.services.results as results_module
+
+    client, _, sessions, _, _ = event_api
+    job_id, payload = _claim_result_job(event_api)
+    original_hash = results_module._stream_sha256
+    original_complete = results_module.JobService.complete
+    completion_reached = False
+    streams = []
+
+    def mark_completion(service, *args, **kwargs):
+        nonlocal completion_reached
+        completed = original_complete(service, *args, **kwargs)
+        completion_reached = True
+        return completed
+
+    def change_one_digest_on_recheck(stream):
+        streams.append(stream)
+        digest = original_hash(stream)
+        if completion_reached:
+            return "0" * 64
+        return digest
+
+    monkeypatch.setattr(
+        results_module.JobService,
+        "complete",
+        mark_completion,
+    )
+    monkeypatch.setattr(
+        results_module,
+        "_stream_sha256",
+        change_one_digest_on_recheck,
+    )
+    response = client.post(
+        f"/api/v1/internal/jobs/{job_id}/result",
+        json=payload,
+        headers={"X-Worker-Token": WORKER_TOKEN},
+    )
+
+    assert response.status_code == 422
+    assert completion_reached
+    assert streams
+    assert all(stream.closed for stream in streams)
+    with sessions() as session:
+        assert session.get(Job, job_id).status == "running"
+        assert session.scalar(
+            select(func.count()).select_from(ProcessingRun)
+            .where(ProcessingRun.job_id == job_id)
+        ) == 0
+
+
+def test_result_rejects_symlink_without_reading_external_file(
+    event_api,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    client, _, sessions, _, _ = event_api
+    job_id, payload = _claim_result_job(event_api)
+    linked = Path(payload["artifacts"][0]["path"])
+    outside = tmp_path / "outside.png"
+    outside.write_bytes(b"external")
+    linked.unlink()
+    try:
+        linked.symlink_to(outside)
+    except OSError as error:
+        pytest.skip(f"symlink unavailable: {error}")
+    payload["artifacts"][0]["sha256"] = hashlib.sha256(b"external").hexdigest()
+    original_read_bytes = Path.read_bytes
+    path_reads = []
+
+    def track_path_reads(path: Path):
+        if path == linked or path == outside:
+            path_reads.append(path)
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", track_path_reads)
+    response = client.post(
+        f"/api/v1/internal/jobs/{job_id}/result",
+        json=payload,
+        headers={"X-Worker-Token": WORKER_TOKEN},
+    )
+
+    assert response.status_code == 422
+    assert path_reads == []
+    with sessions() as session:
+        assert session.get(Job, job_id).status == "running"
+        assert session.scalar(
+            select(func.count()).select_from(ProcessingRun)
+            .where(ProcessingRun.job_id == job_id)
+        ) == 0
+
+
+def test_result_rejects_oversized_artifact_before_reading_it(
+    event_api,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    client, _, sessions, _, _ = event_api
+    job_id, payload = _claim_result_job(event_api)
+    oversized = Path(payload["artifacts"][0]["path"])
+    with oversized.open("wb") as stream:
+        stream.seek(64 * 1024 * 1024)
+        stream.write(b"x")
+
+    def reject_path_reads(path: Path):
+        raise AssertionError(f"oversized artifact was materialized: {path}")
+
+    monkeypatch.setattr(Path, "read_bytes", reject_path_reads)
+    response = client.post(
+        f"/api/v1/internal/jobs/{job_id}/result",
+        json=payload,
+        headers={"X-Worker-Token": WORKER_TOKEN},
+    )
+
+    assert response.status_code == 422
+    with sessions() as session:
+        assert session.get(Job, job_id).status == "running"
+        assert session.scalar(
+            select(func.count()).select_from(ProcessingRun)
+            .where(ProcessingRun.job_id == job_id)
+        ) == 0
+
+
+def test_result_rejects_too_many_artifacts_before_opening_any(
+    event_api,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import das_sentinel.services.results as results_module
+
+    client, _, sessions, _, _ = event_api
+    job_id, payload = _claim_result_job(event_api)
+    base_event = payload["events"][0]
+    base_artifacts = payload["artifacts"]
+    events = []
+    artifacts = []
+    for index in range(101):
+        event_uid = f"bounded-event-{index}"
+        events.append({**base_event, "event_uid": event_uid})
+        artifacts.extend(
+            {**artifact, "event_uid": event_uid}
+            for artifact in base_artifacts
+        )
+    payload["events"] = events
+    payload["artifacts"] = artifacts
+
+    def reject_any_open(*args, **kwargs):
+        del args, kwargs
+        raise AssertionError("artifact count must be rejected before opening")
+
+    monkeypatch.setattr(
+        results_module,
+        "_open_anchored_source",
+        reject_any_open,
+    )
+    response = client.post(
+        f"/api/v1/internal/jobs/{job_id}/result",
+        json=payload,
+        headers={"X-Worker-Token": WORKER_TOKEN},
+    )
+
+    assert response.status_code == 422
+    with sessions() as session:
+        assert session.get(Job, job_id).status == "running"
+        assert session.scalar(
+            select(func.count()).select_from(ProcessingRun)
+            .where(ProcessingRun.job_id == job_id)
+        ) == 0
+
+
+def test_result_stream_hash_enforces_limit_while_reading():
+    import das_sentinel.services.results as results_module
+
+    stream = io.BytesIO(b"123456789")
+
+    with pytest.raises(JobValidationError, match="size limit"):
+        results_module._stream_sha256(stream, maximum_bytes=8)
+
+    assert stream.tell() == 0
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX FIFO semantics")
+def test_result_rejects_fifo_without_blocking(
+    event_api,
+):
+    client, _, _, _, _ = event_api
+    job_id, payload = _claim_result_job(event_api)
+    fifo = Path(payload["artifacts"][0]["path"])
+    fifo.unlink()
+    os.mkfifo(fifo)
+    completed_promptly = True
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(
+            client.post,
+            f"/api/v1/internal/jobs/{job_id}/result",
+            json=payload,
+            headers={"X-Worker-Token": WORKER_TOKEN},
+        )
+        try:
+            response = future.result(timeout=1)
+        except TimeoutError:
+            completed_promptly = False
+            writer = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+            os.close(writer)
+            response = future.result(timeout=2)
+
+    assert completed_promptly
+    assert response.status_code == 422
+
+
 @pytest.mark.parametrize(
     "mutate",
     [
@@ -651,3 +1003,50 @@ def test_artifact_download_rejects_symlink_and_ancestor_replacement_race(
     response = client.get(f"/api/v1/artifacts/{artifact_id}")
     assert response.status_code == 409
     assert b"attacker" not in response.content
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle sharing semantics")
+def test_windows_artifact_parent_handle_blocks_replacement(
+    event_api,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    import das_sentinel.api.routes.artifacts as artifact_route
+
+    client, settings, _, _, ids = event_api
+    artifact_id, target = _register_artifact(event_api)
+    root = settings.app_data_dir / "artifacts"
+    parent = target.parent
+    moved = root / f"{ids['event_1']}-moved"
+    outside = tmp_path / "attacker"
+    outside.mkdir()
+    (outside / target.name).write_bytes(b"attacker")
+    original_open = artifact_route._open_artifact_component
+    replacement_was_blocked = False
+
+    def attempt_replacement_after_open(path, parent_handle, *, expect_directory):
+        nonlocal replacement_was_blocked
+        opened = original_open(
+            path,
+            parent_handle,
+            expect_directory=expect_directory,
+        )
+        if Path(path) == parent:
+            try:
+                parent.rename(moved)
+            except OSError:
+                replacement_was_blocked = True
+            else:
+                parent.symlink_to(outside, target_is_directory=True)
+        return opened
+
+    monkeypatch.setattr(
+        artifact_route,
+        "_open_artifact_component",
+        attempt_replacement_after_open,
+    )
+    response = client.get(f"/api/v1/artifacts/{artifact_id}")
+
+    assert replacement_was_blocked
+    assert response.status_code == 200
+    assert response.content == b"trusted"

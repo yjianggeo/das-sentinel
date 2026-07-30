@@ -236,6 +236,7 @@ def claim_response(claim: JobClaim) -> JobClaimResponse:
         source_size_bytes=claim.source_size_bytes,
         source_mtime_ns=claim.source_mtime_ns,
         site_id=claim.site_id,
+        site_data_root=claim.site_data_root,
         site_timezone=claim.site_timezone,
         cable_type=claim.cable_type,
         processing_profile_id=claim.processing_profile_id,

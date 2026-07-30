@@ -75,6 +75,7 @@ class JobClaim:
     source_size_bytes: int
     source_mtime_ns: int
     site_id: str
+    site_data_root: str
     site_timezone: str
     cable_type: str
     processing_profile_id: str
@@ -410,6 +411,7 @@ class JobService:
             source_size_bytes=source.size_bytes,
             source_mtime_ns=source.mtime_ns,
             site_id=site.id,
+            site_data_root=site.data_path,
             site_timezone=site.timezone,
             cable_type=site.cable_type,
             processing_profile_id=profile.id,

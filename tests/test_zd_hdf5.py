@@ -1,7 +1,9 @@
 import h5py
 import numpy as np
 import pytest
+from das_sentinel.readers.base import ReaderRegistry
 from das_sentinel.readers.zd_hdf5 import ZdHdf5Reader
+from das_sentinel.services.discovery import _open_anchored_source
 
 from tests.fixtures import write_zd_h5
 
@@ -21,6 +23,26 @@ def test_reads_metadata_and_slice(tmp_path):
     np.testing.assert_allclose(block.metadata.channel_distance_m, [12, 16, 20])
     assert block.sample_offset == 10
     assert block.metadata.start_time_utc.isoformat() == "2026-07-26T00:00:00.100000+00:00"
+
+
+def test_reads_repeatedly_from_one_held_binary_stream(tmp_path):
+    path = tmp_path / "sample.h5"
+    write_zd_h5(path, n_time=237)
+    streams = []
+
+    with _open_anchored_source(tmp_path, path) as source:
+        streams.append(source.stream)
+        reader = ReaderRegistry([ZdHdf5Reader()]).resolve(source.stream)
+        metadata = reader.read_metadata(source.stream)
+        count = reader.sample_count(source.stream)
+        block = reader.read_block(source.stream, 10, 12, slice(1, 4))
+
+        assert metadata.sample_rate_hz == 100.0
+        assert count == 237
+        assert block.data.shape == (2, 3)
+        assert not source.stream.closed
+
+    assert all(stream.closed for stream in streams)
 
 
 def test_reports_total_sample_count_without_reading_outside_file(tmp_path):

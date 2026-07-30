@@ -4,6 +4,7 @@ import json
 import math
 import threading
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,13 +15,14 @@ import httpx
 from das_sentinel.config import ProcessingProfile, Settings
 from das_sentinel.pipeline import (
     AnalysisContext,
+    BoundSource,
     FileAnalysis,
     SourceChangedError,
     analyze_file,
 )
 from das_sentinel.readers.base import ReaderRegistry
 from das_sentinel.readers.zd_hdf5 import ZdHdf5Reader
-from das_sentinel.services.discovery import fingerprint
+from das_sentinel.services.discovery import _open_anchored_source
 from das_sentinel.signal.backend import (
     ArrayBackend,
     BackendUnavailable,
@@ -47,6 +49,7 @@ class WorkerClaim:
     source_size_bytes: int
     source_mtime_ns: int
     site_id: str
+    site_data_root: str
     site_timezone: str
     cable_type: str
     processing_profile_id: str
@@ -70,6 +73,7 @@ class WorkerClaim:
             source_size_bytes=parsed.source_size_bytes,
             source_mtime_ns=parsed.source_mtime_ns,
             site_id=parsed.site_id,
+            site_data_root=parsed.site_data_root,
             site_timezone=parsed.site_timezone,
             cable_type=parsed.cable_type,
             processing_profile_id=parsed.processing_profile_id,
@@ -235,54 +239,54 @@ class Worker:
 
         requested_backend: str | None = None
         try:
-            source, profile, reader = self._validate_claim(claim)
-            requested_backend = (
-                self.settings.worker_device
-                if self.settings.worker_device != "auto"
-                else profile.device
-            )
-            metadata = reader.read_metadata(source)
-            self._start_heartbeat(claim)
-            try:
-                analysis, actual_backend, fallback_reason = self._analyze(
-                    claim,
-                    source,
-                    profile,
-                    reader,
-                    requested_backend,
+            with self._validate_claim(claim) as (source, profile, reader):
+                requested_backend = (
+                    self.settings.worker_device
+                    if self.settings.worker_device != "auto"
+                    else profile.device
                 )
-                if analysis.source_fingerprint != claim.source_fingerprint:
-                    raise SourceChangedError(
-                        "analysis source fingerprint does not match claim"
-                    )
-                if analysis.actual_backend != actual_backend:
-                    raise RuntimeError(
-                        "analysis backend identity does not match selected backend"
-                    )
-                payload = _result_payload(
-                    claim,
-                    metadata.start_time_utc,
-                    metadata.sample_rate_hz,
-                    analysis,
-                    requested_backend=requested_backend,
-                    actual_backend=actual_backend,
-                    fallback_reason=fallback_reason,
-                )
+                metadata = reader.read_metadata(source.stream)
+                self._start_heartbeat(claim)
                 try:
-                    self.client.submit_result(claim.id, payload)
-                except Exception as error:
-                    raise ResultSubmissionError(
-                        "result submission failed"
-                    ) from error
-                return WorkerOutcome(
-                    status="succeeded",
-                    job_id=claim.id,
-                    requested_backend=requested_backend,
-                    actual_backend=actual_backend,
-                    backend_fallback_reason=fallback_reason,
-                )
-            finally:
-                self._stop_heartbeat()
+                    analysis, actual_backend, fallback_reason = self._analyze(
+                        claim,
+                        source,
+                        profile,
+                        reader,
+                        requested_backend,
+                    )
+                    if analysis.source_fingerprint != claim.source_fingerprint:
+                        raise SourceChangedError(
+                            "analysis source fingerprint does not match claim"
+                        )
+                    if analysis.actual_backend != actual_backend:
+                        raise RuntimeError(
+                            "analysis backend identity does not match selected backend"
+                        )
+                    payload = _result_payload(
+                        claim,
+                        metadata.start_time_utc,
+                        metadata.sample_rate_hz,
+                        analysis,
+                        requested_backend=requested_backend,
+                        actual_backend=actual_backend,
+                        fallback_reason=fallback_reason,
+                    )
+                    try:
+                        self.client.submit_result(claim.id, payload)
+                    except Exception as error:
+                        raise ResultSubmissionError(
+                            "result submission failed"
+                        ) from error
+                    return WorkerOutcome(
+                        status="succeeded",
+                        job_id=claim.id,
+                        requested_backend=requested_backend,
+                        actual_backend=actual_backend,
+                        backend_fallback_reason=fallback_reason,
+                    )
+                finally:
+                    self._stop_heartbeat()
         except Exception as error:  # noqa: BLE001 - isolate each claimed file
             self._stop_heartbeat()
             code = _failure_code(error)
@@ -295,6 +299,7 @@ class Worker:
                 error_code=code,
             )
 
+    @contextmanager
     def _validate_claim(self, claim: WorkerClaim):
         if claim.worker_id != self.worker_id:
             raise ValueError("claim worker does not match this worker")
@@ -317,19 +322,32 @@ class Worker:
         source = Path(claim.source_path)
         if not source.is_absolute():
             raise ValueError("claim source path must be absolute")
-        stat_result = source.stat()
-        if (
-            stat_result.st_size != claim.source_size_bytes
-            or stat_result.st_mtime_ns != claim.source_mtime_ns
-            or fingerprint(source) != claim.source_fingerprint
-        ):
-            raise ValueError("claim source identity changed")
-        return source, profile, self.readers.resolve(source)
+        root = Path(claim.site_data_root)
+        with _open_anchored_source(root, source) as anchored:
+            discovered = anchored.snapshot().discovered()
+            if (
+                discovered.size_bytes != claim.source_size_bytes
+                or discovered.mtime_ns != claim.source_mtime_ns
+                or discovered.fingerprint != claim.source_fingerprint
+            ):
+                raise ValueError("claim source identity changed")
+            bound_source = BoundSource(
+                path=source,
+                stream=anchored.stream,
+                fingerprint=discovered.fingerprint,
+                size_bytes=discovered.size_bytes,
+                mtime_ns=discovered.mtime_ns,
+            )
+            yield (
+                bound_source,
+                profile,
+                self.readers.resolve(bound_source.stream),
+            )
 
     def _analyze(
         self,
         claim: WorkerClaim,
-        source: Path,
+        source: BoundSource,
         profile: ProcessingProfile,
         reader,
         requested_backend: str,

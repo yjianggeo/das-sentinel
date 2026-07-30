@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from typing import Literal, cast
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.concurrency import run_in_threadpool
-from sqlalchemy import exists, func, select
+from sqlalchemy import func, select
 
 from das_sentinel.api.auth import AuthenticatedAdmin, CsrfAdmin
 from das_sentinel.api.schemas import (
@@ -29,6 +30,13 @@ from das_sentinel.persistence.models import (
 from das_sentinel.persistence.repositories import Repositories
 
 router = APIRouter(prefix="/events", tags=["events"])
+MachineLabelValue = Literal[
+    "earthquake",
+    "blast",
+    "traffic",
+    "noise",
+    "unknown",
+]
 
 
 @router.get("", response_model=list[EventSummaryResponse])
@@ -57,16 +65,38 @@ def list_events(
             detail="unsupported machine label",
         )
 
-    latest_classification_id = (
-        select(func.max(Classification.id))
+    latest_machine_label = (
+        select(Classification.label)
         .where(Classification.event_id == Event.id)
+        .order_by(
+            Classification.created_at.desc(),
+            Classification.id.desc(),
+        )
+        .limit(1)
+        .correlate(Event)
+        .scalar_subquery()
+    )
+    latest_review_id = (
+        select(Review.id)
+        .where(Review.event_id == Event.id)
+        .order_by(
+            Review.created_at.desc(),
+            Review.id.desc(),
+        )
+        .limit(1)
         .correlate(Event)
         .scalar_subquery()
     )
     statement = (
-        select(Event)
+        select(
+            Event,
+            SourceFile.site_id,
+            func.coalesce(latest_machine_label, "unknown"),
+            Review,
+        )
         .join(ProcessingRun, ProcessingRun.id == Event.processing_run_id)
         .join(SourceFile, SourceFile.id == ProcessingRun.source_file_id)
+        .outerjoin(Review, Review.id == latest_review_id)
     )
     if site_id is not None:
         statement = statement.where(SourceFile.site_id == site_id)
@@ -75,23 +105,31 @@ def list_events(
     if end_utc is not None:
         statement = statement.where(Event.occurred_at <= end_utc)
     if machine_label is not None:
-        statement = statement.join(
-            Classification,
-            Classification.id == latest_classification_id,
-        ).where(Classification.label == machine_label)
-    if reviewed is not None:
-        has_review = exists(
-            select(Review.id).where(Review.event_id == Event.id)
+        statement = statement.where(
+            func.coalesce(latest_machine_label, "unknown") == machine_label
         )
-        statement = statement.where(has_review if reviewed else ~has_review)
+    if reviewed is not None:
+        statement = statement.where(
+            latest_review_id.is_not(None)
+            if reviewed
+            else latest_review_id.is_(None)
+        )
     statement = statement.order_by(
         Event.occurred_at.desc(),
         Event.id.desc(),
     ).limit(limit).offset(offset)
 
     with request.app.state.session_factory() as session:
-        rows = list(session.scalars(statement))
-        return [_summary(session, event) for event in rows]
+        rows = session.execute(statement).all()
+        return [
+            _list_summary(
+                event,
+                row_site_id,
+                cast(MachineLabelValue, label),
+                latest_review,
+            )
+            for event, row_site_id, label, latest_review in rows
+        ]
 
 
 @router.get("/{event_id}", response_model=EventDetailResponse)
@@ -240,8 +278,28 @@ def _summary(
         end_sample=event.end_sample,
         channel_start=event.channel_start,
         channel_stop=event.channel_stop,
-        machine_label=event.machine_label,
+        machine_label=cast(MachineLabelValue, event.machine_label),
         latest_review=None if latest is None else _review(latest),
+    )
+
+
+def _list_summary(
+    event: Event,
+    site_id: str,
+    machine_label: MachineLabelValue,
+    latest_review: Review | None,
+) -> EventSummaryResponse:
+    return EventSummaryResponse(
+        id=event.id,
+        event_uid=event.event_uid,
+        site_id=site_id,
+        occurred_at=event.occurred_at,
+        start_sample=event.start_sample,
+        end_sample=event.end_sample,
+        channel_start=event.channel_start,
+        channel_stop=event.channel_stop,
+        machine_label=machine_label,
+        latest_review=None if latest_review is None else _review(latest_review),
     )
 
 

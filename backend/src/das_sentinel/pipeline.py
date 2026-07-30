@@ -11,7 +11,7 @@ from dataclasses import dataclass, field, replace
 from datetime import timedelta
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, BinaryIO
 from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -106,8 +106,36 @@ class FileAnalysis:
     artifacts: tuple[ArtifactManifest, ...]
 
 
+@dataclass(frozen=True)
+class BoundSource:
+    """A source path whose no-follow file handle is held by the caller."""
+
+    path: Path
+    stream: BinaryIO
+    fingerprint: str
+    size_bytes: int
+    mtime_ns: int
+
+    def __fspath__(self) -> str:
+        return str(self.path)
+
+    def __str__(self) -> str:
+        return str(self.path)
+
+    @property
+    def name(self) -> str:
+        return self.path.name
+
+    @property
+    def suffix(self) -> str:
+        return self.path.suffix
+
+    def __getattr__(self, name: str):
+        return getattr(self.stream, name)
+
+
 def analyze_file(
-    path: str | Path,
+    path: str | Path | BoundSource,
     reader: DasReader,
     profile: ProcessingProfile,
     backend: ArrayBackend,
@@ -115,15 +143,25 @@ def analyze_file(
     context: AnalysisContext | None = None,
 ) -> FileAnalysis:
     """Analyze one DAS file in overlapping blocks and render review artifacts."""
-    source = Path(path)
+    reader_source: Path | BinaryIO
+    if isinstance(path, BoundSource):
+        source: Path | BoundSource = path
+        reader_source = path.stream
+        source_path = path.path
+        source_fingerprint = path.fingerprint
+        _ensure_source_unchanged(source, source_fingerprint)
+    else:
+        source = Path(path)
+        reader_source = source
+        source_path = source
+        source_fingerprint = _source_fingerprint(source)
     run_context = context or AnalysisContext()
     started = time.perf_counter()
     timings = {name: 0.0 for name in _TIMING_NAMES}
 
     read_started = time.perf_counter()
-    source_fingerprint = _source_fingerprint(source)
-    metadata = reader.read_metadata(source)
-    sample_count = reader.sample_count(source)
+    metadata = reader.read_metadata(reader_source)
+    sample_count = reader.sample_count(reader_source)
     timings["read"] += _elapsed_ms(read_started)
     _validate_metadata(profile, metadata.sample_rate_hz)
     if sample_count <= 0:
@@ -146,7 +184,7 @@ def analyze_file(
             else min(sample_count, logical_start + step_samples)
         )
         read_started = time.perf_counter()
-        block = reader.read_block(source, sample_start, sample_stop)
+        block = reader.read_block(reader_source, sample_start, sample_stop)
         timings["read"] += _elapsed_ms(read_started)
         candidates.extend(
             candidate
@@ -199,7 +237,11 @@ def analyze_file(
                 metadata.sample_rate_hz,
             )
             read_started = time.perf_counter()
-            raw_block = reader.read_block(source, window_start, window_stop)
+            raw_block = reader.read_block(
+                reader_source,
+                window_start,
+                window_stop,
+            )
             timings["read"] += _elapsed_ms(read_started)
 
             primary_detector = _primary_detector(event)
@@ -298,7 +340,7 @@ def analyze_file(
 
     timings["total"] = _elapsed_ms(started)
     return FileAnalysis(
-        source_path=str(source),
+        source_path=str(source_path),
         source_fingerprint=source_fingerprint,
         actual_backend=backend.name,
         backend_fallback_reason=backend.unavailable_reason,
@@ -494,7 +536,10 @@ def _freeze_json(value: Any) -> Any:
 
 class _ArtifactTransaction:
     def __init__(
-        self, artifact_root: Path, source: Path, source_fingerprint: str
+        self,
+        artifact_root: Path,
+        source: Path | BoundSource,
+        source_fingerprint: str,
     ) -> None:
         artifact_root.mkdir(parents=True, exist_ok=True)
         self.final_root = artifact_root.resolve(strict=True)
@@ -726,9 +771,23 @@ def _validate_metadata(
             )
 
 
-def _ensure_source_unchanged(path: Path, expected: str) -> None:
+def _ensure_source_unchanged(
+    path: Path | BoundSource,
+    expected: str,
+) -> None:
     try:
-        current = _source_fingerprint(path)
+        if isinstance(path, BoundSource):
+            stat_result = os.fstat(path.stream.fileno())
+            if (
+                stat_result.st_size != path.size_bytes
+                or stat_result.st_mtime_ns != path.mtime_ns
+            ):
+                raise SourceChangedError(
+                    "DAS source changed during analysis"
+                )
+            current = _source_fingerprint_from_stat(path.path, stat_result)
+        else:
+            current = _source_fingerprint(path)
     except OSError as error:
         raise SourceChangedError("DAS source changed during analysis") from error
     if current != expected:
@@ -738,8 +797,15 @@ def _ensure_source_unchanged(path: Path, expected: str) -> None:
 def _source_fingerprint(path: Path) -> str:
     resolved = path.resolve(strict=True)
     stat = resolved.stat()
+    return _source_fingerprint_from_stat(resolved, stat)
+
+
+def _source_fingerprint_from_stat(
+    path: Path,
+    stat_result: os.stat_result,
+) -> str:
     payload = json.dumps(
-        (str(resolved), stat.st_size, stat.st_mtime_ns),
+        (str(path), stat_result.st_size, stat_result.st_mtime_ns),
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode()

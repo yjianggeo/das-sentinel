@@ -51,7 +51,7 @@ class ZdHdf5Reader:
             return ProbeResult(False, self.FORMAT_NAME, str(error))
         return ProbeResult(True, self.FORMAT_NAME)
 
-    def read_metadata(self, path: Path) -> DasMetadata:
+    def read_metadata(self, path: Path | BinaryIO) -> DasMetadata:
         with h5py.File(path, "r") as handle:
             raw, data, times = self._required_datasets(handle)
             n_time, n_channel, _ = self._dimensions(data, times)
@@ -67,7 +67,7 @@ class ZdHdf5Reader:
                 self._required_attr(raw, self.ATTR_UNIT),
             )
 
-    def sample_count(self, path: Path) -> int:
+    def sample_count(self, path: Path | BinaryIO) -> int:
         with h5py.File(path, "r") as handle:
             _, data, times = self._required_datasets(handle)
             n_time, _, _ = self._dimensions(data, times)
@@ -75,7 +75,7 @@ class ZdHdf5Reader:
 
     def read_block(
         self,
-        path: Path,
+        path: Path | BinaryIO,
         sample_start: int,
         sample_stop: int,
         channel_slice: slice = slice(None),
@@ -135,7 +135,7 @@ class ZdHdf5Reader:
 
     def _metadata(
         self,
-        path: Path,
+        path: Path | BinaryIO,
         start_time: datetime,
         sample_rate_hz: float,
         channel_distance_m: np.ndarray,
@@ -169,8 +169,12 @@ class ZdHdf5Reader:
         return start, stop
 
     @staticmethod
-    def _filename_warnings(path: Path, data_time: datetime) -> tuple[str, ...]:
-        match = re.search(r"(?<!\d)(\d{8}T\d{6})Z?(?!\d)", path.name)
+    def _filename_warnings(
+        path: Path | BinaryIO,
+        data_time: datetime,
+    ) -> tuple[str, ...]:
+        name = path.name if isinstance(path, Path) else ""
+        match = re.search(r"(?<!\d)(\d{8}T\d{6})Z?(?!\d)", name)
         if match is None:
             return ()
         filename_time = datetime.strptime(match.group(1), "%Y%m%dT%H%M%S").replace(

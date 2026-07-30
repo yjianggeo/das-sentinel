@@ -1,19 +1,31 @@
 from __future__ import annotations
 
 import hashlib
+import os
+from contextlib import ExitStack
 from datetime import timedelta
 from pathlib import Path
 
 from sqlalchemy.orm import Session
 
-from das_sentinel.api.schemas import WorkerResultRequest
+from das_sentinel.api.schemas import (
+    WorkerArtifactResult,
+    WorkerEventResult,
+    WorkerResultRequest,
+)
 from das_sentinel.persistence.models import (
+    Event,
     Job,
     ProcessingProfile,
     SourceFile,
     utc_now,
 )
 from das_sentinel.persistence.repositories import Repositories
+from das_sentinel.services.discovery import (
+    DiscoveryPathError,
+    _AnchoredSource,
+    _open_anchored_source,
+)
 from das_sentinel.services.jobs import (
     JobConflictError,
     JobNotFoundError,
@@ -22,6 +34,8 @@ from das_sentinel.services.jobs import (
     JobValidationError,
 )
 
+MAX_RESULT_ARTIFACT_BYTES = 64 * 1024 * 1024
+MAX_RESULT_ARTIFACT_FILES = 600
 ARTIFACT_KINDS = frozenset(
     {
         "waterfall_raw",
@@ -68,8 +82,33 @@ class ResultService:
             )
         self._validate_identity(job, source, profile, payload)
         events_by_uid = self._validate_manifest(payload)
-        artifact_paths, artifact_rows = self._validate_artifact_files(payload)
+        with ExitStack() as artifact_handles:
+            artifact_rows, held_artifacts = self._validate_artifact_files(
+                payload,
+                artifact_handles,
+            )
+            return self._persist_validated(
+                job,
+                source,
+                profile,
+                payload,
+                events_by_uid,
+                artifact_rows,
+                held_artifacts,
+            )
 
+    def _persist_validated(
+        self,
+        job: Job,
+        source: SourceFile,
+        profile: ProcessingProfile,
+        payload: WorkerResultRequest,
+        events_by_uid: dict[str, WorkerEventResult],
+        artifact_rows: list[tuple[WorkerArtifactResult, str]],
+        held_artifacts: list[
+            tuple[_AnchoredSource, str, tuple[Path, int, int]]
+        ],
+    ) -> JobSnapshot:
         now = utc_now()
         run = self.repositories.runs.add(
             job_id=job.id,
@@ -84,7 +123,7 @@ class ResultService:
         )
         run.started_at = now
         run.finished_at = now
-        persisted_events = {}
+        persisted_events: dict[str, Event] = {}
         for event in payload.events:
             occurred_at = payload.source_start_time_utc + timedelta(
                 seconds=event.start_sample / payload.sample_rate_hz
@@ -118,22 +157,24 @@ class ResultService:
         if set(persisted_events) != set(events_by_uid):
             raise JobValidationError("result event identities are inconsistent")
         for artifact, stored_path in artifact_rows:
-            event = persisted_events[artifact.event_uid]
+            persisted_event = persisted_events[artifact.event_uid]
             self.repositories.artifacts.add(
-                event_id=event.id,
+                event_id=persisted_event.id,
                 kind=artifact.kind,
                 path=stored_path,
                 media_type=artifact.media_type,
                 sha256=artifact.sha256,
             )
-        return self.jobs.complete(
+        completed = self.jobs.complete(
             job.id,
             payload.worker_id,
             payload.profile_version,
             payload.pipeline_version,
-            artifact_paths,
+            (),
             now=now,
         )
+        self._verify_held_artifacts(held_artifacts)
+        return completed
 
     @staticmethod
     def _validate_identity(
@@ -168,8 +209,12 @@ class ResultService:
     @staticmethod
     def _validate_manifest(
         payload: WorkerResultRequest,
-    ) -> dict[str, object]:
-        events_by_uid = {}
+    ) -> dict[str, WorkerEventResult]:
+        if len(payload.artifacts) > MAX_RESULT_ARTIFACT_FILES:
+            raise JobValidationError(
+                "result contains too many artifact files"
+            )
+        events_by_uid: dict[str, WorkerEventResult] = {}
         for event in payload.events:
             if event.event_uid in events_by_uid:
                 raise JobValidationError("result contains duplicate event UIDs")
@@ -200,9 +245,15 @@ class ResultService:
     def _validate_artifact_files(
         self,
         payload: WorkerResultRequest,
-    ) -> tuple[list[Path], list[tuple[object, str]]]:
-        paths: list[Path] = []
-        rows: list[tuple[object, str]] = []
+        handles: ExitStack,
+    ) -> tuple[
+        list[tuple[WorkerArtifactResult, str]],
+        list[tuple[_AnchoredSource, str, tuple[Path, int, int]]],
+    ]:
+        rows: list[tuple[WorkerArtifactResult, str]] = []
+        held: list[
+            tuple[_AnchoredSource, str, tuple[Path, int, int]]
+        ] = []
         for artifact in payload.artifacts:
             candidate = Path(artifact.path)
             if not candidate.is_absolute() or ".." in candidate.parts:
@@ -217,11 +268,73 @@ class ResultService:
                     "artifact path escapes configured artifact root"
                 ) from error
             try:
-                digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+                source = handles.enter_context(
+                    _open_anchored_source(
+                        self.artifact_root,
+                        candidate,
+                        required_suffix=None,
+                        hold_ancestors=os.name == "nt",
+                    )
+                )
+                snapshot = source.snapshot()
+            except (DiscoveryPathError, OSError) as error:
+                raise JobValidationError(
+                    "artifact path must use an existing no-follow regular file chain"
+                ) from error
+            if snapshot.size_bytes > MAX_RESULT_ARTIFACT_BYTES:
+                raise JobValidationError("artifact file exceeds the size limit")
+            try:
+                digest = _stream_sha256(source.stream)
             except OSError as error:
-                raise JobValidationError("artifact file is not readable") from error
+                raise JobValidationError(
+                    "artifact file is not readable"
+                ) from error
             if digest != artifact.sha256:
                 raise JobValidationError("artifact SHA-256 does not match file")
-            paths.append(candidate)
             rows.append((artifact, relative.as_posix()))
-        return paths, rows
+            held.append((source, digest, snapshot.signature))
+        return rows, held
+
+    @staticmethod
+    def _verify_held_artifacts(
+        held_artifacts: list[
+            tuple[_AnchoredSource, str, tuple[Path, int, int]]
+        ],
+    ) -> None:
+        for source, expected_digest, expected_signature in held_artifacts:
+            try:
+                if source.snapshot().signature != expected_signature:
+                    raise JobValidationError(
+                        "artifact file changed while persisting result"
+                    )
+                if _stream_sha256(source.stream) != expected_digest:
+                    raise JobValidationError(
+                        "artifact file changed while persisting result"
+                    )
+            except OSError as error:
+                raise JobValidationError(
+                    "artifact file changed while persisting result"
+                ) from error
+
+
+def _stream_sha256(
+    stream,
+    *,
+    maximum_bytes: int = MAX_RESULT_ARTIFACT_BYTES,
+) -> str:
+    stream.seek(0)
+    digest = hashlib.sha256()
+    remaining = maximum_bytes
+    try:
+        while True:
+            chunk = stream.read(min(1024 * 1024, remaining + 1))
+            if not chunk:
+                return digest.hexdigest()
+            if len(chunk) > remaining:
+                raise JobValidationError(
+                    "artifact file exceeds the size limit"
+                )
+            digest.update(chunk)
+            remaining -= len(chunk)
+    finally:
+        stream.seek(0)
