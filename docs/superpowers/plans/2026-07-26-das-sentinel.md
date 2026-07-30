@@ -1474,11 +1474,30 @@ Catch only recognized backend-unavailable/OOM exceptions for the one CPU retry; 
 exceptions become structured job failures. Event APIs filter by site/date/label/review
 status and serve only registered artifacts whose resolved paths stay below Artifact Store.
 
+The claim includes the configured site data root. Before reader resolution, bind the
+claimed source to its expected size/mtime/fingerprint through a trusted-anchor,
+component-by-component no-follow handle chain and keep that identity bound for every
+metadata/block read and the complete analyzer lifetime; no later path reopen may analyze
+a replacement file. Result persistence likewise opens each artifact safely before
+hashing, keeps those handles through the result transaction and job completion, and never
+uses a normal path read before the no-follow boundary.
+
+Event-list filtering and display use the same latest-classification definition:
+`(created_at DESC, id DESC)`. Fetch the page's site identity, latest machine result, and
+latest review with a constant bounded query count rather than per-event lazy loads.
+Artifact downloads walk from a trusted filesystem anchor and prevent each already-opened
+Windows ancestor from deletion/replacement while opening the next component; retain a
+deterministic replacement regression that proves the external target is never opened.
+
 - [ ] **Step 4: Run worker and event tests**
 
 Run: `python -m pytest tests/test_worker.py tests/test_events_api.py -q`
 
 Expected: PASS, including corrupt-file isolation and artifact traversal rejection.
+
+Also cover claim-to-analysis source replacement, result artifact replacement before
+hashing, constant query count across event page sizes, backdated machine classifications,
+and Windows ancestor replacement during artifact download.
 
 - [ ] **Step 5: Commit**
 
