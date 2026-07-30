@@ -3,9 +3,10 @@ from __future__ import annotations
 import os
 import subprocess
 from dataclasses import FrozenInstanceError
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import BinaryIO
 
+import das_sentinel.services.discovery as discovery_module
 import h5py
 import pytest
 from das_sentinel.config import ProcessingProfile as ProfileConfig
@@ -464,6 +465,43 @@ class _FailingProbe:
         raise ValueError("probe failed")
 
 
+class _MarkerProbe:
+    def __init__(self) -> None:
+        self.opened_markers: list[str] = []
+
+    def probe(self, source: BinaryIO) -> ProbeResult:
+        with h5py.File(source, "r") as handle:
+            self.opened_markers.append(str(handle.attrs["discovery_marker"]))
+        return ProbeResult(True, "test")
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (
+            PurePosixPath("/srv/das/site"),
+            ("/", "/srv", "/srv/das", "/srv/das/site"),
+        ),
+        (
+            PureWindowsPath("C:/das/site"),
+            ("C:\\", "C:\\das", "C:\\das\\site"),
+        ),
+        (
+            PureWindowsPath("//server/share/das/site"),
+            (
+                "\\\\server\\share\\",
+                "\\\\server\\share\\das",
+                "\\\\server\\share\\das\\site",
+            ),
+        ),
+    ],
+)
+def test_absolute_path_chain_starts_at_trusted_root(value, expected):
+    chain = discovery_module._absolute_path_chain(value)
+
+    assert tuple(str(component) for component in chain) == expected
+
+
 def test_probe_cannot_be_redirected_by_parent_replacement_after_enumeration(
     tmp_path: Path,
 ):
@@ -512,6 +550,84 @@ def test_probe_failure_releases_all_anchored_handles(tmp_path: Path):
     assert discover_batch(_site(root), root, tracker=tracker, now=10) == ()
 
     parent.rename(root / "released")
+
+
+def test_probe_cannot_follow_replaced_site_root_ancestor(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    ancestor = tmp_path / "configured"
+    moved = tmp_path / "configured-original"
+    site_root = ancestor / "site"
+    outside_ancestor = tmp_path / "outside"
+    outside_root = outside_ancestor / "site"
+    site_root.mkdir(parents=True)
+    outside_root.mkdir(parents=True)
+    internal = site_root / "a.h5"
+    external = outside_root / "a.h5"
+    write_zd_h5(internal)
+    write_zd_h5(external)
+    with h5py.File(internal, "r+") as handle:
+        handle.attrs["discovery_marker"] = "internal"
+    with h5py.File(external, "r+") as handle:
+        handle.attrs["discovery_marker"] = "external"
+    internal_stat = internal.stat()
+    os.utime(
+        external,
+        ns=(internal_stat.st_atime_ns, internal_stat.st_mtime_ns),
+    )
+    assert external.stat().st_size == internal_stat.st_size
+    assert external.stat().st_mtime_ns == internal_stat.st_mtime_ns
+
+    preflight = tmp_path / "ancestor-symlink-preflight"
+    try:
+        preflight.symlink_to(outside_ancestor, target_is_directory=True)
+        preflight.unlink()
+    except OSError as error:
+        pytest.skip(f"directory symlink unavailable: {error}")
+
+    reader = _MarkerProbe()
+    tracker = StableFileTracker(reader=reader)
+    site = _site(site_root)
+    assert discover_batch(site, site_root, tracker=tracker, now=0) == ()
+
+    original_open = discovery_module._open_source_component
+    replaced = False
+    opened_paths: list[Path] = []
+
+    def replace_before_first_safe_open(
+        path,
+        parent_handle,
+        *,
+        expect_directory,
+    ):
+        nonlocal replaced
+        opened_paths.append(Path(path))
+        if not replaced:
+            replaced = True
+            ancestor.rename(moved)
+            ancestor.symlink_to(outside_ancestor, target_is_directory=True)
+        return original_open(
+            path,
+            parent_handle,
+            expect_directory=expect_directory,
+        )
+
+    monkeypatch.setattr(
+        discovery_module,
+        "_open_source_component",
+        replace_before_first_safe_open,
+    )
+
+    try:
+        files = discover_batch(site, site_root, tracker=tracker, now=10)
+    except DiscoveryPathError:
+        files = ()
+
+    assert replaced is True
+    assert opened_paths[0] == Path(site_root.anchor)
+    assert files == ()
+    assert reader.opened_markers == []
 
 
 def test_enqueue_is_idempotent_across_repeated_scans_and_tracker_restart(

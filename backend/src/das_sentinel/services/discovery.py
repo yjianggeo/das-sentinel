@@ -9,7 +9,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import BinaryIO, Protocol
 
 from pydantic import ValidationError
@@ -414,13 +414,15 @@ def _open_anchored_source(
 
     with ExitStack() as stack:
         try:
-            root_handle = _open_source_component(
-                root,
-                None,
-                expect_directory=True,
-            )
-            stack.callback(root_handle.close)
-            parent_handle = root_handle
+            parent_handle: _SourceHandle | None = None
+            for root_component in _absolute_path_chain(root):
+                opened = _open_source_component(
+                    Path(root_component),
+                    parent_handle,
+                    expect_directory=True,
+                )
+                stack.callback(opened.close)
+                parent_handle = opened
             current = root
             final_handle: _SourceHandle | None = None
             for index, component in enumerate(relative.parts):
@@ -444,6 +446,17 @@ def _open_anchored_source(
                 "source path must use an existing no-follow regular file chain"
             ) from error
         yield source
+
+
+def _absolute_path_chain(path: PurePath) -> tuple[PurePath, ...]:
+    if not path.is_absolute() or not path.anchor or ".." in path.parts:
+        raise DiscoveryPathError("filesystem anchor path must be absolute and normalized")
+    current = type(path)(path.anchor)
+    components = [current]
+    for component in path.parts[1:]:
+        current /= component
+        components.append(current)
+    return tuple(components)
 
 
 @contextmanager
