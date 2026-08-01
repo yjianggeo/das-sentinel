@@ -155,6 +155,10 @@ class SiteResponse(StrictSchema):
     current_profile: ProfileResponse
 
 
+class ScanRequest(StrictSchema):
+    path: str | None = Field(default=None, max_length=1024)
+
+
 class JobEnqueueRequest(StrictSchema):
     source_file_id: str = Field(min_length=1, max_length=36)
     processing_profile_id: str = Field(min_length=1, max_length=36)

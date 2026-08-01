@@ -17,6 +17,7 @@ from das_sentinel.api.routes.events import router as events_router
 from das_sentinel.api.routes.internal import router as internal_router
 from das_sentinel.api.routes.jobs import router as jobs_router
 from das_sentinel.api.routes.models import router as models_router
+from das_sentinel.api.routes.scans import router as scans_router
 from das_sentinel.api.routes.sites import router as sites_router
 from das_sentinel.config import Settings
 from das_sentinel.persistence import (
@@ -79,7 +80,9 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(events_router, prefix="/api/v1")
     app.include_router(artifacts_router, prefix="/api/v1")
     app.include_router(models_router, prefix="/api/v1")
+    app.include_router(scans_router, prefix="/api/v1")
     app.include_router(internal_router, prefix="/api/v1")
+    app.state.discovery_trackers = {}
     return app
 
 
