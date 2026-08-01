@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.requests import Request
-from starlette.responses import Response
+from starlette.responses import FileResponse, Response
+from starlette.staticfiles import StaticFiles
 
 from das_sentinel.api.routes.artifacts import router as artifacts_router
 from das_sentinel.api.routes.auth import router as auth_router
@@ -83,7 +86,42 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(scans_router, prefix="/api/v1")
     app.include_router(internal_router, prefix="/api/v1")
     app.state.discovery_trackers = {}
+    _mount_spa(app)
     return app
+
+
+def _web_dist() -> Path:
+    override = os.environ.get("DAS_WEB_DIST")
+    if override:
+        return Path(override)
+    return Path(__file__).resolve().parents[4] / "frontend" / "dist"
+
+
+def _mount_spa(app: FastAPI) -> None:
+    dist = _web_dist().resolve()
+    index = dist / "index.html"
+    if not index.is_file():
+        return
+    assets = dist / "assets"
+    if assets.is_dir():
+        app.mount(
+            "/assets",
+            StaticFiles(directory=assets),
+            name="web-assets",
+        )
+
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def spa_fallback(full_path: str) -> Response:
+        if full_path.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Not found")
+        candidate = (dist / full_path).resolve()
+        if (
+            full_path
+            and candidate.is_file()
+            and candidate.is_relative_to(dist)
+        ):
+            return FileResponse(candidate)
+        return FileResponse(index)
 
 
 def _recover_stale_jobs(sessions, artifact_root) -> list[str]:

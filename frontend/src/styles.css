@@ -1,0 +1,197 @@
+:root {
+  color-scheme: dark;
+  font-family: "Segoe UI", "Microsoft YaHei", system-ui, sans-serif;
+  background: #0d1117;
+  color: #e6edf3;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: #0d1117;
+}
+
+.loading {
+  padding: 2rem;
+  color: #8b949e;
+}
+
+.shell-header {
+  display: flex;
+  align-items: center;
+  gap: 1.5rem;
+  padding: 0.75rem 1.5rem;
+  background: #161b22;
+  border-bottom: 1px solid #30363d;
+}
+
+.brand {
+  font-weight: 700;
+  color: #58a6ff;
+}
+
+.shell-header nav {
+  display: flex;
+  gap: 1rem;
+  flex: 1;
+}
+
+.shell-header nav a {
+  color: #8b949e;
+  text-decoration: none;
+  padding: 0.25rem 0.5rem;
+  border-radius: 6px;
+}
+
+.shell-header nav a.active {
+  color: #e6edf3;
+  background: #21262d;
+}
+
+main {
+  padding: 1.5rem;
+  max-width: 1200px;
+}
+
+.link-button {
+  background: none;
+  border: none;
+  color: #8b949e;
+  cursor: pointer;
+}
+
+.link-button:hover {
+  color: #e6edf3;
+}
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 1rem;
+  margin: 1rem 0;
+}
+
+.card {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 1rem;
+}
+
+.card .card-value {
+  font-size: 2rem;
+  font-weight: 700;
+}
+
+.card .card-title {
+  color: #8b949e;
+  font-size: 0.9rem;
+}
+
+form.stack {
+  display: grid;
+  gap: 0.75rem;
+  max-width: 420px;
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  padding: 1.25rem;
+}
+
+label {
+  display: grid;
+  gap: 0.3rem;
+  font-size: 0.9rem;
+  color: #8b949e;
+}
+
+input,
+select,
+textarea {
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  color: #e6edf3;
+  padding: 0.45rem 0.6rem;
+  font: inherit;
+}
+
+button.primary {
+  background: #238636;
+  border: 1px solid #2ea043;
+  border-radius: 6px;
+  color: #fff;
+  padding: 0.5rem 1rem;
+  cursor: pointer;
+}
+
+button.danger {
+  background: none;
+  border: 1px solid #f85149;
+  border-radius: 6px;
+  color: #f85149;
+  padding: 0.3rem 0.75rem;
+  cursor: pointer;
+}
+
+button.subtle {
+  background: #21262d;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  color: #e6edf3;
+  padding: 0.3rem 0.75rem;
+  cursor: pointer;
+}
+
+.error {
+  color: #f85149;
+}
+
+table.data {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 1rem;
+}
+
+table.data th,
+table.data td {
+  text-align: left;
+  padding: 0.5rem 0.75rem;
+  border-bottom: 1px solid #30363d;
+  font-size: 0.9rem;
+}
+
+table.data th {
+  color: #8b949e;
+  font-weight: 600;
+}
+
+.status-pill {
+  display: inline-block;
+  padding: 0.1rem 0.6rem;
+  border-radius: 999px;
+  font-size: 0.8rem;
+  border: 1px solid #30363d;
+}
+
+.status-queued { color: #8b949e; }
+.status-running { color: #58a6ff; border-color: #58a6ff; }
+.status-succeeded { color: #3fb950; border-color: #3fb950; }
+.status-failed { color: #f85149; border-color: #f85149; }
+.status-cancelled { color: #d29922; border-color: #d29922; }
+
+.progress-track {
+  background: #21262d;
+  border-radius: 999px;
+  height: 8px;
+  min-width: 120px;
+  overflow: hidden;
+}
+
+.progress-fill {
+  background: #58a6ff;
+  height: 100%;
+}
