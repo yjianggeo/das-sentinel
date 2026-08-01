@@ -459,6 +459,18 @@ class EventDetailResponse(EventSummaryResponse):
     run: EventRunResponse
 
 
+class ModelResponse(StrictSchema):
+    id: str
+    site_id: str
+    version: str
+    status: Literal["candidate", "active", "retired", "invalid"]
+    dataset_sha256: str | None
+    bundle_sha256: str
+    metrics: dict[str, Any]
+    created_at: datetime
+    published_at: datetime | None
+
+
 def _iana_timezone(value: str) -> str:
     try:
         ZoneInfo(value)
