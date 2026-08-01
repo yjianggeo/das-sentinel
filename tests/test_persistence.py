@@ -367,11 +367,53 @@ def test_sqlite_runtime_gate_requires_fixed_version_or_explicit_patch():
     ) == (3, 50, 4)
 
 
-def test_application_startup_check_does_not_silently_accept_old_sqlite(
-    migrated_engine,
-):
-    with pytest.raises(SQLiteRuntimeError):
-        check_database_startup(migrated_engine)
+class _StubResult:
+    def __init__(self, value):
+        self._value = value
+
+    def scalar_one(self):
+        return self._value
+
+
+class _StubConnection:
+    def __init__(self, sqlite_version):
+        self._sqlite_version = sqlite_version
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def exec_driver_sql(self, statement):
+        normalized = statement.strip().lower()
+        if "sqlite_version" in normalized:
+            return _StubResult(self._sqlite_version)
+        if "journal_mode" in normalized:
+            return _StubResult("wal")
+        if "foreign_keys" in normalized:
+            return _StubResult(1)
+        if "busy_timeout" in normalized:
+            return _StubResult(5000)
+        raise AssertionError(f"unexpected statement: {statement}")
+
+
+class _StubEngine:
+    def __init__(self, sqlite_version):
+        self._sqlite_version = sqlite_version
+
+    def connect(self):
+        return _StubConnection(self._sqlite_version)
+
+
+def test_application_startup_check_does_not_silently_accept_old_sqlite():
+    with pytest.raises(SQLiteRuntimeError, match="3.51.3"):
+        check_database_startup(_StubEngine("3.42.0"))
+
+
+def test_application_startup_check_accepts_current_runtime(migrated_engine):
+    report = check_database_startup(migrated_engine)
+    assert report.sqlite_version >= (3, 51, 3)
 
 
 def test_async_write_coordinator_exposes_one_shared_lock():

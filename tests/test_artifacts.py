@@ -18,12 +18,16 @@ from das_sentinel.domain import Candidate, EventRecord
 
 EVENT_ID = "123e4567-e89b-12d3-a456-426614174000"
 
+# Spawned children re-import this module (and matplotlib) before signalling
+# readiness; on slow storage such as a NAS that import alone can exceed 10 s.
+_SPAWN_READY_S = 60
+
 
 def _process_store_worker(root: str, content: bytes, ready, start, results) -> None:
     from das_sentinel.artifacts import ArtifactConflictError, ArtifactStore
 
     ready.set()
-    start.wait(10)
+    start.wait(_SPAWN_READY_S)
     try:
         artifact = ArtifactStore(Path(root)).write(EVENT_ID, "evidence", content, "application/json")
         results.put(("success", artifact.sha256))
@@ -39,7 +43,7 @@ def _lock_worker(path: str, attempting, acquired, release, crash: bool) -> None:
         acquired.set()
         if crash:
             os._exit(0)
-        release.wait(10)
+        release.wait(_SPAWN_READY_S)
 
 
 def _event() -> EventRecord:
@@ -268,10 +272,10 @@ def test_store_serializes_real_processes_for_conflicting_bytes(tmp_path):
     ]
     for process in processes:
         process.start()
-    assert all(signal.wait(10) for signal in ready)
+    assert all(signal.wait(_SPAWN_READY_S) for signal in ready)
     start.set()
     for process in processes:
-        process.join(20)
+        process.join(_SPAWN_READY_S)
         assert process.exitcode == 0
     outcomes = [results.get(timeout=5), results.get(timeout=5)]
     successes = [digest for status, digest in outcomes if status == "success"]
@@ -288,10 +292,10 @@ def test_process_lock_excludes_spawned_contender_until_release(tmp_path):
     second_attempt, second_acquired = context.Event(), context.Event()
     first = context.Process(target=_lock_worker, args=(lock, first_attempt, first_acquired, release, False))
     second = context.Process(target=_lock_worker, args=(lock, second_attempt, second_acquired, release, False))
-    first.start(); assert first_acquired.wait(10)
-    second.start(); assert second_attempt.wait(10)
+    first.start(); assert first_acquired.wait(_SPAWN_READY_S)
+    second.start(); assert second_attempt.wait(_SPAWN_READY_S)
     assert not second_acquired.wait(0.3)
-    release.set(); first.join(10); second.join(10)
+    release.set(); first.join(_SPAWN_READY_S); second.join(_SPAWN_READY_S)
     assert first.exitcode == second.exitcode == 0 and second_acquired.is_set()
 
 
@@ -300,12 +304,12 @@ def test_process_lock_recovers_after_crashed_owner_leaves_lock_file(tmp_path):
     lock = str(tmp_path / "artifact.lock")
     attempted, acquired, release = context.Event(), context.Event(), context.Event()
     crashed = context.Process(target=_lock_worker, args=(lock, attempted, acquired, release, True))
-    crashed.start(); assert acquired.wait(10); crashed.join(10)
+    crashed.start(); assert acquired.wait(_SPAWN_READY_S); crashed.join(_SPAWN_READY_S)
     assert crashed.exitcode == 0 and Path(lock).exists()
     next_attempt, next_acquired = context.Event(), context.Event()
     recovered = context.Process(target=_lock_worker, args=(lock, next_attempt, next_acquired, release, False))
-    recovered.start(); assert next_acquired.wait(10)
-    release.set(); recovered.join(10)
+    recovered.start(); assert next_acquired.wait(_SPAWN_READY_S)
+    release.set(); recovered.join(_SPAWN_READY_S)
     assert recovered.exitcode == 0
 
 
