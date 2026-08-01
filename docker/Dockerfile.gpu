@@ -1,0 +1,32 @@
+# syntax=docker/dockerfile:1
+
+# GPU worker image: NVIDIA CUDA runtime + cupy-cuda12x.
+# The API service always uses docker/Dockerfile.cpu; this image only runs
+# the analysis worker with DAS_WORKER_DEVICE=cuda.
+FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04 AS runtime
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3.12 python3.12-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && python3.12 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+WORKDIR /app
+COPY pyproject.toml ./
+COPY backend/ backend/
+COPY alembic.ini ./
+RUN pip install ".[gpu]"
+
+COPY docker/entrypoint-api.sh /entrypoint.sh
+RUN chmod +x /entrypoint.sh \
+    && useradd --system --uid 10001 --home /app-data appuser \
+    && mkdir -p /app-data \
+    && chown appuser /app-data
+
+USER appuser
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["worker"]
