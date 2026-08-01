@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from typing import Literal, cast
 
 from fastapi import APIRouter, HTTPException, Query, Request, status
@@ -9,6 +10,7 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import func, select
 
 from das_sentinel.api.auth import AuthenticatedAdmin, CsrfAdmin
+from das_sentinel.classifiers.similarity import SimilarityIndex
 from das_sentinel.api.schemas import (
     EventArtifactResponse,
     EventDetailResponse,
@@ -130,6 +132,75 @@ def list_events(
             )
             for event, row_site_id, label, latest_review in rows
         ]
+
+
+@router.get(
+    "/{event_id}/similar",
+    response_model=list[EventSummaryResponse],
+)
+def similar_events(
+    event_id: str,
+    request: Request,
+    admin: AuthenticatedAdmin,
+    limit: int = Query(default=5, ge=1, le=20),
+) -> list[EventSummaryResponse]:
+    del admin
+    with request.app.state.session_factory() as session:
+        event = session.get(Event, event_id)
+        if event is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Event not found",
+            )
+        run = session.get(ProcessingRun, event.processing_run_id)
+        source = None if run is None else session.get(SourceFile, run.source_file_id)
+        if source is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Event source not found",
+            )
+        statement = (
+            select(Event)
+            .join(ProcessingRun, ProcessingRun.id == Event.processing_run_id)
+            .join(SourceFile, SourceFile.id == ProcessingRun.source_file_id)
+            .where(SourceFile.site_id == source.site_id)
+            .order_by(Event.id)
+        )
+        peers = [
+            SimpleNamespace(
+                event_id=peer.id,
+                features={
+                    str(name): float(value)
+                    for name, value in json.loads(peer.features_json).items()
+                },
+            )
+            for peer in session.scalars(statement)
+        ]
+        try:
+            index = SimilarityIndex().fit(peers)
+            result = index.query(
+                {
+                    str(name): float(value)
+                    for name, value in json.loads(event.features_json).items()
+                },
+                limit=limit + 1,
+            )
+        except ValueError as error:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=str(error),
+            ) from error
+        neighbours = []
+        for neighbour in result.neighbors:
+            if neighbour.event_id == event_id:
+                continue
+            peer = session.get(Event, neighbour.event_id)
+            if peer is None:
+                continue
+            neighbours.append(_summary(session, peer, site_id=source.site_id))
+            if len(neighbours) >= limit:
+                break
+        return neighbours
 
 
 @router.get("/{event_id}", response_model=EventDetailResponse)

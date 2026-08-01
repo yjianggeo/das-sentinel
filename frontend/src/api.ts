@@ -123,6 +123,53 @@ export interface EventSummary {
   latest_review: Review | null;
 }
 
+export interface EventEvidence {
+  detector: string;
+  score: number;
+  payload: Record<string, unknown>;
+}
+
+export interface MachineClassification {
+  id: number;
+  label: string;
+  decision_score: number;
+  method: string;
+  reasons: string[];
+  model_version_id: string | null;
+  created_at: string;
+}
+
+export interface EventArtifact {
+  id: string;
+  kind: string;
+  media_type: string;
+}
+
+export interface EventRun {
+  id: string;
+  source_file_id: string;
+  source_fingerprint: string;
+  processing_profile_id: string;
+  requested_backend: string;
+  actual_backend: string;
+  backend_fallback_reason: string | null;
+  profile_version: number;
+  pipeline_version: string;
+  model_version_id: string | null;
+  timings_ms: Record<string, number>;
+  started_at: string | null;
+  finished_at: string | null;
+}
+
+export interface EventDetail extends EventSummary {
+  features: Record<string, number>;
+  evidence: EventEvidence[];
+  machine_history: MachineClassification[];
+  review_history: Review[];
+  artifacts: EventArtifact[];
+  run: EventRun;
+}
+
 export interface ModelInfo {
   id: string;
   site_id: string;
