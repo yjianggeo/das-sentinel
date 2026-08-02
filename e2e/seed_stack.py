@@ -27,16 +27,16 @@ import uvicorn
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "backend" / "src"))
 
-from argon2 import PasswordHasher  # noqa: E402
-from das_sentinel.api import create_app  # noqa: E402
-from das_sentinel.config import ProcessingProfile, Settings  # noqa: E402
-from das_sentinel.persistence import (  # noqa: E402
+from argon2 import PasswordHasher
+from das_sentinel.api import create_app
+from das_sentinel.config import ProcessingProfile, Settings
+from das_sentinel.persistence import (
     Repositories,
     create_local_engine,
     session_factory,
     upgrade_database,
 )
-from das_sentinel.worker.main import HttpxWorkerClient, Worker  # noqa: E402
+from das_sentinel.worker.main import HttpxWorkerClient, Worker
 
 PASSWORD = "test-admin-password"
 WORKER_TOKEN = "e2e-worker-token-" + "x" * 32

@@ -10,7 +10,6 @@ from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import func, select
 
 from das_sentinel.api.auth import AuthenticatedAdmin, CsrfAdmin
-from das_sentinel.classifiers.similarity import SimilarityIndex
 from das_sentinel.api.schemas import (
     EventArtifactResponse,
     EventDetailResponse,
@@ -21,6 +20,7 @@ from das_sentinel.api.schemas import (
     ReviewCreate,
     ReviewResponse,
 )
+from das_sentinel.classifiers.similarity import SimilarityIndex
 from das_sentinel.persistence.models import (
     MACHINE_LABELS,
     Classification,

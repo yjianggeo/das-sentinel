@@ -21,17 +21,18 @@ import threading
 import time
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Self
 
 import h5py
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "backend" / "src"))
 
-from das_sentinel.config import ProcessingProfile  # noqa: E402
-from das_sentinel.pipeline import analyze_file  # noqa: E402
-from das_sentinel.readers.base import ReaderRegistry  # noqa: E402
-from das_sentinel.readers.zd_hdf5 import ZdHdf5Reader  # noqa: E402
-from das_sentinel.signal.backend import select_backend  # noqa: E402
+from das_sentinel.config import ProcessingProfile
+from das_sentinel.pipeline import analyze_file
+from das_sentinel.readers.base import ReaderRegistry
+from das_sentinel.readers.zd_hdf5 import ZdHdf5Reader
+from das_sentinel.signal.backend import select_backend
 
 N_CHANNELS = 1000
 SAMPLE_RATE_HZ = 1000.0
@@ -126,7 +127,7 @@ class _RssSampler:
             self.peak_bytes = max(self.peak_bytes, self._current_peak_bytes())
             time.sleep(self._interval)
 
-    def __enter__(self) -> "_RssSampler":
+    def __enter__(self) -> Self:
         self._thread.start()
         return self
 

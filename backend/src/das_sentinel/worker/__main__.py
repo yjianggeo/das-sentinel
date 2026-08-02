@@ -11,7 +11,6 @@ from __future__ import annotations
 import os
 import socket
 import time
-
 from typing import Protocol
 
 from das_sentinel.config import Settings
@@ -46,7 +45,7 @@ def run_forever(
 
 
 def main() -> None:
-    settings = Settings()
+    settings = Settings()  # type: ignore[call-arg]  # secrets come from DAS_* env
     worker_id = os.environ.get("DAS_WORKER_ID") or socket.gethostname()
     client: WorkerProtocol = HttpxWorkerClient(settings.api_url, settings.worker_token)
     worker = Worker(settings=settings, client=client, worker_id=worker_id)
