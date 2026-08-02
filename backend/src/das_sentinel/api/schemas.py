@@ -273,7 +273,7 @@ class WorkerEventResult(StrictSchema):
     end_sample: StrictInt = Field(ge=1, le=2**63 - 1)
     channel_start: StrictInt = Field(ge=0, le=2**31 - 2)
     channel_stop: StrictInt = Field(ge=1, le=2**31 - 1)
-    features: dict[str, FiniteFloat] = Field(default_factory=dict, max_length=512)
+    features: dict[str, FiniteFloat | str] = Field(default_factory=dict, max_length=512)
     evidence: list[WorkerEvidenceResult] = Field(
         default_factory=list,
         max_length=64,
@@ -284,6 +284,15 @@ class WorkerEventResult(StrictSchema):
     @classmethod
     def validate_event_uid(cls, value: str) -> str:
         return _nonblank(value, field="event UID", maximum=128)
+
+    @field_validator("features")
+    @classmethod
+    def validate_features(cls, value: dict[str, float | str]) -> dict[str, float | str]:
+        for key, item in value.items():
+            _nonblank(key, field="feature name", maximum=128)
+            if isinstance(item, str):
+                _nonblank(item, field="feature value", maximum=256)
+        return value
 
     @model_validator(mode="after")
     def validate_ranges(self) -> WorkerEventResult:

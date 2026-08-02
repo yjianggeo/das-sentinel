@@ -6,8 +6,10 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
+from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.requests import Request
@@ -110,18 +112,28 @@ def _mount_spa(app: FastAPI) -> None:
             name="web-assets",
         )
 
-    @app.get("/{full_path:path}", include_in_schema=False)
-    async def spa_fallback(full_path: str) -> Response:
-        if full_path.startswith("api/"):
-            raise HTTPException(status_code=404, detail="Not found")
-        candidate = (dist / full_path).resolve()
-        if (
-            full_path
-            and candidate.is_file()
-            and candidate.is_relative_to(dist)
-        ):
-            return FileResponse(candidate)
-        return FileResponse(index)
+    async def spa_fallback(request: Request, exc: Exception) -> Response:
+        # Only GET misses fall back to the SPA; API misses stay JSON 404 and
+        # every other HTTP error keeps its original status and detail.
+        if isinstance(exc, StarletteHTTPException) and exc.status_code == 404:
+            full_path = request.url.path.lstrip("/")
+            if full_path.startswith("api/") or request.method != "GET":
+                return JSONResponse({"detail": "Not found"}, status_code=404)
+            candidate = (dist / full_path).resolve()
+            if full_path and candidate.is_file() and candidate.is_relative_to(dist):
+                return FileResponse(candidate)
+            return FileResponse(index)
+        if isinstance(exc, StarletteHTTPException):
+            return JSONResponse(
+                {"detail": exc.detail},
+                status_code=exc.status_code,
+                headers=getattr(exc, "headers", None),
+            )
+        raise exc
+
+    # A 404 handler (not a catch-all route) so dynamically added routes keep
+    # working and no route ordering traps exist.
+    app.add_exception_handler(StarletteHTTPException, spa_fallback)
 
 
 def _recover_stale_jobs(sessions, artifact_root) -> list[str]:

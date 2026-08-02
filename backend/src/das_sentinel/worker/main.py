@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 import httpx
+import numpy as np
 
 from das_sentinel.config import ProcessingProfile, Settings
 from das_sentinel.pipeline import (
@@ -180,6 +181,12 @@ class HttpxWorkerClient:
             f"/api/v1/internal/jobs/{job_id}/result",
             json=payload,
         )
+        if response.status_code >= 400:
+            raise httpx.HTTPStatusError(
+                f"result rejected with {response.status_code}: {response.text[:512]}",
+                request=response.request,
+                response=response,
+            )
         response.raise_for_status()
 
     def fail(
@@ -276,7 +283,7 @@ class Worker:
                         self.client.submit_result(claim.id, payload)
                     except Exception as error:
                         raise ResultSubmissionError(
-                            "result submission failed"
+                            f"result submission failed: {error}"
                         ) from error
                     return WorkerOutcome(
                         status="succeeded",
@@ -483,6 +490,19 @@ def _failure_code(error: BaseException) -> str:
     return "analysis_failed"
 
 
+def _json_safe(value: Any) -> Any:
+    """Convert numpy scalars/containers into JSON-serializable natives."""
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    return value
+
+
 def _result_payload(
     claim: WorkerClaim,
     source_start_time: datetime,
@@ -550,7 +570,7 @@ def _result_payload(
         "requested_backend": requested_backend,
         "actual_backend": actual_backend,
         "backend_fallback_reason": fallback_reason,
-        "timings_ms": analysis.timings_ms,
-        "events": events,
-        "artifacts": artifacts,
+        "timings_ms": _json_safe(analysis.timings_ms),
+        "events": _json_safe(events),
+        "artifacts": _json_safe(artifacts),
     }

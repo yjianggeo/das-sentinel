@@ -131,3 +131,32 @@ def test_rejects_out_of_range_block_bounds(tmp_path, sample_start, sample_stop, 
 
     with pytest.raises(ValueError, match="bounds"):
         ZdHdf5Reader().read_block(path, sample_start, sample_stop, channel_slice)
+
+
+def _drop_spacing_attr(path) -> None:
+    with h5py.File(path, "r+") as handle:
+        del handle["Acquisition/Raw[0]"].attrs["SpatialSamplingInterval"]
+
+
+def test_infers_channel_spacing_from_filename_when_attribute_missing(tmp_path):
+    path = tmp_path / "jjk__3400m_4m_2_1000Hz_500Hz_UTC8_20230919173.h5"
+    write_zd_h5(path, fs=500.0)
+    _drop_spacing_attr(path)
+
+    reader = ZdHdf5Reader()
+
+    assert reader.probe(path).supported
+    block = reader.read_block(path, 10, 12, slice(1, 4))
+    np.testing.assert_allclose(block.metadata.channel_distance_m, [12, 16, 20])
+    assert "channel spacing inferred from filename" in block.metadata.warnings
+
+
+def test_rejects_file_without_spacing_attribute_or_filename_hint(tmp_path):
+    path = tmp_path / "plain-acquisition.h5"
+    write_zd_h5(path)
+    _drop_spacing_attr(path)
+
+    result = ZdHdf5Reader().probe(path)
+
+    assert not result.supported
+    assert "SpatialSamplingInterval" in result.reason

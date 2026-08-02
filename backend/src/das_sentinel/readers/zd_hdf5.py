@@ -41,12 +41,20 @@ class ZdHdf5Reader:
                     return ProbeResult(False, self.FORMAT_NAME, "RawData dimensions do not match RawDataTime")
                 for attribute_name in (
                     self.ATTR_SAMPLE_RATE,
-                    self.ATTR_CHANNEL_SPACING,
                     self.ATTR_START_LOCUS,
                     self.ATTR_UNIT,
                 ):
                     if attribute_name not in raw.attrs:
                         return ProbeResult(False, self.FORMAT_NAME, f"missing {attribute_name}")
+                if (
+                    self.ATTR_CHANNEL_SPACING not in raw.attrs
+                    and self._spacing_from_filename(path) is None
+                ):
+                    return ProbeResult(
+                        False,
+                        self.FORMAT_NAME,
+                        f"missing {self.ATTR_CHANNEL_SPACING} and no filename spacing hint",
+                    )
         except (OSError, TypeError, ValueError) as error:
             return ProbeResult(False, self.FORMAT_NAME, str(error))
         return ProbeResult(True, self.FORMAT_NAME)
@@ -57,7 +65,7 @@ class ZdHdf5Reader:
             n_time, n_channel, _ = self._dimensions(data, times)
             del n_time
             start_time = self._time_at(times, 0)
-            spacing = float(self._required_attr(raw, self.ATTR_CHANNEL_SPACING))
+            spacing, inferred = self._spacing(raw, path)
             start_locus = int(self._required_attr(raw, self.ATTR_START_LOCUS))
             return self._metadata(
                 path,
@@ -65,6 +73,7 @@ class ZdHdf5Reader:
                 float(self._required_attr(raw, self.ATTR_SAMPLE_RATE)),
                 (start_locus + np.arange(n_channel)) * spacing,
                 self._required_attr(raw, self.ATTR_UNIT),
+                spacing_inferred=inferred,
             )
 
     def sample_count(self, path: Path | BinaryIO) -> int:
@@ -90,7 +99,7 @@ class ZdHdf5Reader:
             else:
                 values = data[sample_start:sample_stop, channel_start:channel_stop]
 
-            spacing = float(self._required_attr(raw, self.ATTR_CHANNEL_SPACING))
+            spacing, inferred = self._spacing(raw, path)
             start_locus = int(self._required_attr(raw, self.ATTR_START_LOCUS))
             metadata = self._metadata(
                 path,
@@ -99,6 +108,7 @@ class ZdHdf5Reader:
                 (start_locus + np.arange(channel_start, channel_stop)) * spacing,
                 self._required_attr(raw, self.ATTR_UNIT),
                 source_start_time=self._time_at(times, 0),
+                spacing_inferred=inferred,
             )
         return DasBlock(np.asarray(values, dtype=np.float32), metadata, sample_start)
 
@@ -141,17 +151,46 @@ class ZdHdf5Reader:
         channel_distance_m: np.ndarray,
         unit: str | bytes,
         source_start_time: datetime | None = None,
+        spacing_inferred: bool = False,
     ) -> DasMetadata:
         if isinstance(unit, bytes):
             unit = unit.decode()
+        warnings = self._filename_warnings(path, source_start_time or start_time)
+        if spacing_inferred:
+            warnings = (*warnings, "channel spacing inferred from filename")
         return DasMetadata(
             source_path=str(path),
             start_time_utc=start_time,
             sample_rate_hz=sample_rate_hz,
             channel_distance_m=np.asarray(channel_distance_m),
             unit=str(unit),
-            warnings=self._filename_warnings(path, source_start_time or start_time),
+            warnings=warnings,
         )
+
+    def _spacing(self, raw: h5py.Group, path: Path | BinaryIO) -> tuple[float, bool]:
+        """Channel spacing in metres, plus whether it was filename-inferred."""
+        if self.ATTR_CHANNEL_SPACING in raw.attrs:
+            return float(raw.attrs[self.ATTR_CHANNEL_SPACING]), False
+        hint = self._spacing_from_filename(path)
+        if hint is None:
+            raise ValueError(
+                f"missing required attribute {self.ATTR_CHANNEL_SPACING} "
+                "and no filename spacing hint"
+            )
+        return hint, True
+
+    @staticmethod
+    def _spacing_from_filename(path: Path | BinaryIO) -> float | None:
+        """Infer channel spacing from ZD names like ``site__3400m_4m_2_...``.
+
+        The interrogator naming convention embeds ``<gauge length>m_<spacing>m``;
+        when several ``Xm`` tokens exist the spacing is the last one.
+        """
+        name = path.name if isinstance(path, Path) else str(getattr(path, "name", ""))
+        matches = re.findall(r"_(\d+(?:\.\d+)?)m(?=_)", name)
+        if not matches:
+            return None
+        return float(matches[-1])
 
     @staticmethod
     def _validate_sample_bounds(start: int, stop: int, n_time: int) -> None:

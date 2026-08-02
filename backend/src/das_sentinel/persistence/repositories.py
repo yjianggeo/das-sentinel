@@ -284,7 +284,7 @@ class EventRepository(_Repository):
         channel_start: int,
         channel_stop: int,
         occurred_at: datetime,
-        features: dict[str, float] | None = None,
+        features: dict[str, float | str] | None = None,
     ) -> Event:
         return self._add(
             Event(

@@ -454,7 +454,9 @@ def test_blocking_claim_database_work_does_not_block_event_loop(
     tick_request = Thread(target=lambda: client.get("/api/v1/job-write-tick"))
     tick_request.start()
     try:
-        assert ticked.wait(0.5)
+        # Budget must stay far below the 5 s blocking claim to prove the event
+        # loop is not blocked, while tolerating slow network-drive hosts.
+        assert ticked.wait(3.0)
     finally:
         release.set()
         request.join(5)

@@ -683,3 +683,87 @@ def test_http_client_uses_only_worker_token_header_and_strict_claim_validation(
     assert seen[0].headers["x-worker-token"] == "top-secret"
     assert "cookie" not in seen[0].headers
     assert "top-secret" not in repr(client)
+
+
+def test_result_payload_is_json_serializable_with_numpy_scalars(tmp_path):
+    import json
+
+    from das_sentinel.worker.main import _result_payload
+
+    source = tmp_path / "source.h5"
+    source.write_bytes(b"payload-test")
+    claim = _claim(source)
+    candidate = Candidate(
+        detector="stalta",
+        start_sample=np.int64(10),
+        end_sample=np.int64(20),
+        peak_sample=np.int64(15),
+        channel_start=np.int64(1),
+        channel_stop=np.int64(4),
+        score=np.float64(0.9),
+        metrics={"peak_ratio": np.float32(3.5)},
+        quality_flags=("synthetic",),
+    )
+    event = EventRecord(
+        event_id="event-1",
+        start_sample=np.int64(10),
+        end_sample=np.int64(20),
+        peak_sample=np.int64(15),
+        channel_start=np.int64(1),
+        channel_stop=np.int64(4),
+        evidence=(candidate,),
+        features={"duration_s": np.float64(0.5)},
+        label=Label.EARTHQUAKE,
+        decision_score=0.9,
+        reasons=("test",),
+    )
+    analysis = FileAnalysis(
+        source_path=str(source),
+        source_fingerprint="fp",
+        actual_backend="cpu",
+        backend_fallback_reason=None,
+        metadata_warnings=(),
+        events=(event,),
+        audit_candidate_count=1,
+        timings_ms={"total": np.float64(12.5)},
+        artifacts=(),
+    )
+
+    payload = _result_payload(
+        claim,
+        datetime(2026, 7, 30, tzinfo=UTC),
+        1000.0,
+        analysis,
+        requested_backend="cpu",
+        actual_backend="cpu",
+        fallback_reason=None,
+    )
+
+    encoded = json.dumps(payload)
+    assert "event-1" in encoded
+
+
+def test_internal_result_schema_accepts_string_feature_values():
+    from das_sentinel.api.schemas import WorkerEventResult
+
+    result = WorkerEventResult(
+        event_uid="event-1",
+        start_sample=10,
+        end_sample=20,
+        channel_start=1,
+        channel_stop=4,
+        features={
+            "duration_s": 0.5,
+            "site_id": "8069e40a-839a-4f8d-9b1e-aeadb6151bd1",
+            "cable_type": "downhole",
+        },
+        classification={
+            "label": "earthquake",
+            "decision_score": 0.9,
+            "method": "rules",
+            "reasons": ["test"],
+        },
+    )
+
+    assert result.features["site_id"] == "8069e40a-839a-4f8d-9b1e-aeadb6151bd1"
+    assert result.features["duration_s"] == 0.5
