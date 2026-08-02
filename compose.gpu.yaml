@@ -1,0 +1,31 @@
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.gpu
+    command: ["worker"]
+    env_file: [.env]
+    environment:
+      DAS_API_URL: http://api:8000
+      DAS_WORKER_DEVICE: cuda
+    depends_on:
+      api:
+        condition: service_healthy
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - type: bind
+        source: ${DAS_DATA_ROOT}
+        target: /data
+        read_only: true
+      - type: volume
+        source: app-data
+        target: /app-data
+
+volumes:
+  app-data: {}

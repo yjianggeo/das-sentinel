@@ -355,7 +355,8 @@ git commit -m "feat(core): add settings and DAS domain contracts"
 
 **Interfaces:**
 - Consumes: `DasMetadata`, `DasBlock`.
-- Produces: `DasReader` protocol, `ReaderRegistry`, `ZdHdf5Reader.probe/read_metadata/read_block`.
+- Produces: `DasReader` protocol, `ReaderRegistry`,
+  `ZdHdf5Reader.probe/read_metadata/sample_count/read_block`.
 
 - [ ] **Step 1: Add a synthetic HDF5 fixture and failing reader tests**
 
@@ -418,6 +419,7 @@ class ProbeResult:
 class DasReader(Protocol):
     def probe(self, path: Path) -> ProbeResult: ...
     def read_metadata(self, path: Path) -> DasMetadata: ...
+    def sample_count(self, path: Path) -> int: ...
     def read_block(self, path: Path, sample_start: int, sample_stop: int,
                    channel_slice: slice = slice(None)) -> DasBlock: ...
 
@@ -575,9 +577,12 @@ Expected: FAIL importing detector modules.
 - [ ] **Step 3: Implement detector-specific evidence**
 
 STA/LTA uses squared signal, cumulative-window means, a safe epsilon, channel coincidence,
-edge suppression equal to the longer filter/STA margin, and run grouping. Energy detection
-computes window RMS ratio, excess kurtosis, peak/median, normalized Welch band powers, and
-spectral entropy. Each detector returns global sample indexes by adding
+and run grouping. Its trailing windows use only past samples: the leading LTA eligibility
+already supplies edge protection, so do not discard a second full LTA window at the right
+edge. A default 20-second block with a 10-second LTA must retain enough eligible samples
+for the configured minimum event duration. Energy detection computes window RMS ratio,
+excess kurtosis, peak/median, normalized Welch band powers, and spectral entropy. Each
+detector returns global sample indexes by adding
 `PreprocessedBlock.sample_offset`. For an accepted raw ratio `r` and detector threshold
 `t`, normalize the candidate score as `0.60 + 0.40 * clip((r - t) / t, 0, 1)`;
 retain the unmodified raw ratio in candidate metrics.
@@ -712,7 +717,13 @@ git commit -m "feat(detect): add traffic trajectories and templates"
 - Create: `tests/test_fusion.py`
 
 **Interfaces:**
-- Produces: `fuse_candidates(candidates, profile, site_id, pipeline_version) -> list[EventRecord]`.
+- Produces:
+  `fuse_candidates(candidates, profile, sample_rate_hz, site_id, pipeline_version, source_fingerprint=None) -> list[EventRecord]`.
+- `sample_rate_hz` is explicit so `merge_gap_seconds` is converted to samples without
+  hiding structural timing data inside detector metrics.
+- `source_fingerprint` is optional for backward-compatible detector-unit use. File
+  pipelines must provide it so two source files with the same sample/channel coordinates
+  cannot generate the same event UUID.
 
 - [ ] **Step 1: Write failing balanced-gate tests**
 
@@ -720,17 +731,19 @@ git commit -m "feat(detect): add traffic trajectories and templates"
 def test_two_overlapping_normal_candidates_form_event(profile):
     events = fuse_candidates(
         [candidate("stalta", 100, 180, 0.65), candidate("energy", 120, 190, 0.64)],
-        profile, "site-a", "v1",
+        profile, 100.0, "site-a", "v1",
     )
     assert len(events) == 1
     assert {e.detector for e in events[0].evidence} == {"stalta", "energy"}
 
 def test_single_weak_candidate_stays_out_of_review_queue(profile):
-    assert fuse_candidates([candidate("energy", 100, 180, 0.45)], profile, "site-a", "v1") == []
+    assert fuse_candidates(
+        [candidate("energy", 100, 180, 0.45)], profile, 100.0, "site-a", "v1"
+    ) == []
 
 def test_event_id_is_deterministic(profile):
-    first = fuse_candidates([candidate("stalta", 100, 180, 0.95)], profile, "s", "v1")[0]
-    second = fuse_candidates([candidate("stalta", 100, 180, 0.95)], profile, "s", "v1")[0]
+    first = fuse_candidates([candidate("stalta", 100, 180, 0.95)], profile, 100.0, "s", "v1")[0]
+    second = fuse_candidates([candidate("stalta", 100, 180, 0.95)], profile, 100.0, "s", "v1")[0]
     assert first.event_id == second.event_id
 ```
 
@@ -744,8 +757,9 @@ Expected: FAIL importing `fuse_candidates`.
 
 Use temporal overlap plus channel-range overlap, allow the profile merge gap, merge across
 block boundaries, and require either two ordinary detectors or one strong, quality-valid
-detector. Generate UUID5 from site ID, pipeline version, merged peak sample, and merged
-channel interval. Preserve every evidence object sorted by detector and peak.
+detector. Generate UUID5 from site ID, pipeline version, optional source fingerprint,
+merged peak sample, and merged channel interval. Preserve every evidence object sorted by
+detector and peak.
 
 - [ ] **Step 4: Run fusion tests**
 
@@ -838,6 +852,9 @@ git commit -m "feat(classify): add explainable features rules and abstention"
 
 **Interfaces:**
 - Produces: `SimilarityIndex.fit/query`, `TrainingReport`, `train_model`, `save_model_bundle`, `load_model_bundle`.
+- `save_model_bundle` returns the SHA-256 of the complete saved bundle.
+- `load_model_bundle` requires an `expected_sha256` obtained from trusted persistence and
+  verifies it before parsing the outer ZIP, JSON metadata, or skops model payload.
 
 - [ ] **Step 1: Add failing semantic and release-gate tests**
 
@@ -896,13 +913,21 @@ git commit -m "feat(ml): add similarity and supervised model gates"
 - Create: `tests/test_artifacts.py`
 
 **Interfaces:**
-- Produces: `ArtifactManifest`, `render_event_artifacts(block, event, features, out_dir)`.
+- Produces: `EventArtifactData`, `ArtifactManifest`,
+  `render_event_artifacts(data, event, features, out_dir)`.
+- `EventArtifactData` explicitly carries distinct `raw_data` and `filtered_data` arrays,
+  `sample_offset`, `sample_rate_hz`, `channel_distance_m`, `bad_channel_mask`,
+  `start_time_utc`, IANA `site_timezone`, `profile`, explicit `profile_version`,
+  `pipeline_version`, explicit `model_version`, `backend_name`, `rule_output`, and
+  optional `model_output`. Use `rules-only` as `model_version` when no learned model
+  participates. The two arrays must have the same `[time, channel]` shape; rendering must
+  never relabel filtered data as raw.
 
 - [ ] **Step 1: Add failing artifact tests**
 
 ```python
-def test_renders_complete_event_artifact_set(tmp_path, event_block, event, features):
-    manifest = render_event_artifacts(event_block, event, features, tmp_path)
+def test_renders_complete_event_artifact_set(tmp_path, event_artifact_data, event, features):
+    manifest = render_event_artifacts(event_artifact_data, event, features, tmp_path)
     assert set(manifest.files) == {
         "waterfall_raw", "waterfall_filtered", "waveform", "psd", "stft", "evidence"
     }
@@ -937,9 +962,10 @@ class ArtifactManifest:
 
 Use Matplotlib `Agg`, robust 1st/99th percentile limits, explicit UTC/local axes, physical
 distance axes, `scipy.signal.welch`, and `scipy.signal.stft`. Write to a temporary sibling
-file and atomically replace the final file. Derive directories from validated event UUIDs,
-not user strings. Evidence JSON includes profile, pipeline, backend, source range,
-detections, features, rule/model outputs, and quality flags.
+file and atomically replace the final file while serializing writers across processes.
+Derive directories from validated event UUIDs, not user strings. Every plot displays the
+profile, pipeline, and model versions. Evidence JSON includes those versions, profile,
+backend, source range, detections, features, rule/model outputs, and quality flags.
 
 - [ ] **Step 4: Run artifact tests**
 
@@ -964,7 +990,19 @@ git commit -m "feat(artifacts): render waterfall and spectral products"
 - Create: `tests/test_performance.py`
 
 **Interfaces:**
-- Produces: `FileAnalysis`, `analyze_file(path, reader, profile, backend, artifact_root)`.
+- Produces: `AnalysisContext`, `FileAnalysis`,
+  `analyze_file(path, reader, profile, backend, artifact_root, context=None)`.
+- `AnalysisContext` explicitly carries the stable run identity and site metadata required
+  by fusion, features, and artifacts: `site_id`, IANA `site_timezone`,
+  `profile_version`, `pipeline_version`, `cable_type`, `device_config`, and
+  `rule_profile`. Defaults are stable (`unknown-site`, `UTC`, `profile-v1`,
+  `pipeline-v1`, unknown cable/device, and an empty rule profile), so the original
+  five-argument call remains valid. Task 11 is rules-only and records model version
+  `rules-only`; later worker/model tasks may extend model inputs explicitly.
+- Canonicalize and recursively freeze `rule_profile` at context construction, including
+  nested lists and objects. Artifact evidence records the rule profile itself,
+  `profile_version`, and its canonical SHA-256 so the rules-only decision can be
+  reproduced.
 
 - [ ] **Step 1: Add failing cross-block and idempotent-result tests**
 
@@ -1003,12 +1041,38 @@ class FileAnalysis:
     artifacts: tuple[ArtifactManifest, ...]
 ```
 
-Read 20-second blocks with 5-second overlap, preprocess once per detector frequency bank,
-run the enabled detectors, translate to file-global indexes, fuse after all blocks, extract
-features from event windows, classify, and render only fused review events. Return audit
+Use `reader.sample_count(path)` to include the final partial block without bypassing the
+reader abstraction. Use 20-second logical blocks at a 15-second step. Prepend the required
+LTA history only for STA/LTA detection; coherence, trajectory, and other detectors search
+the logical block so a stronger history-only peak cannot suppress a canonical candidate.
+Keep only candidates whose peak belongs to that block's canonical
+`[logical_start, next_logical_start)` interval, with the last block owning through EOF;
+this prevents both boundary blind zones and overlap duplicates.
+Process one distinct detector frequency bank at a time, reuse it for detectors sharing
+that band, then release it before the next band to bound memory. Run the enabled detectors,
+translate to file-global indexes, apply deterministic same-detector safety deduplication
+before audit/fusion (prefer unflagged, then higher-score evidence), fuse after all blocks,
+extract features from event windows, classify, and render only fused review events. CUDA
+arrays entering CPU-only trajectory, feature, or artifact paths use an explicit backend
+transfer. For each rendered event, assemble one `EventArtifactData` from the
+true raw samples and the matching filtered samples, preserving their shared sample/channel
+coordinates plus UTC and site timezone metadata from `AnalysisContext`. Return audit
 candidates separately from review events. `FileAnalysis` contains source fingerprint,
 metadata warnings, events, audit candidate count, timings, actual backend, and artifact
 manifests.
+
+The source fingerprint is SHA-256 over a canonical JSON tuple of the resolved source path,
+file size, and nanosecond modification time. Pass it into fusion and verify it after block
+reads and before/following artifact rendering; fail the run if it changes. Do not hash the
+complete DAS payload a second time. Validate the metadata sample rate as finite and
+positive, and reject detector/energy bands outside its Nyquist range before processing.
+Render every run into a private staging directory. Under the same promotion lock, perform
+the final source revalidation and then atomically promote complete event directories.
+Transfer/clear rollback ownership before releasing that lock after a successful commit;
+no later failure may delete an already published directory without reacquiring the same
+lock and proving ownership. On failure before commit, remove staging and only final
+directories still exclusively owned by that failed run; never leave unregistered partial
+artifacts.
 
 - [ ] **Step 4: Run pipeline and opt-in performance tests**
 
@@ -1018,8 +1082,12 @@ Expected: PASS.
 
 Run: `python -m pytest tests/test_performance.py -m performance -q`
 
-Expected: PASS on the configured baseline host; record wall time rather than asserting a
-universal GPU speedup.
+Expected: PASS on the configured baseline host for the approved logical baseline
+`60 s x 1 kHz x 1000 channels`, including at least one bounded event artifact, with peak
+RSS below 4 GiB. Use distinct approved frequency banks and execute real
+energy/coherence/trajectory detector workspaces; a fixed detector may supply the single
+bounded artifact event. Assert the approved CPU baseline wall-time ceiling of less than
+60 seconds, while not asserting a universal GPU speedup.
 
 - [ ] **Step 5: Commit**
 
@@ -1075,7 +1143,18 @@ Use SQLAlchemy 2 typed mappings, foreign keys, unique run keys, immutable profil
 append-only reviews/classifications, UTC strings or timezone-aware conversion, and
 transaction-scoped repository methods. On startup check SQLite version, set
 `journal_mode=WAL`, `foreign_keys=ON`, `busy_timeout=5000`, and reject remote-looking
-database URLs/paths. Protect all writes with one async application lock in the API layer.
+database URLs/paths. Model-version rows store the complete model-bundle SHA-256 separately
+from the artifact path. Enforce append-only classifications/reviews and immutable profile
+identity/payload in SQLite itself, not only through repository method omissions: database
+triggers reject updates/deletes of classification/review rows and reject changes to a
+profile's site, version, or payload while still allowing `is_current` to change. Removing a
+parent must not silently cascade-delete append-only audit rows. Switching a site's current
+profile clears and flushes the previous flag before setting the new flag, within the same
+caller transaction, so SQLite's partial unique index cannot observe two current rows.
+Canonical JSON rejects non-finite numbers. A programmatic migration URL takes precedence
+over an ambient environment variable; the environment variable is only a CLI fallback when
+the Alembic configuration URL is empty. Protect all writes with one async application lock
+in the API layer.
 
 - [ ] **Step 4: Run migrations twice and repository tests**
 
@@ -1133,9 +1212,36 @@ Expected: FAIL importing `create_app`.
 - [ ] **Step 3: Implement single-admin sessions and site profile versions**
 
 Hash with `argon2.PasswordHasher`; never return password hashes. Store admin ID and random
-CSRF token in signed sessions. Require `X-CSRF-Token` for POST/PATCH/DELETE. Resolve site
-paths and ensure they remain under `Settings.data_root`. Site edits create a new immutable
-`ProcessingProfile` row and atomically mark it current.
+CSRF token in signed sessions. Clear any prior session on login, return the token in the
+`X-CSRF-Token` response header, and let authenticated `GET /api/v1/session` recover the
+same token. Session cookies are `HttpOnly`, `SameSite=Strict`, use the configured secure
+flag, and never contain credentials or hashes. Except for the login endpoint, require an
+authenticated, enabled admin and constant-time `X-CSRF-Token` validation for every
+POST/PATCH/DELETE, including logout. Serialize write transactions through the one
+application-scoped `AsyncWriteCoordinator`. Clear POST `/api/v1/session` state in
+middleware inside `SessionMiddleware`, before FastAPI body parsing, so malformed JSON and
+every 422 login attempt also invalidate any old session. Add `Cache-Control: no-store` to
+every session-bearing API response.
+
+Bound login password length. Execute Argon2 behind one application-scoped concurrency
+limiter and move Argon2 plus its synchronous database lookup to a worker thread. Make
+synchronous read routes normal `def` handlers so FastAPI offloads them. For write routes,
+acquire the async application write lock and then run the entire synchronous path
+resolution/database transaction in a worker thread; neither SQLite's busy timeout nor slow
+NAS metadata I/O may block the single Uvicorn event loop.
+
+At application startup, validate the already-migrated local database with
+`check_database_startup`; the web process does not silently run migrations or bypass the
+SQLite safety gate. Resolve the configured data root and submitted site path with existing
+filesystem entries, reject non-directories and symlink escapes, and ensure the result
+remains under `Settings.data_root` without writing to it. Site edits create a new immutable
+`ProcessingProfile` row and atomically mark it current. The shared `ProcessingProfile`
+validator rejects non-finite values, non-positive counts/windows/frequency thresholds,
+invalid probability-like scores, negative merge/artifact padding, non-positive slowness,
+unordered trajectory velocities, and unordered normal/strong fusion thresholds, so both
+site creation and merged PATCH payloads persist only runnable configurations. Require at
+least two ordered, non-overlapping energy bands because normalized band entropy divides
+by `log(number_of_bands)`.
 
 - [ ] **Step 4: Run API tests**
 
@@ -1162,7 +1268,9 @@ git commit -m "feat(api): add admin session and site management"
 - Create: `tests/test_worker_protocol.py`
 
 **Interfaces:**
-- Produces: `JobService.enqueue/claim/heartbeat/complete/fail/recover_stale`, public job routes, internal worker routes.
+- Produces: `JobService.enqueue/claim/heartbeat/complete/fail/retry/cancel/recover_stale`;
+  authenticated public enqueue/list/detail/retry/cancel routes; and worker-token internal
+  claim/heartbeat/complete/fail routes.
 
 - [ ] **Step 1: Add failing atomic-claim and stale-recovery tests**
 
@@ -1195,11 +1303,47 @@ progress numerator/denominator, error code/message, and retry eligibility. Claim
 transitions execute under the API write lock. Internal submission validates worker token,
 job ownership, pipeline/profile versions, and artifact paths below the configured root.
 
+Repository/service methods flush but never commit; the caller owns a short transaction.
+Enqueue validates that source and immutable profile belong to the same enabled site and is
+idempotent for an existing source/profile/pipeline job. Claim selects the oldest eligible
+queued job, increments its attempt count, assigns exactly one non-empty worker ID, records
+a UTC heartbeat, and returns the immutable source path/fingerprint/size/mtime, site
+timezone/cable type, profile version/payload, and pipeline version needed by Task 16.
+The one application writer lock serializes claim/cancel/retry/heartbeat/final transitions.
+Synchronous SQLite and filesystem checks run in a worker thread rather than the Uvicorn
+event loop.
+
+Heartbeats require the owning worker and validate strict integer values satisfying
+`0 <= numerator <= denominator <= 2**63 - 1`, so an otherwise valid JSON integer cannot
+overflow SQLite and become a 500 response.
+Completion/failure require `running` plus the owning worker. Completion also requires exact
+profile and pipeline versions and resolves every existing regular artifact path below
+`Settings.app_data_dir / "artifacts"` without following an escape. Reject an artifact root
+that is itself a symlink, junction, or other reparse point. Validate the root, every parent,
+and the final ordinary file through held no-follow handles (or an equivalently atomic safe
+handoff) so concurrent path replacement cannot redirect validation outside the trusted
+root; a failed validation leaves the job running. Failure stores bounded structured error
+fields. Retry only changes an eligible failed job back to queued while below a fixed
+three-attempt limit; cancellation is allowed only before a terminal state. Stale running
+jobs older than two minutes return to queued while attempts remain, otherwise become
+non-retryable failed jobs. API startup invokes stale recovery after the database safety
+check.
+
+Authenticate internal routes only with a non-empty `X-Worker-Token` compared in constant
+time to `Settings.worker_token`; never accept browser session/CSRF as a substitute and
+never expose the token. Public job writes use the existing enabled-admin session and CSRF
+requirements. Return 404 for missing jobs, 409 for invalid state/owner/version transitions,
+422 for malformed progress or unsafe artifact paths, and 401 for a wrong worker token.
+
 - [ ] **Step 4: Run job tests**
 
 Run: `python -m pytest tests/test_jobs.py tests/test_worker_protocol.py -q`
 
 Expected: PASS, including retry limit and cancellation tests.
+
+Also cover the complete frozen source metadata, signed-64-bit progress bounds, rejection
+of a reparse-point artifact root, and a deterministic parent-replacement race proving that
+unsafe completion is rejected without changing the running job.
 
 - [ ] **Step 5: Commit**
 
@@ -1252,11 +1396,26 @@ observations spanning 10 seconds and a successful lightweight `probe`. Persist d
 files through the API repository and enqueue only missing `(fingerprint, profile_version,
 pipeline_version)` run keys.
 
+Load the current persisted profile through the complete `config.ProcessingProfile`
+validator before scanning; a malformed non-discovery field must fail discovery rather
+than enqueue work that can only fail later. Bind the final metadata snapshot and HDF5
+probe to a regular file opened through a held no-follow chain that starts at a trusted
+filesystem anchor and includes every ancestor of the configured site root as well as
+every source component (or an equivalent handle-relative reader input). On POSIX, walk
+from `/` with relative `openat`; on Windows, hold the volume/share root and each
+non-reparse component without delete sharing. A root ancestor or source parent replaced
+after validation/enumeration must not cause the reader to open any file outside the
+configured site root; validation only after a path-based probe is insufficient.
+
 - [ ] **Step 4: Run discovery tests**
 
 Run: `python -m pytest tests/test_discovery.py -q`
 
 Expected: PASS, including partial HDF5 and symlink-escape rejection.
+
+Also include malformed non-discovery profile values, a deterministic
+enumeration-to-probe parent-replacement race, and a root-validation-to-open ancestor
+replacement race proving that no root-external HDF5 file is opened.
 
 - [ ] **Step 5: Commit**
 
@@ -1315,11 +1474,30 @@ Catch only recognized backend-unavailable/OOM exceptions for the one CPU retry; 
 exceptions become structured job failures. Event APIs filter by site/date/label/review
 status and serve only registered artifacts whose resolved paths stay below Artifact Store.
 
+The claim includes the configured site data root. Before reader resolution, bind the
+claimed source to its expected size/mtime/fingerprint through a trusted-anchor,
+component-by-component no-follow handle chain and keep that identity bound for every
+metadata/block read and the complete analyzer lifetime; no later path reopen may analyze
+a replacement file. Result persistence likewise opens each artifact safely before
+hashing, keeps those handles through the result transaction and job completion, and never
+uses a normal path read before the no-follow boundary.
+
+Event-list filtering and display use the same latest-classification definition:
+`(created_at DESC, id DESC)`. Fetch the page's site identity, latest machine result, and
+latest review with a constant bounded query count rather than per-event lazy loads.
+Artifact downloads walk from a trusted filesystem anchor and prevent each already-opened
+Windows ancestor from deletion/replacement while opening the next component; retain a
+deterministic replacement regression that proves the external target is never opened.
+
 - [ ] **Step 4: Run worker and event tests**
 
 Run: `python -m pytest tests/test_worker.py tests/test_events_api.py -q`
 
 Expected: PASS, including corrupt-file isolation and artifact traversal rejection.
+
+Also cover claim-to-analysis source replacement, result artifact replacement before
+hashing, constant query count across event page sizes, backdated machine classifications,
+and Windows ancestor replacement during artifact download.
 
 - [ ] **Step 5: Commit**
 
@@ -1369,7 +1547,9 @@ Expected: FAIL importing `TrainingService`.
 - [ ] **Step 3: Implement snapshots, reports, atomic activation, and rollback**
 
 Snapshot reviewed event IDs, labels, ordered feature JSON, profile version, and SHA-256.
-Training creates a model artifact and report without activation. Publishing verifies the
+Training creates a model artifact, stores the SHA-256 returned by `save_model_bundle` in
+the model-version database row, and creates the report without activation. Every model load
+passes that trusted database digest to `load_model_bundle`. Publishing verifies the
 four-class counts and metrics and refuses a candidate whose macro-F1 is below the active
 model, deactivates the prior model and activates the candidate in one transaction. Rollback
 activates the immediately preceding valid site model. Never delete model files during
@@ -1638,7 +1818,7 @@ git commit -m "feat(web): add three-column review and model lifecycle"
 **Interfaces:**
 - Produces independent CPU and GPU deployment commands with the same API/app-data layout.
 
-- [ ] **Step 1: Add failing static deployment assertions**
+- [ ] **Step 1: Add failing deployment configuration assertions**
 
 ```python
 def test_raw_data_mounts_are_read_only(compose_cpu):
@@ -1650,10 +1830,6 @@ def test_raw_data_mounts_are_read_only(compose_cpu):
 def test_gpu_worker_reserves_nvidia_device(compose_gpu):
     devices = compose_gpu["services"]["worker"]["deploy"]["resources"]["reservations"]["devices"]
     assert devices == [{"driver": "nvidia", "count": 1, "capabilities": ["gpu"]}]
-
-def test_cpu_image_does_not_install_cupy():
-    text = Path("docker/Dockerfile.cpu").read_text("utf-8")
-    assert "cupy" not in text.lower()
 ```
 
 - [ ] **Step 2: Verify failure**
@@ -1765,6 +1941,16 @@ Run: `docker compose -f compose.yaml -f compose.cpu.yaml build`
 
 Expected: both CPU services build. On a CUDA host also run
 `docker compose -f compose.yaml -f compose.gpu.yaml config`.
+
+Run:
+
+```bash
+docker compose -f compose.yaml -f compose.cpu.yaml run --rm --no-deps worker \
+  python -c "import importlib.util; assert importlib.util.find_spec('cupy') is None"
+```
+
+Expected: PASS, proving from the built CPU container's runtime environment that CuPy
+is not installed.
 
 - [ ] **Step 5: Commit**
 

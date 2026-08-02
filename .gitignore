@@ -12,3 +12,7 @@ build/
 .coverage
 htmlcov/
 app-data/
+benchmark-data/
+e2e/test-results/
+e2e/stack-data/
+e2e-seed.log

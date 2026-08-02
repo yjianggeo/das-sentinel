@@ -1,0 +1,23 @@
+services:
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.cpu
+    command: ["worker"]
+    env_file: [.env]
+    environment:
+      DAS_API_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    volumes:
+      - type: bind
+        source: ${DAS_DATA_ROOT}
+        target: /data
+        read_only: true
+      - type: volume
+        source: app-data
+        target: /app-data
+
+volumes:
+  app-data: {}
