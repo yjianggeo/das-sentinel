@@ -3,7 +3,7 @@
 # GPU worker image: NVIDIA CUDA runtime + cupy-cuda12x.
 # The API service always uses docker/Dockerfile.cpu; this image only runs
 # the analysis worker with DAS_WORKER_DEVICE=cuda.
-FROM nvidia/cuda:12.8.1-runtime-ubuntu24.04 AS runtime
+FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1

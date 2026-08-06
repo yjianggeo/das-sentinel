@@ -8,12 +8,13 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import httpx
 import numpy as np
 import pytest
 from das_sentinel.artifacts import ArtifactFile, ArtifactManifest
 from das_sentinel.config import ProcessingProfile, Settings
 from das_sentinel.domain import Candidate, DasMetadata, EventRecord, Label
-from das_sentinel.pipeline import FileAnalysis
+from das_sentinel.pipeline import FileAnalysis, SourceChangedError
 from das_sentinel.readers.base import ProbeResult, ReaderRegistry
 from das_sentinel.services.discovery import fingerprint
 from das_sentinel.signal.backend import ArrayBackend, BackendUnavailable
@@ -22,6 +23,9 @@ from das_sentinel.worker.main import (
     HttpxWorkerClient,
     Worker,
     WorkerClaim,
+    WorkerFatalProtocolError,
+    WorkerTransientError,
+    _failure_retry_eligible,
 )
 
 
@@ -225,6 +229,104 @@ def test_worker_returns_idle_when_no_job(tmp_path: Path):
     assert outcome.status == "idle"
     assert protocol.heartbeats == []
     assert protocol.results == []
+    assert protocol.failures == []
+
+
+@pytest.mark.parametrize("status", [500, 502, 503])
+def test_http_client_maps_server_errors_to_transient(status: int) -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(status, request=request)
+    )
+    client = HttpxWorkerClient("http://api", "w" * 40, transport=transport)
+    with pytest.raises(WorkerTransientError):
+        client.claim("worker-1")
+
+
+@pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.ReadTimeout])
+def test_http_client_maps_transport_failures_to_transient(error_type) -> None:
+    def fail(request):
+        raise error_type("offline", request=request)
+
+    client = HttpxWorkerClient(
+        "http://api",
+        "w" * 40,
+        transport=httpx.MockTransport(fail),
+    )
+    with pytest.raises(WorkerTransientError):
+        client.claim("worker-1")
+
+
+def test_http_client_maps_unauthorized_to_fatal() -> None:
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(401, request=request)
+    )
+    client = HttpxWorkerClient("http://api", "w" * 40, transport=transport)
+    with pytest.raises(WorkerFatalProtocolError):
+        client.claim("worker-1")
+
+
+def test_http_client_fatal_error_does_not_expose_response_body() -> None:
+    secret = "sensitive-server-payload"
+    transport = httpx.MockTransport(
+        lambda request: httpx.Response(422, text=secret, request=request)
+    )
+    client = HttpxWorkerClient("http://api", "w" * 40, transport=transport)
+
+    with pytest.raises(WorkerFatalProtocolError) as raised:
+        client.claim("worker-1")
+
+    assert "422" in str(raised.value)
+    assert secret not in str(raised.value)
+
+
+def test_invalid_claim_is_reported_nonretryable(tmp_path: Path) -> None:
+    source = tmp_path / "input.h5"
+    source.write_bytes(b"stable")
+    protocol = FakeProtocol([replace(_claim(source), source_size_bytes=999)])
+    outcome = _worker(
+        tmp_path,
+        protocol,
+        lambda *args: pytest.fail("invalid claim must not be analyzed"),
+    ).run_once()
+    assert outcome.error_code == "invalid_claim"
+    assert protocol.failures[0][4] is False
+
+
+@pytest.mark.parametrize(
+    "error",
+    [SourceChangedError("changed"), ValueError("invalid"), TypeError("invalid")],
+)
+def test_irrecoverable_worker_failures_are_not_retry_eligible(error) -> None:
+    assert _failure_retry_eligible(error) is False
+
+
+def test_ordinary_analysis_failure_remains_retry_eligible() -> None:
+    assert _failure_retry_eligible(OSError("temporary read failure")) is True
+
+
+def test_transport_loss_after_claim_leaves_job_for_stale_recovery(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "input.h5"
+    source.write_bytes(b"stable")
+
+    class OfflineResultProtocol(FakeProtocol):
+        def submit_result(self, job_id: str, payload: dict[str, Any]) -> None:
+            del job_id, payload
+            raise WorkerTransientError("offline")
+
+    protocol = OfflineResultProtocol([_claim(source)])
+    worker = _worker(
+        tmp_path,
+        protocol,
+        lambda path, reader, profile, backend, artifact_root, context: _analysis(
+            Path(path), backend, Path(artifact_root)
+        ),
+    )
+
+    with pytest.raises(WorkerTransientError, match="offline"):
+        worker.run_once()
+
     assert protocol.failures == []
 
 

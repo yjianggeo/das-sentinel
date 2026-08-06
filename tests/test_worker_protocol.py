@@ -15,11 +15,20 @@ from das_sentinel.persistence import (
     session_factory,
     upgrade_database,
 )
-from das_sentinel.services.jobs import JobService
+from das_sentinel.persistence.models import Job, utc_now
+from das_sentinel.services.jobs import STALE_AFTER, JobService
 from fastapi.testclient import TestClient
 
 PASSWORD = "correct horse"
 WORKER_TOKEN = "worker-secret-" + "x" * 32
+
+
+@pytest.fixture(autouse=True)
+def safe_sqlite_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "das_sentinel.persistence.db.validate_selected_sqlite_runtime",
+        lambda: (3, 53, 3),
+    )
 
 
 def _settings(tmp_path: Path) -> Settings:
@@ -216,6 +225,28 @@ def test_enqueue_claim_heartbeat_complete_protocol_and_no_token_leak(api_client)
     assert "worker_token" not in exposed
 
 
+def test_claim_recovers_stale_job_without_api_restart(api_client) -> None:
+    client, _, token, source_id, profile_id = api_client
+    stale_id = _enqueue(client, token, source_id, profile_id).json()["id"]
+    first = client.post(
+        "/api/v1/internal/jobs/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN},
+        json={"worker_id": "dead-worker"},
+    ).json()["id"]
+    assert first == stale_id
+    with client.app.state.session_factory.begin() as session:
+        row = session.get(Job, stale_id)
+        row.heartbeat_at = utc_now() - STALE_AFTER - timedelta(seconds=1)
+    recovered = client.post(
+        "/api/v1/internal/jobs/claim",
+        headers={"X-Worker-Token": WORKER_TOKEN},
+        json={"worker_id": "replacement-worker"},
+    )
+    assert recovered.status_code == 200
+    assert recovered.json()["id"] == stale_id
+    assert recovered.json()["worker_id"] == "replacement-worker"
+
+
 def test_protocol_maps_not_found_conflict_and_validation(api_client):
     client, _, token, source_id, profile_id = api_client
     missing = client.post(
@@ -364,7 +395,7 @@ def test_complete_rejects_unsafe_artifact_symlink_without_state_change(
     outside = tmp_path / "secret.png"
     outside.write_bytes(b"secret")
     link = settings.app_data_dir / "artifacts" / "linked.png"
-    link.parent.mkdir(parents=True)
+    link.parent.mkdir(parents=True, exist_ok=True)
     try:
         link.symlink_to(outside)
     except OSError as error:

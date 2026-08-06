@@ -77,6 +77,11 @@ def test_gpu_image_installs_cupy_and_cuda_runtime() -> None:
     assert "cupy-cuda12x" in text or ".[gpu]" in text
 
 
+def test_gpu_image_uses_cuda_devel_base() -> None:
+    dockerfile = (ROOT / "docker" / "Dockerfile.gpu").read_text("utf-8")
+    assert "FROM nvidia/cuda:12.8.1-devel-ubuntu24.04 AS runtime" in dockerfile
+
+
 def test_api_has_healthcheck_and_runs_non_root(compose_cpu: dict) -> None:
     assert "healthcheck" in compose_cpu["services"]["api"]
     dockerfile = (ROOT / "docker" / "Dockerfile.cpu").read_text("utf-8")

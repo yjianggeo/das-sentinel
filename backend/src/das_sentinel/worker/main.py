@@ -33,6 +33,14 @@ from das_sentinel.signal.backend import (
 MAX_FAILURE_MESSAGE = 1024
 
 
+class WorkerTransientError(RuntimeError):
+    """A worker API failure that is safe to retry after backoff."""
+
+
+class WorkerFatalProtocolError(RuntimeError):
+    """A worker API response that must stop the polling process."""
+
+
 class CudaOutOfMemoryError(RuntimeError):
     """Explicit adapter exception for an exact CUDA allocation failure."""
 
@@ -149,14 +157,35 @@ class HttpxWorkerClient:
     def close(self) -> None:
         self._client.close()
 
+    def _request(
+        self,
+        method: str,
+        path: str,
+        json: dict[str, Any] | None = None,
+    ) -> httpx.Response:
+        try:
+            response = self._client.request(method, path, json=json)
+        except httpx.TransportError as error:
+            raise WorkerTransientError("worker API transport failure") from error
+        if response.status_code >= 500:
+            raise WorkerTransientError(
+                f"worker API returned HTTP {response.status_code}"
+            )
+        if response.status_code >= 400:
+            raise WorkerFatalProtocolError(
+                f"worker API returned HTTP {response.status_code}"
+            )
+        response.raise_for_status()
+        return response
+
     def claim(self, worker_id: str) -> WorkerClaim | None:
-        response = self._client.post(
+        response = self._request(
+            "POST",
             "/api/v1/internal/jobs/claim",
             json={"worker_id": worker_id},
         )
         if response.status_code == 204:
             return None
-        response.raise_for_status()
         return WorkerClaim.from_dict(response.json())
 
     def heartbeat(
@@ -166,7 +195,8 @@ class HttpxWorkerClient:
         numerator: int,
         denominator: int,
     ) -> None:
-        response = self._client.post(
+        self._request(
+            "POST",
             f"/api/v1/internal/jobs/{job_id}/heartbeat",
             json={
                 "worker_id": worker_id,
@@ -174,20 +204,13 @@ class HttpxWorkerClient:
                 "denominator": denominator,
             },
         )
-        response.raise_for_status()
 
     def submit_result(self, job_id: str, payload: dict[str, Any]) -> None:
-        response = self._client.post(
+        self._request(
+            "POST",
             f"/api/v1/internal/jobs/{job_id}/result",
             json=payload,
         )
-        if response.status_code >= 400:
-            raise httpx.HTTPStatusError(
-                f"result rejected with {response.status_code}: {response.text[:512]}",
-                request=response.request,
-                response=response,
-            )
-        response.raise_for_status()
 
     def fail(
         self,
@@ -197,7 +220,8 @@ class HttpxWorkerClient:
         error_message: str,
         retry_eligible: bool,
     ) -> None:
-        response = self._client.post(
+        self._request(
+            "POST",
             f"/api/v1/internal/jobs/{job_id}/fail",
             json={
                 "worker_id": worker_id,
@@ -206,7 +230,6 @@ class HttpxWorkerClient:
                 "retry_eligible": retry_eligible,
             },
         )
-        response.raise_for_status()
 
 
 class Worker:
@@ -281,6 +304,8 @@ class Worker:
                     )
                     try:
                         self.client.submit_result(claim.id, payload)
+                    except (WorkerTransientError, WorkerFatalProtocolError):
+                        raise
                     except Exception as error:
                         raise ResultSubmissionError(
                             f"result submission failed: {error}"
@@ -294,11 +319,19 @@ class Worker:
                     )
                 finally:
                     self._stop_heartbeat()
+        except (WorkerTransientError, WorkerFatalProtocolError):
+            self._stop_heartbeat()
+            raise
         except Exception as error:  # noqa: BLE001 - isolate each claimed file
             self._stop_heartbeat()
             code = _failure_code(error)
             message = self._safe_error_message(error, claim)
-            self._report_failure(claim.id, code, message)
+            self._report_failure(
+                claim.id,
+                code,
+                message,
+                _failure_retry_eligible(error),
+            )
             return WorkerOutcome(
                 status="failed",
                 job_id=claim.id,
@@ -456,6 +489,7 @@ class Worker:
         job_id: str,
         error_code: str,
         error_message: str,
+        retry_eligible: bool,
     ) -> bool:
         try:
             self.client.fail(
@@ -463,7 +497,7 @@ class Worker:
                 self.worker_id,
                 error_code,
                 error_message,
-                True,
+                retry_eligible,
             )
         except Exception:  # noqa: BLE001 - failure reporting must not kill polling
             return False
@@ -488,6 +522,10 @@ def _failure_code(error: BaseException) -> str:
     if isinstance(error, (ValueError, TypeError)):
         return "invalid_claim"
     return "analysis_failed"
+
+
+def _failure_retry_eligible(error: BaseException) -> bool:
+    return not isinstance(error, (SourceChangedError, ValueError, TypeError))
 
 
 def _json_safe(value: Any) -> Any:

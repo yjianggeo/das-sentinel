@@ -54,6 +54,18 @@ def _cuda_backend() -> ArrayBackend | None:
     return ArrayBackend(name="cuda", xp=cupy)
 
 
+def smoke_test_cuda() -> None:
+    cupy = _load_cupy()
+    if cupy is None:
+        raise BackendUnavailable(_CUPY_LOAD_ERROR or "CuPy/CUDA is unavailable")
+    values = cupy.asarray([0.0, 1.0, 0.0, -1.0], dtype=cupy.float32)
+    spectrum = cupy.fft.rfft(values)
+    host = np.asarray(cupy.asnumpy(spectrum))
+    cupy.cuda.Stream.null.synchronize()
+    if host.shape != (3,) or not np.isfinite(host).all():
+        raise BackendUnavailable("CUDA FFT smoke test returned invalid output")
+
+
 def select_backend(device: str) -> ArrayBackend:
     """Select the requested array backend without importing CuPy for CPU work."""
     if device == "cpu":

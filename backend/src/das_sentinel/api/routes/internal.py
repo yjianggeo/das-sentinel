@@ -167,7 +167,9 @@ async def submit_job_result(
 
 def _claim(sessions, artifact_root, worker_id: str) -> JobClaim | None:
     with sessions.begin() as session:
-        return JobService(session, artifact_root).claim(worker_id)
+        service = JobService(session, artifact_root)
+        service.recover_stale()
+        return service.claim(worker_id)
 
 
 def _heartbeat(
