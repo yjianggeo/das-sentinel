@@ -18,6 +18,7 @@ from das_sentinel.pipeline import FileAnalysis, SourceChangedError
 from das_sentinel.readers.base import ProbeResult, ReaderRegistry
 from das_sentinel.services.discovery import fingerprint
 from das_sentinel.signal.backend import ArrayBackend, BackendUnavailable
+from das_sentinel.worker.__main__ import run_forever
 from das_sentinel.worker.main import (
     CudaOutOfMemoryError,
     HttpxWorkerClient,
@@ -82,6 +83,32 @@ class FakeProtocol:
         self.failures.append(
             (job_id, worker_id, error_code, error_message, retry_eligible)
         )
+
+
+class PeriodicHeartbeatFailureProtocol(FakeProtocol):
+    def __init__(self, claims, error: BaseException) -> None:
+        super().__init__(claims)
+        self.error = error
+        self.heartbeat_calls = 0
+        self.periodic_attempted = threading.Event()
+
+    def heartbeat(
+        self,
+        job_id: str,
+        worker_id: str,
+        numerator: int,
+        denominator: int,
+    ) -> None:
+        self.heartbeat_calls += 1
+        if self.heartbeat_calls == 1:
+            return super().heartbeat(
+                job_id,
+                worker_id,
+                numerator,
+                denominator,
+            )
+        self.periodic_attempted.set()
+        raise self.error
 
 
 def _settings(tmp_path: Path, *, worker_device: str = "auto") -> Settings:
@@ -601,6 +628,112 @@ def test_result_submission_failure_is_structured_and_stops_heartbeat(
     assert outcome.error_code == "persistence_failed"
     assert protocol.failures[0][2] == "persistence_failed"
     assert worker.heartbeat_thread is None
+
+
+def test_transient_failure_report_error_drives_polling_backoff(tmp_path: Path) -> None:
+    source = tmp_path / "input.h5"
+    source.write_bytes(b"stable")
+
+    class OfflineFailureProtocol(FakeProtocol):
+        def fail(self, *args, **kwargs) -> None:
+            del args, kwargs
+            raise WorkerTransientError("offline while reporting failure")
+
+    protocol = OfflineFailureProtocol([_claim(source)])
+
+    def fail_analysis(*args):
+        del args
+        raise OSError("analysis failed")
+
+    sleeps = []
+    run_forever(
+        _worker(tmp_path, protocol, fail_analysis),
+        max_iterations=1,
+        sleep=sleeps.append,
+    )
+
+    assert sleeps == [1.0]
+    assert protocol.results == []
+
+
+def test_fatal_failure_report_error_terminates_polling(tmp_path: Path) -> None:
+    source = tmp_path / "input.h5"
+    source.write_bytes(b"stable")
+
+    class UnauthorizedFailureProtocol(FakeProtocol):
+        def fail(self, *args, **kwargs) -> None:
+            del args, kwargs
+            raise WorkerFatalProtocolError("unauthorized while reporting failure")
+
+    protocol = UnauthorizedFailureProtocol([_claim(source)])
+
+    def fail_analysis(*args):
+        del args
+        raise OSError("analysis failed")
+
+    with pytest.raises(WorkerFatalProtocolError, match="unauthorized"):
+        run_forever(
+            _worker(tmp_path, protocol, fail_analysis),
+            max_iterations=1,
+            sleep=lambda _: pytest.fail("fatal errors must not sleep"),
+        )
+
+    assert protocol.results == []
+
+
+def test_periodic_transient_heartbeat_loss_drives_polling_backoff(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "input.h5"
+    source.write_bytes(b"stable")
+    protocol = PeriodicHeartbeatFailureProtocol(
+        [_claim(source)],
+        WorkerTransientError("heartbeat offline"),
+    )
+
+    def finish_after_lease_loss(
+        path, reader, profile, backend, artifact_root, context
+    ):
+        del reader, profile, context
+        assert protocol.periodic_attempted.wait(1)
+        return _analysis(Path(path), backend, Path(artifact_root))
+
+    sleeps = []
+    run_forever(
+        _worker(tmp_path, protocol, finish_after_lease_loss),
+        max_iterations=1,
+        sleep=sleeps.append,
+    )
+
+    assert sleeps == [1.0]
+    assert protocol.results == []
+    assert protocol.failures == []
+
+
+def test_periodic_fatal_heartbeat_loss_terminates_polling(tmp_path: Path) -> None:
+    source = tmp_path / "input.h5"
+    source.write_bytes(b"stable")
+    protocol = PeriodicHeartbeatFailureProtocol(
+        [_claim(source)],
+        WorkerFatalProtocolError("heartbeat unauthorized"),
+    )
+
+    def finish_after_lease_loss(
+        path, reader, profile, backend, artifact_root, context
+    ):
+        del reader, profile, context
+        assert protocol.periodic_attempted.wait(1)
+        return _analysis(Path(path), backend, Path(artifact_root))
+
+    with pytest.raises(WorkerFatalProtocolError, match="unauthorized"):
+        run_forever(
+            _worker(tmp_path, protocol, finish_after_lease_loss),
+            max_iterations=1,
+            sleep=lambda _: pytest.fail("fatal errors must not sleep"),
+        )
+
+    assert protocol.results == []
+    assert protocol.failures == []
 
 
 def test_worker_rejects_analyzer_backend_identity_mismatch(tmp_path: Path):

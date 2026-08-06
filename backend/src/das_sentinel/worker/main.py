@@ -261,6 +261,9 @@ class Worker:
         self.heartbeat_interval_seconds = float(heartbeat_interval_seconds)
         self.heartbeat_thread: threading.Thread | None = None
         self._heartbeat_stop: threading.Event | None = None
+        self._heartbeat_error: (
+            WorkerTransientError | WorkerFatalProtocolError | None
+        ) = None
 
     def run_once(self) -> WorkerOutcome:
         claim = self.client.claim(self.worker_id)
@@ -278,13 +281,17 @@ class Worker:
                 metadata = reader.read_metadata(source.stream)
                 self._start_heartbeat(claim)
                 try:
-                    analysis, actual_backend, fallback_reason = self._analyze(
-                        claim,
-                        source,
-                        profile,
-                        reader,
-                        requested_backend,
-                    )
+                    try:
+                        analysis, actual_backend, fallback_reason = self._analyze(
+                            claim,
+                            source,
+                            profile,
+                            reader,
+                            requested_backend,
+                        )
+                    finally:
+                        self._stop_heartbeat()
+                        self._raise_heartbeat_error()
                     if analysis.source_fingerprint != claim.source_fingerprint:
                         raise SourceChangedError(
                             "analysis source fingerprint does not match claim"
@@ -441,6 +448,7 @@ class Worker:
             return result, "cpu", "cuda_out_of_memory"
 
     def _start_heartbeat(self, claim: WorkerClaim) -> None:
+        self._heartbeat_error = None
         self.client.heartbeat(claim.id, self.worker_id, 0, 1)
         stop = threading.Event()
 
@@ -448,6 +456,9 @@ class Worker:
             while not stop.wait(self.heartbeat_interval_seconds):
                 try:
                     self.client.heartbeat(claim.id, self.worker_id, 0, 1)
+                except (WorkerTransientError, WorkerFatalProtocolError) as error:
+                    self._heartbeat_error = error
+                    return
                 except Exception:  # noqa: BLE001 - heartbeat failure stops this helper
                     return
 
@@ -469,6 +480,12 @@ class Worker:
             thread.join()
         self._heartbeat_stop = None
         self.heartbeat_thread = None
+
+    def _raise_heartbeat_error(self) -> None:
+        error = self._heartbeat_error
+        self._heartbeat_error = None
+        if error is not None:
+            raise error
 
     def _safe_error_message(
         self,
@@ -499,6 +516,8 @@ class Worker:
                 error_message,
                 retry_eligible,
             )
+        except (WorkerTransientError, WorkerFatalProtocolError):
+            raise
         except Exception:  # noqa: BLE001 - failure reporting must not kill polling
             return False
         return True
