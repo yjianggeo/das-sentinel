@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import warnings
 from datetime import UTC, datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from alembic import command
+from alembic.config import Config
+from das_sentinel.persistence import db as persistence_db
 from das_sentinel.persistence.db import (
     AsyncWriteCoordinator,
     SQLiteRuntimeError,
@@ -39,58 +44,6 @@ EXPECTED_TABLES = {
     "model_versions",
     "artifacts",
 }
-
-
-class _SafeVersionCursor:
-    def __init__(self, cursor):
-        self._cursor = cursor
-        self._sqlite_version_requested = False
-
-    def execute(self, statement, *args, **kwargs):
-        self._sqlite_version_requested = statement == "SELECT sqlite_version()"
-        return self._cursor.execute(statement, *args, **kwargs)
-
-    def fetchone(self):
-        if self._sqlite_version_requested:
-            self._sqlite_version_requested = False
-            self._cursor.fetchone()
-            return ("3.53.3",)
-        return self._cursor.fetchone()
-
-    def __getattr__(self, name):
-        return getattr(self._cursor, name)
-
-
-class _SafeVersionConnection:
-    def __init__(self, connection):
-        self._connection = connection
-
-    def cursor(self, *args, **kwargs):
-        return _SafeVersionCursor(self._connection.cursor(*args, **kwargs))
-
-    def __getattr__(self, name):
-        return getattr(self._connection, name)
-
-
-class _SafeVersionSQLiteDriver:
-    sqlite_version = "3.53.3"
-
-    def __init__(self, driver):
-        self._driver = driver
-
-    def connect(self, *args, **kwargs):
-        return _SafeVersionConnection(self._driver.connect(*args, **kwargs))
-
-    def __getattr__(self, name):
-        return getattr(self._driver, name)
-
-
-@pytest.fixture(autouse=True)
-def safe_sqlite_driver_for_migration_tests(monkeypatch):
-    from das_sentinel.persistence import db
-
-    selected = db._sqlite_driver()
-    monkeypatch.setattr(db, "_sqlite_driver", lambda: _SafeVersionSQLiteDriver(selected))
 
 
 @pytest.fixture
@@ -225,6 +178,76 @@ def test_hardening_migration_adds_model_binding_and_review_idempotency(
         "reviews_append_only_update",
         "reviews_append_only_delete",
     }
+
+
+def test_hardening_migration_round_trip_preserves_review_triggers(database_url):
+    driver = persistence_db._sqlite_driver()
+    assert driver is sqlite3
+    assert driver.sqlite_version == "3.53.3"
+    assert sqlite3.connect(":memory:").execute(
+        "SELECT sqlite_version()"
+    ).fetchone() == ("3.53.3",)
+    assert validate_selected_sqlite_runtime() == (3, 53, 3)
+
+    repository_root = Path(__file__).resolve().parents[1]
+    configuration = Config(str(repository_root / "alembic.ini"))
+    configuration.set_main_option(
+        "script_location",
+        str(
+            repository_root
+            / "backend"
+            / "src"
+            / "das_sentinel"
+            / "persistence"
+            / "migrations"
+        ),
+    )
+    configuration.set_main_option("sqlalchemy.url", database_url)
+
+    def schema_state():
+        engine = create_local_engine(database_url)
+        try:
+            inspector = inspect(engine)
+            with engine.connect() as connection:
+                triggers = set(
+                    connection.exec_driver_sql(
+                        "SELECT name FROM sqlite_master "
+                        "WHERE type = 'trigger' AND tbl_name = 'reviews'"
+                    ).scalars()
+                )
+            return (
+                {item["name"] for item in inspector.get_columns("jobs")},
+                {item["name"] for item in inspector.get_columns("reviews")},
+                {item["name"] for item in inspector.get_indexes("reviews")},
+                triggers,
+            )
+        finally:
+            engine.dispose()
+
+    append_only_triggers = {
+        "reviews_append_only_update",
+        "reviews_append_only_delete",
+    }
+    command.upgrade(configuration, "0001_initial")
+    job_columns, review_columns, review_indexes, triggers = schema_state()
+    assert "model_version_id" not in job_columns
+    assert "request_id" not in review_columns
+    assert "uq_review_event_request" not in review_indexes
+    assert triggers >= append_only_triggers
+
+    command.upgrade(configuration, "0002_job_model_and_review_request")
+    job_columns, review_columns, review_indexes, triggers = schema_state()
+    assert "model_version_id" in job_columns
+    assert "request_id" in review_columns
+    assert "uq_review_event_request" in review_indexes
+    assert triggers >= append_only_triggers
+
+    command.downgrade(configuration, "0001_initial")
+    job_columns, review_columns, review_indexes, triggers = schema_state()
+    assert "model_version_id" not in job_columns
+    assert "request_id" not in review_columns
+    assert "uq_review_event_request" not in review_indexes
+    assert triggers >= append_only_triggers
 
 
 def test_schema_has_no_foreign_key_dependency_cycle():

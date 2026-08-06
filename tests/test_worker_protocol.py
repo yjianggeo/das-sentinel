@@ -23,14 +23,6 @@ PASSWORD = "correct horse"
 WORKER_TOKEN = "worker-secret-" + "x" * 32
 
 
-@pytest.fixture(autouse=True)
-def safe_sqlite_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "das_sentinel.persistence.db.validate_selected_sqlite_runtime",
-        lambda: (3, 53, 3),
-    )
-
-
 def _settings(tmp_path: Path) -> Settings:
     data_root = tmp_path / "raw"
     app_data = tmp_path / "app-data"

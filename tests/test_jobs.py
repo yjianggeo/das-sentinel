@@ -26,14 +26,6 @@ from das_sentinel.services.jobs import (
 from sqlalchemy import func, select
 
 
-@pytest.fixture(autouse=True)
-def safe_sqlite_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(
-        "das_sentinel.persistence.db.validate_selected_sqlite_runtime",
-        lambda: (3, 53, 3),
-    )
-
-
 @pytest.fixture
 def job_database(tmp_path: Path):
     app_data = tmp_path / "app-data"
