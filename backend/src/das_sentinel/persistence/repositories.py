@@ -361,12 +361,20 @@ class EventRepository(_Repository):
 
 
 class ReviewRepository(_Repository):
+    def get_by_request(self, event_id: str, request_id: str) -> Review | None:
+        statement = select(Review).where(
+            Review.event_id == event_id,
+            Review.request_id == request_id,
+        )
+        return self.session.scalar(statement)
+
     def add(
         self,
         event_id: str,
         *,
         label: str,
         note: str | None = None,
+        request_id: str | None = None,
         admin_id: int | None = None,
         created_at: datetime | None = None,
     ) -> Review:
@@ -377,6 +385,7 @@ class ReviewRepository(_Repository):
             admin_id=admin_id,
             label=_label(label, SUPERVISED_LABELS),
             note=note,
+            request_id=request_id,
         )
         if created_at is not None:
             row.created_at = normalize_utc(created_at)

@@ -1,4 +1,4 @@
-import { useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { api, ApiError, type EventSummary } from "../api";
 
 const LABELS = [
@@ -23,20 +23,39 @@ export default function ReviewForm({
   const [note, setNote] = useState("");
   const [status, setStatus] = useState<"idle" | "saved" | "error">("idle");
   const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+  const busyRef = useRef(false);
+  const requestIdRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    busyRef.current = false;
+    requestIdRef.current = null;
+    setBusy(false);
+    setStatus("idle");
+    setError("");
+  }, [eventId]);
 
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
-    if (!label) return;
+    if (!label || busyRef.current) return;
+    busyRef.current = true;
+    setBusy(true);
+    requestIdRef.current ??= crypto.randomUUID();
     try {
       await api.post(`/api/v1/events/${eventId}/reviews`, {
         label,
         note: note || null,
+        request_id: requestIdRef.current,
       });
       setStatus("saved");
+      requestIdRef.current = null;
       onReviewed();
     } catch (cause) {
       setStatus("error");
       setError(cause instanceof ApiError ? cause.message : "保存复核失败");
+    } finally {
+      busyRef.current = false;
+      setBusy(false);
     }
   }
 
@@ -66,7 +85,7 @@ export default function ReviewForm({
             rows={3}
           />
         </label>
-        <button className="primary" type="submit" disabled={!label}>
+        <button className="primary" type="submit" disabled={!label || busy}>
           保存复核
         </button>
         {status === "saved" && <p role="status">已保存</p>}

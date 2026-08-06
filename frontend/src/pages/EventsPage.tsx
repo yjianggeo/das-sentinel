@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import {
   api,
   type EventDetail,
@@ -23,6 +23,8 @@ export default function EventsPage() {
   const [detail, setDetail] = useState<EventDetail | null>(null);
   const [similar, setSimilar] = useState<EventSummary[]>([]);
   const [error, setError] = useState("");
+  const requestSequence = useRef(0);
+  const activeController = useRef<AbortController | null>(null);
 
   useEffect(() => {
     api
@@ -31,18 +33,39 @@ export default function EventsPage() {
       .catch(() => setError("无法加载事件"));
   }, []);
 
+  useEffect(() => () => activeController.current?.abort(), []);
+
   const openEvent = useCallback((event: EventSummary) => {
+    const sequence = ++requestSequence.current;
+    activeController.current?.abort();
+    const controller = new AbortController();
+    activeController.current = controller;
     setSelected(event);
     setDetail(null);
     setSimilar([]);
+    setError("");
     api
-      .get<EventDetail>(`/api/v1/events/${event.id}`)
-      .then(setDetail)
-      .catch(() => setError("无法加载事件详情"));
+      .get<EventDetail>(`/api/v1/events/${event.id}`, undefined, controller.signal)
+      .then((value) => {
+        if (sequence === requestSequence.current) setDetail(value);
+      })
+      .catch((cause: unknown) => {
+        if (cause instanceof DOMException && cause.name === "AbortError") return;
+        if (sequence === requestSequence.current) setError("无法加载事件详情");
+      });
     api
-      .get<EventSummary[]>(`/api/v1/events/${event.id}/similar`)
-      .then(setSimilar)
-      .catch(() => setSimilar([]));
+      .get<EventSummary[]>(
+        `/api/v1/events/${event.id}/similar`,
+        undefined,
+        controller.signal,
+      )
+      .then((value) => {
+        if (sequence === requestSequence.current) setSimilar(value);
+      })
+      .catch((cause: unknown) => {
+        if (cause instanceof DOMException && cause.name === "AbortError") return;
+        if (sequence === requestSequence.current) setSimilar([]);
+      });
   }, []);
 
   const reloadEvents = useCallback(() => {
@@ -51,9 +74,12 @@ export default function EventsPage() {
       .then(setEvents)
       .catch(() => undefined);
     if (selected) {
+      const sequence = requestSequence.current;
       api
         .get<EventDetail>(`/api/v1/events/${selected.id}`)
-        .then(setDetail)
+        .then((value) => {
+          if (sequence === requestSequence.current) setDetail(value);
+        })
         .catch(() => undefined);
     }
   }, [selected]);
@@ -74,7 +100,7 @@ export default function EventsPage() {
         {selected !== null && detail === null && (
           <p className="loading">正在加载详情…</p>
         )}
-        {selected !== null && detail !== null && (
+        {selected !== null && detail !== null && selected.id === detail.id && (
           <>
             <header className="event-detail-header">
               <h2>{formatOccurredAt(detail.occurred_at)}</h2>

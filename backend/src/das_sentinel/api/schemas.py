@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
+from uuid import UUID
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import (
@@ -404,6 +405,7 @@ class WorkerResultRequest(StrictSchema):
 class ReviewCreate(StrictSchema):
     label: Literal["earthquake", "blast", "traffic", "noise"]
     note: str | None = Field(default=None, max_length=2000)
+    request_id: UUID | None = None
 
     @field_validator("note")
     @classmethod

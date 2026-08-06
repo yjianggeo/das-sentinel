@@ -5,9 +5,10 @@ from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Literal, cast
 
-from fastapi import APIRouter, HTTPException, Query, Request, status
+from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 
 from das_sentinel.api.auth import AuthenticatedAdmin, CsrfAdmin
 from das_sentinel.api.schemas import (
@@ -284,16 +285,23 @@ def get_event(
     "/{event_id}/reviews",
     response_model=ReviewResponse,
     status_code=status.HTTP_201_CREATED,
+    responses={
+        status.HTTP_200_OK: {
+            "model": ReviewResponse,
+            "description": "Existing review returned for a replayed request ID.",
+        }
+    },
 )
 async def create_review(
     event_id: str,
     payload: ReviewCreate,
     request: Request,
+    response: Response,
     admin: CsrfAdmin,
 ) -> ReviewResponse:
     try:
         async with request.app.state.write_coordinator.lock:
-            review = await run_in_threadpool(
+            review, status_code = await run_in_threadpool(
                 _append_review,
                 request.app.state.session_factory,
                 event_id,
@@ -305,6 +313,7 @@ async def create_review(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="Event not found",
         ) from error
+    response.status_code = status_code
     return review
 
 
@@ -313,15 +322,43 @@ def _append_review(
     event_id: str,
     payload: ReviewCreate,
     admin_id: int,
-) -> ReviewResponse:
+) -> tuple[ReviewResponse, int]:
+    request_id = None if payload.request_id is None else str(payload.request_id)
+    race_error: IntegrityError | None = None
+    try:
+        with sessions.begin() as session:
+            reviews = Repositories(session).reviews
+            if request_id is not None:
+                existing = reviews.get_by_request(event_id, request_id)
+                if existing is not None:
+                    return _review(existing), status.HTTP_200_OK
+            row = reviews.add(
+                event_id,
+                label=payload.label,
+                note=payload.note,
+                request_id=request_id,
+                admin_id=admin_id,
+            )
+            return _review(row), status.HTTP_201_CREATED
+    except IntegrityError as error:
+        if request_id is None or not _is_review_request_race(error):
+            raise
+        race_error = error
+
     with sessions.begin() as session:
-        row = Repositories(session).reviews.add(
-            event_id,
-            label=payload.label,
-            note=payload.note,
-            admin_id=admin_id,
-        )
-        return _review(row)
+        assert race_error is not None
+        existing = Repositories(session).reviews.get_by_request(event_id, request_id)
+        if existing is None:
+            raise race_error
+        return _review(existing), status.HTTP_200_OK
+
+
+def _is_review_request_race(error: IntegrityError) -> bool:
+    original = error.orig
+    constraint = getattr(getattr(original, "diag", None), "constraint_name", None)
+    if constraint == "uq_review_event_request":
+        return True
+    return str(original) == "UNIQUE constraint failed: reviews.event_id, reviews.request_id"
 
 
 def _summary(

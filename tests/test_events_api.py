@@ -441,6 +441,52 @@ def test_event_review_appends_without_mutating_machine_or_prior_review(event_api
         ) == 2
 
 
+def test_review_request_id_replays_original_review_and_new_id_appends(event_api):
+    client, _, _, token, ids = event_api
+    first_payload = {
+        "label": "earthquake",
+        "note": "original submission",
+        "request_id": "11111111-1111-4111-8111-111111111111",
+    }
+    replay_payload = {
+        "label": "noise",
+        "note": "must not replace original",
+        "request_id": "11111111-1111-4111-8111-111111111111",
+    }
+    second_payload = {
+        "label": "blast",
+        "note": "second submission",
+        "request_id": "22222222-2222-4222-8222-222222222222",
+    }
+
+    first = client.post(
+        f"/api/v1/events/{ids['event_1']}/reviews",
+        json=first_payload,
+        headers={"X-CSRF-Token": token},
+    )
+    replay = client.post(
+        f"/api/v1/events/{ids['event_1']}/reviews",
+        json=replay_payload,
+        headers={"X-CSRF-Token": token},
+    )
+    second = client.post(
+        f"/api/v1/events/{ids['event_1']}/reviews",
+        json=second_payload,
+        headers={"X-CSRF-Token": token},
+    )
+
+    assert first.status_code == 201
+    assert replay.status_code == 200
+    assert replay.json() == first.json()
+    assert second.status_code == 201
+    assert second.json()["id"] != first.json()["id"]
+    detail = client.get(f"/api/v1/events/{ids['event_1']}").json()
+    assert [item["id"] for item in detail["review_history"]] == [
+        first.json()["id"],
+        second.json()["id"],
+    ]
+
+
 @pytest.mark.parametrize(
     "payload",
     [

@@ -1,13 +1,19 @@
-import { screen } from "@testing-library/react";
+import { act, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { transferableAbortController } from "node:util";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, beforeAll, beforeEach } from "vitest";
 import { renderApp } from "../test/render";
 
 const server = setupServer();
+const domAbortController = globalThis.AbortController;
+const nativeAbortController = transferableAbortController().constructor as typeof AbortController;
 
-beforeAll(() => server.listen());
+beforeAll(() => {
+  globalThis.AbortController = nativeAbortController;
+  server.listen();
+});
 beforeEach(() => {
   server.resetHandlers();
   server.use(
@@ -16,7 +22,10 @@ beforeEach(() => {
     ),
   );
 });
-afterAll(() => server.close());
+afterAll(() => {
+  server.close();
+  globalThis.AbortController = domAbortController;
+});
 
 const SUMMARY = {
   id: "event-1",
@@ -29,6 +38,20 @@ const SUMMARY = {
   channel_stop: 40,
   machine_label: "unknown",
   latest_review: null,
+};
+
+const SUMMARY_TWO = {
+  ...SUMMARY,
+  id: "event-2",
+  event_uid: "uid-2",
+  occurred_at: "2026-07-26T11:42:16Z",
+};
+
+const STALE_SIMILAR = {
+  ...SUMMARY,
+  id: "event-stale-similar",
+  event_uid: "uid-stale-similar",
+  occurred_at: "2026-07-26T12:42:16Z",
 };
 
 const DETAIL = {
@@ -72,11 +95,84 @@ const DETAIL = {
   },
 };
 
+const DETAIL_TWO = {
+  ...DETAIL,
+  ...SUMMARY_TWO,
+  run: {
+    ...DETAIL.run,
+    id: "run-2",
+  },
+};
+
+function deferredResponse(expectedDeliveries: number) {
+  let resolve: () => void;
+  let markStarted: () => void;
+  let markDelivered: () => void;
+  const promise = new Promise<void>((done) => {
+    resolve = done;
+  });
+  const started = new Promise<void>((done) => {
+    let count = 0;
+    markStarted = () => {
+      count += 1;
+      if (count === expectedDeliveries) done();
+    };
+  });
+  const delivered = new Promise<void>((done) => {
+    let count = 0;
+    markDelivered = () => {
+      count += 1;
+      if (count === expectedDeliveries) done();
+    };
+  });
+  return {
+    promise,
+    started,
+    delivered,
+    markStarted: () => markStarted(),
+    markDelivered: () => markDelivered(),
+    resolve: () => resolve(),
+  };
+}
+
 function useEventHandlers() {
   server.use(
     http.get("/api/v1/events", () => HttpResponse.json([SUMMARY])),
     http.get("/api/v1/events/event-1", () => HttpResponse.json(DETAIL)),
     http.get("/api/v1/events/event-1/similar", () => HttpResponse.json([])),
+  );
+}
+
+function useTwoEventHandlers(
+  first: ReturnType<typeof deferredResponse>,
+  second: ReturnType<typeof deferredResponse>,
+) {
+  server.use(
+    http.get("/api/v1/events", () => HttpResponse.json([SUMMARY, SUMMARY_TWO])),
+    http.get("/api/v1/events/event-1", async () => {
+      first.markStarted();
+      await first.promise;
+      first.markDelivered();
+      return HttpResponse.json(DETAIL);
+    }),
+    http.get("/api/v1/events/event-1/similar", async () => {
+      first.markStarted();
+      await first.promise;
+      first.markDelivered();
+      return HttpResponse.json([STALE_SIMILAR]);
+    }),
+    http.get("/api/v1/events/event-2", async () => {
+      second.markStarted();
+      await second.promise;
+      second.markDelivered();
+      return HttpResponse.json(DETAIL_TWO);
+    }),
+    http.get("/api/v1/events/event-2/similar", async () => {
+      second.markStarted();
+      await second.promise;
+      second.markDelivered();
+      return HttpResponse.json([]);
+    }),
   );
 }
 
@@ -129,4 +225,111 @@ it("submits a human review and keeps the machine label", async () => {
   expect(await screen.findByText("已保存")).toBeVisible();
   expect(reviewed).toBe(true);
   expect(screen.getAllByText("待定").length).toBeGreaterThan(0);
+});
+
+it("keeps the latest selected detail when responses finish in reverse order", async () => {
+  const first = deferredResponse(2);
+  const second = deferredResponse(2);
+  useTwoEventHandlers(first, second);
+  renderApp("/events");
+
+  await userEvent.click(await screen.findByText("2026-07-26 10:42:16"));
+  await first.started;
+  await userEvent.click(await screen.findByText("2026-07-26 11:42:16"));
+  await second.started;
+  second.resolve();
+  await second.delivered;
+
+  expect(
+    await screen.findByRole("heading", { name: "2026-07-26 11:42:16" }),
+  ).toBeVisible();
+  await act(async () => {
+    first.resolve();
+    await first.delivered;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  await waitFor(() => {
+    expect(
+      screen.queryByRole("heading", { name: "2026-07-26 10:42:16" }),
+    ).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("heading", { name: "2026-07-26 11:42:16" }),
+    ).toBeVisible();
+    expect(
+      screen.queryByRole("button", { name: "2026-07-26 12:42:16" }),
+    ).not.toBeInTheDocument();
+  });
+});
+
+it("double click sends one review request with one UUID", async () => {
+  const requests: unknown[] = [];
+  useEventHandlers();
+  server.use(
+    http.post("/api/v1/events/event-1/reviews", async ({ request }) => {
+      requests.push(await request.json());
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return HttpResponse.json(
+        {
+          id: 7,
+          label: "earthquake",
+          note: null,
+          created_at: "2026-07-26T11:00:00Z",
+        },
+        { status: 201 },
+      );
+    }),
+  );
+  renderApp("/events");
+
+  await userEvent.click(await screen.findByText("2026-07-26 10:42:16"));
+  await userEvent.selectOptions(
+    await screen.findByLabelText("人工标签"),
+    "earthquake",
+  );
+  const save = screen.getByRole("button", { name: "保存复核" });
+  await Promise.all([userEvent.click(save), userEvent.click(save)]);
+
+  expect(requests).toHaveLength(1);
+  expect(requests[0]).toMatchObject({
+    request_id: expect.stringMatching(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    ),
+  });
+});
+
+it("retries a failed review with the same UUID", async () => {
+  const requests: Array<{ request_id: string }> = [];
+  let attempts = 0;
+  useEventHandlers();
+  server.use(
+    http.post("/api/v1/events/event-1/reviews", async ({ request }) => {
+      requests.push((await request.json()) as { request_id: string });
+      attempts += 1;
+      if (attempts === 1) return HttpResponse.json({ detail: "retry" }, { status: 500 });
+      return HttpResponse.json(
+        {
+          id: 8,
+          label: "earthquake",
+          note: null,
+          created_at: "2026-07-26T11:00:00Z",
+        },
+        { status: 201 },
+      );
+    }),
+  );
+  renderApp("/events");
+
+  await userEvent.click(await screen.findByText("2026-07-26 10:42:16"));
+  await userEvent.selectOptions(
+    await screen.findByLabelText("人工标签"),
+    "earthquake",
+  );
+  const save = screen.getByRole("button", { name: "保存复核" });
+  await userEvent.click(save);
+  await screen.findByRole("alert");
+  await userEvent.click(save);
+
+  expect(requests).toHaveLength(2);
+  expect(requests[1].request_id).toBe(requests[0].request_id);
 });

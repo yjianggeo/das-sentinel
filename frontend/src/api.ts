@@ -19,6 +19,7 @@ async function request<T>(
   path: string,
   body?: unknown,
   params?: Record<string, string>,
+  signal?: AbortSignal,
 ): Promise<T> {
   const url = new URL(path, window.location.origin);
   if (params) {
@@ -38,6 +39,7 @@ async function request<T>(
     headers,
     credentials: "same-origin",
     body: body === undefined ? undefined : JSON.stringify(body),
+    signal,
   });
   if (response.status === 204) {
     setCsrfToken(response.headers.get("x-csrf-token") ?? csrfToken);
@@ -57,8 +59,8 @@ async function request<T>(
 }
 
 export const api = {
-  get: <T>(path: string, params?: Record<string, string>) =>
-    request<T>("GET", path, undefined, params),
+  get: <T>(path: string, params?: Record<string, string>, signal?: AbortSignal) =>
+    request<T>("GET", path, undefined, params, signal),
   post: <T>(path: string, body?: unknown) => request<T>("POST", path, body),
   patch: <T>(path: string, body: unknown) => request<T>("PATCH", path, body),
   delete: <T>(path: string) => request<T>("DELETE", path),
