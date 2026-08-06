@@ -335,6 +335,58 @@ it("retries a failed review with the same UUID", async () => {
   expect(requests[1].request_id).toBe(requests[0].request_id);
 });
 
+it("starts a new logical review after editing a failed submission", async () => {
+  const requests: Array<{
+    label: string;
+    note: string | null;
+    request_id: string;
+  }> = [];
+  useEventHandlers();
+  server.use(
+    http.post("/api/v1/events/event-1/reviews", async ({ request }) => {
+      requests.push(
+        (await request.json()) as {
+          label: string;
+          note: string | null;
+          request_id: string;
+        },
+      );
+      if (requests.length === 1) return HttpResponse.error();
+      return HttpResponse.json(
+        {
+          id: 9,
+          label: "earthquake",
+          note: "补充证据",
+          created_at: "2026-07-26T11:00:00Z",
+        },
+        { status: 201 },
+      );
+    }),
+  );
+  renderApp("/events");
+
+  await userEvent.click(await screen.findByText("2026-07-26 10:42:16"));
+  await userEvent.selectOptions(
+    await screen.findByLabelText("人工标签"),
+    "earthquake",
+  );
+  const save = screen.getByRole("button", { name: "保存复核" });
+  await userEvent.click(save);
+  await screen.findByRole("alert");
+
+  await userEvent.type(screen.getByLabelText("备注"), "补充证据");
+  expect.soft(screen.queryByRole("alert")).not.toBeInTheDocument();
+  await userEvent.click(save);
+  await screen.findByText("已保存");
+
+  expect(requests).toHaveLength(2);
+  expect(requests[1]).toMatchObject({
+    label: "earthquake",
+    note: "补充证据",
+  });
+  expect(requests[1].request_id).not.toBe(requests[0].request_id);
+});
+
 it("isolates an in-flight review when the selected event changes", async () => {
   const first = deferredResponse(1);
   const second = deferredResponse(1);
@@ -430,3 +482,116 @@ it("isolates an in-flight review when the selected event changes", async () => {
   expect(secondBodies[1].request_id).toBe(secondBodies[0].request_id);
   expect(reviewedCount).toBe(1);
 });
+
+for (const staleOutcome of ["success", "failure"] as const) {
+  it(`keeps event B active when an unmounted event A review finishes with ${staleOutcome}`, async () => {
+    const first = deferredResponse(1);
+    const second = deferredResponse(1);
+    const firstBodies: Array<{ request_id: string }> = [];
+    const secondBodies: Array<{ request_id: string }> = [];
+    let eventOneDetailRequests = 0;
+    server.use(
+      http.get("/api/v1/events", () =>
+        HttpResponse.json([SUMMARY, SUMMARY_TWO]),
+      ),
+      http.get("/api/v1/events/event-1", () => {
+        eventOneDetailRequests += 1;
+        return HttpResponse.json(DETAIL);
+      }),
+      http.get("/api/v1/events/event-1/similar", () => HttpResponse.json([])),
+      http.get("/api/v1/events/event-2", () => HttpResponse.json(DETAIL_TWO)),
+      http.get("/api/v1/events/event-2/similar", () => HttpResponse.json([])),
+      http.post("/api/v1/events/event-1/reviews", async ({ request }) => {
+        firstBodies.push((await request.json()) as { request_id: string });
+        first.markStarted();
+        await first.promise;
+        first.markDelivered();
+        if (staleOutcome === "failure") return HttpResponse.error();
+        return HttpResponse.json(
+          {
+            id: 11,
+            label: "earthquake",
+            note: null,
+            created_at: "2026-07-26T11:00:00Z",
+          },
+          { status: 201 },
+        );
+      }),
+      http.post("/api/v1/events/event-2/reviews", async ({ request }) => {
+        secondBodies.push((await request.json()) as { request_id: string });
+        if (secondBodies.length === 1) {
+          second.markStarted();
+          await second.promise;
+          second.markDelivered();
+          return HttpResponse.error();
+        }
+        return HttpResponse.json(
+          {
+            id: 12 + secondBodies.length,
+            label: "blast",
+            note: null,
+            created_at: "2026-07-26T11:01:00Z",
+          },
+          { status: 201 },
+        );
+      }),
+    );
+    renderApp("/events");
+
+    await userEvent.click(await screen.findByText("2026-07-26 10:42:16"));
+    await userEvent.selectOptions(
+      await screen.findByLabelText("人工标签"),
+      "earthquake",
+    );
+    await userEvent.click(screen.getByRole("button", { name: "保存复核" }));
+    await first.started;
+
+    await userEvent.click(screen.getByText("2026-07-26 11:42:16"));
+    expect(
+      await screen.findByRole("heading", { name: "2026-07-26 11:42:16" }),
+    ).toBeVisible();
+    const currentLabel = screen.getByLabelText("人工标签");
+    const currentNote = screen.getByLabelText("备注");
+    await userEvent.selectOptions(currentLabel, "blast");
+    const currentSave = screen.getByRole("button", { name: "保存复核" });
+    await userEvent.click(currentSave);
+    await second.started;
+
+    await act(async () => {
+      first.resolve();
+      await first.delivered;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const formStillMounted = document.body.contains(currentSave);
+    const saveWasDisabled = currentSave.hasAttribute("disabled");
+    const labelWasDisabled = currentLabel.hasAttribute("disabled");
+    const noteWasDisabled = currentNote.hasAttribute("disabled");
+    const hadStatus = screen.queryByRole("status") !== null;
+    const hadError = screen.queryByRole("alert") !== null;
+    await act(async () => {
+      second.resolve();
+      await second.delivered;
+    });
+
+    expect(saveWasDisabled).toBe(true);
+    expect(labelWasDisabled).toBe(true);
+    expect(noteWasDisabled).toBe(true);
+    expect(formStillMounted).toBe(true);
+    expect(hadStatus).toBe(false);
+    expect(hadError).toBe(false);
+    expect(eventOneDetailRequests).toBe(1);
+
+    await screen.findByRole("alert");
+    await userEvent.click(currentSave);
+    await screen.findByText("已保存");
+    await waitFor(() => expect(secondBodies).toHaveLength(2));
+    expect(secondBodies[1].request_id).toBe(secondBodies[0].request_id);
+
+    await waitFor(() => expect(currentSave).toBeEnabled());
+    await userEvent.click(currentSave);
+    await waitFor(() => expect(secondBodies).toHaveLength(3));
+    expect(secondBodies[2].request_id).not.toBe(secondBodies[1].request_id);
+    expect(firstBodies).toHaveLength(1);
+  });
+}

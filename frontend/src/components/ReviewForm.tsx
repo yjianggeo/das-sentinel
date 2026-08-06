@@ -37,7 +37,27 @@ export default function ReviewForm({
     setBusy(false);
     setStatus("idle");
     setError("");
+    return () => {
+      eventGenerationRef.current += 1;
+      activeSubmissionRef.current = null;
+    };
   }, [eventId]);
+
+  function onLabelChange(nextLabel: string) {
+    if (busyRef.current || nextLabel === label) return;
+    setLabel(nextLabel);
+    requestIdRef.current = null;
+    setStatus("idle");
+    setError("");
+  }
+
+  function onNoteChange(nextNote: string) {
+    if (busyRef.current || nextNote === note) return;
+    setNote(nextNote);
+    requestIdRef.current = null;
+    setStatus("idle");
+    setError("");
+  }
 
   async function onSubmit(event: FormEvent) {
     event.preventDefault();
@@ -81,7 +101,8 @@ export default function ReviewForm({
           人工标签
           <select
             value={label}
-            onChange={(event) => setLabel(event.target.value)}
+            onChange={(event) => onLabelChange(event.target.value)}
+            disabled={busy}
             required
           >
             <option value="">请选择…</option>
@@ -96,7 +117,8 @@ export default function ReviewForm({
           备注
           <textarea
             value={note}
-            onChange={(event) => setNote(event.target.value)}
+            onChange={(event) => onNoteChange(event.target.value)}
+            disabled={busy}
             rows={3}
           />
         </label>
