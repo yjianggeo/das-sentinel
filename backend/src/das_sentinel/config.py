@@ -132,3 +132,13 @@ class Settings(BaseSettings):
     secure_cookies: bool = True
     pipeline_version: str = "v1"
     worker_device: Literal["auto", "cpu", "cuda"] = "auto"
+
+    @model_validator(mode="after")
+    def reject_insecure_secrets(self) -> "Settings":
+        for name, value in (
+            ("session_secret", self.session_secret),
+            ("worker_token", self.worker_token),
+        ):
+            if value.lower().startswith("change-me-"):
+                raise ValueError(f"{name} uses an insecure example value")
+        return self

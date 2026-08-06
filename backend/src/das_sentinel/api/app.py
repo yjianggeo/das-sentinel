@@ -16,6 +16,7 @@ from starlette.requests import Request
 from starlette.responses import FileResponse, Response
 from starlette.staticfiles import StaticFiles
 
+from das_sentinel.api.routes import health_router
 from das_sentinel.api.routes.artifacts import router as artifacts_router
 from das_sentinel.api.routes.auth import router as auth_router
 from das_sentinel.api.routes.events import router as events_router
@@ -31,6 +32,7 @@ from das_sentinel.persistence import (
     create_local_engine,
     session_factory,
 )
+from das_sentinel.runtime import probe_storage
 from das_sentinel.services.jobs import JobService
 
 
@@ -56,6 +58,7 @@ def create_app(settings: Settings) -> FastAPI:
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         try:
             check_database_startup(engine)
+            probe_storage(settings)
             await run_in_threadpool(
                 _recover_stale_jobs,
                 app.state.session_factory,
@@ -87,9 +90,14 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(models_router, prefix="/api/v1")
     app.include_router(scans_router, prefix="/api/v1")
     app.include_router(internal_router, prefix="/api/v1")
+    app.include_router(health_router)
     app.state.discovery_trackers = {}
     _mount_spa(app)
     return app
+
+
+def create_runtime_app() -> FastAPI:
+    return create_app(Settings())  # type: ignore[call-arg]
 
 
 def _web_dist() -> Path:
