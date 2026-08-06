@@ -302,9 +302,7 @@ def _report_from_metadata(value: Any) -> TrainingReport:
     return TrainingReport(float(metrics[0]), labels_map("recall_by_label"), labels_map("precision_by_label"), matrix, float(metrics[1]), value["rule_profile_version"], value["rule_profile_hash"], profile, labels_map("reviewed_count_by_label", integer=True))
 
 
-def _read_verified_bundle(path: str | Path, expected_sha256: str) -> bytes:
-    if not isinstance(expected_sha256, str) or len(expected_sha256) != 64 or any(character not in "0123456789abcdefABCDEF" for character in expected_sha256):
-        raise ValueError("expected SHA-256 must be 64 hexadecimal characters")
+def _read_bundle_path_bytes(path: str | Path) -> bytes:
     try:
         bundle_path = Path(path)
         if bundle_path.stat().st_size > _MAX_BUNDLE_BYTES:
@@ -312,9 +310,6 @@ def _read_verified_bundle(path: str | Path, expected_sha256: str) -> bytes:
         raw_bundle = bundle_path.read_bytes()
     except OSError as exc:
         raise ValueError("model bundle cannot be read") from exc
-    actual_sha256 = sha256(raw_bundle).hexdigest()
-    if not compare_digest(actual_sha256, expected_sha256.lower()):
-        raise ValueError("model bundle SHA-256 does not match expected digest")
     return raw_bundle
 
 
@@ -336,8 +331,11 @@ def _validate_skops_archive(model_bytes: bytes) -> None:
             raise ValueError("model bundle skops archive exceeds safety limits")
 
 
-def load_model_bundle(path: str | Path, expected_feature_names: Sequence[str], expected_sha256: str) -> ModelBundle:
-    metadata, model_bytes = _read_bundle(_read_verified_bundle(path, expected_sha256))
+def _load_verified_components(
+    metadata: dict[str, Any],
+    model_bytes: bytes,
+    expected_feature_names: Sequence[str],
+) -> ModelBundle:
     expected = tuple(expected_feature_names)
     if set(metadata) != {"feature_schema_version", "feature_names", "labels", "training_snapshot_hash", "sklearn_version", "rule_profile_version", "rule_profile_hash", "rule_profile", "model", "report"}:
         raise ValueError("model bundle metadata schema is invalid")
@@ -358,7 +356,6 @@ def load_model_bundle(path: str | Path, expected_feature_names: Sequence[str], e
     if profile_hash != metadata["rule_profile_hash"] or metadata["rule_profile_version"] != report.rule_profile_version or metadata["rule_profile_hash"] != report.rule_profile_hash or profile != report.rule_profile:
         raise ValueError("model bundle rule profile binding is invalid")
     try:
-        _validate_skops_archive(model_bytes)
         if get_untrusted_types(data=model_bytes):
             raise ValueError("model bundle contains untrusted model types")
         model = skops_loads(model_bytes)
@@ -374,3 +371,42 @@ def load_model_bundle(path: str | Path, expected_feature_names: Sequence[str], e
     if not all(hasattr(model, name) for name in ("n_features_in_", "estimators_", "classes_", "n_classes_", "n_outputs_")) or model.n_features_in_ != len(expected) or len(model.estimators_) != 300 or model.n_outputs_ != 1:
         raise ValueError("model bundle classifier feature count or fitted state is invalid")
     return ModelBundle(model, expected, _LABELS, metadata["training_snapshot_hash"], sklearn.__version__, report, vectorizer.feature_schema_version)
+
+
+def load_model_bundle_bytes(
+    raw: bytes,
+    expected_feature_names: Sequence[str],
+    expected_sha256: str,
+) -> ModelBundle:
+    if (
+        not isinstance(expected_sha256, str)
+        or len(expected_sha256) != 64
+        or any(
+            character not in "0123456789abcdefABCDEF"
+            for character in expected_sha256
+        )
+    ):
+        raise ValueError("expected SHA-256 must be 64 hexadecimal characters")
+    if len(raw) > _MAX_BUNDLE_BYTES:
+        raise ValueError("model bundle is too large")
+    if not compare_digest(sha256(raw).hexdigest(), expected_sha256.lower()):
+        raise ValueError("model bundle SHA-256 does not match expected digest")
+    metadata, model_bytes = _read_bundle(raw)
+    _validate_skops_archive(model_bytes)
+    return _load_verified_components(
+        metadata,
+        model_bytes,
+        expected_feature_names,
+    )
+
+
+def load_model_bundle(
+    path: str | Path,
+    expected_feature_names: Sequence[str],
+    expected_sha256: str,
+) -> ModelBundle:
+    return load_model_bundle_bytes(
+        _read_bundle_path_bytes(path),
+        expected_feature_names,
+        expected_sha256,
+    )

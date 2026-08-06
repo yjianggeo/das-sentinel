@@ -50,7 +50,7 @@ class PublishGateError(TrainingServiceError):
 class TrainingRow:
     event_id: str
     label: str
-    features: dict[str, float]
+    features: dict[str, Any]
     group: str
 
 
@@ -201,7 +201,7 @@ class TrainingService:
                     event_id=event.id,
                     label=str(label),
                     features={
-                        str(name): float(value)
+                        str(name): value
                         for name, value in json.loads(event.features_json).items()
                     },
                     group=event.occurred_at.date().isoformat(),

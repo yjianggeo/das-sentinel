@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 from das_sentinel.artifacts import ArtifactManifest
 from das_sentinel.config import ProcessingProfile
-from das_sentinel.domain import Candidate
+from das_sentinel.domain import Candidate, Label
 from das_sentinel.readers.zd_hdf5 import ZdHdf5Reader
 from das_sentinel.signal.backend import select_backend
 from das_sentinel.signal.preprocess import PreprocessedBlock
@@ -201,6 +201,90 @@ def _empty_artifact_manifest(data, event, features, out_dir):
     del data, features
     (Path(out_dir) / event.event_id).mkdir(parents=True)
     return ArtifactManifest(event.event_id, {})
+
+
+class _PredictingBundle:
+    def predict_probabilities(self, features):
+        assert features["site_id"] == "site-a"
+        return {
+            Label.EARTHQUAKE: 0.01,
+            Label.BLAST: 0.01,
+            Label.TRAFFIC: 0.97,
+            Label.NOISE: 0.01,
+        }
+
+
+def test_pipeline_uses_bound_model_and_records_model_evidence(
+    tmp_path, monkeypatch
+):
+    from das_sentinel import pipeline
+
+    captured = []
+    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
+    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
+    monkeypatch.setattr(
+        pipeline,
+        "render_event_artifacts",
+        lambda data, event, features, out_dir: captured.append(data)
+        or _empty_artifact_manifest(data, event, features, out_dir),
+    )
+    context = pipeline.AnalysisContext(
+        site_id="site-a",
+        processing_profile_id="profile-a",
+        profile_version="1",
+        pipeline_version="v1",
+        model_version_id="model-a",
+        model_version="7",
+    )
+    source_path = tmp_path / "source.h5"
+    _write_boundary_file(source_path)
+
+    result = pipeline.analyze_file(
+        source_path,
+        ZdHdf5Reader(),
+        _profile(),
+        select_backend("cpu"),
+        tmp_path / "artifacts",
+        context,
+        _PredictingBundle(),
+    )
+
+    assert result.events[0].label == Label.TRAFFIC
+    assert captured[0].model_version == "7"
+    assert captured[0].model_output["probabilities"]["traffic"] == 0.97
+
+
+def test_pipeline_wraps_bound_model_prediction_errors(tmp_path, monkeypatch):
+    from das_sentinel import pipeline
+
+    class InvalidPredictingBundle:
+        def predict_probabilities(self, features):
+            del features
+            raise ValueError("invalid probabilities")
+
+    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
+    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
+    source_path = tmp_path / "source.h5"
+    _write_boundary_file(source_path)
+    context = pipeline.AnalysisContext(
+        model_version_id="model-a",
+        model_version="7",
+    )
+
+    with pytest.raises(pipeline.InvalidModelError, match="prediction"):
+        pipeline.analyze_file(
+            source_path,
+            ZdHdf5Reader(),
+            _profile(),
+            select_backend("cpu"),
+            tmp_path / "artifacts",
+            context,
+            InvalidPredictingBundle(),
+        )
 
 
 def test_pipeline_merges_cross_block_event_and_preserves_artifact_inputs(
@@ -617,6 +701,22 @@ def test_analysis_context_rejects_non_mapping_rule_profile():
 
     with pytest.raises(TypeError, match="rule_profile"):
         AnalysisContext(rule_profile=[])  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    ("model_version_id", "model_version"),
+    [("model-a", None), (None, "7")],
+)
+def test_analysis_context_rejects_partial_model_identity(
+    model_version_id, model_version
+):
+    from das_sentinel.pipeline import AnalysisContext
+
+    with pytest.raises(ValueError, match="provided together"):
+        AnalysisContext(
+            model_version_id=model_version_id,
+            model_version=model_version,
+        )
 
 
 def test_analysis_context_snapshots_canonical_rule_profile():

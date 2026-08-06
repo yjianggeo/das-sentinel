@@ -30,7 +30,13 @@ def _sessions(tmp_path: Path):
     return session_factory(engine)
 
 
-def _seed_site(sessions, *, per_label: int = 25, separable: bool = True) -> str:
+def _seed_site(
+    sessions,
+    *,
+    per_label: int = 25,
+    separable: bool = True,
+    include_context: bool = False,
+) -> str:
     """One site, one current profile, reviewed events across five days."""
     with sessions.begin() as session:
         repositories = Repositories(session)
@@ -72,6 +78,14 @@ def _seed_site(sessions, *, per_label: int = 25, separable: bool = True) -> str:
                     }
                 else:
                     features = {"duration_s": 1.0, "rms": 1.0}
+                if include_context:
+                    features.update(
+                        {
+                            "site_id": site.id,
+                            "cable_type": "borehole",
+                            "device_config": "cpu",
+                        }
+                    )
                 event = repositories.events.add(
                     run_id=run.id,
                     event_uid=f"{label}-{index}",
@@ -117,6 +131,21 @@ def test_training_creates_candidate_not_active(training_env):
             artifact_root.resolve()
         )
         assert Path(stored.artifact_path).exists()
+
+
+def test_training_service_preserves_context_strings_for_schema_boundary(
+    training_env,
+):
+    sessions, artifact_root = training_env
+    site_id = _seed_site(sessions, include_context=True)
+
+    with sessions.begin() as session:
+        model = TrainingService(session, artifact_root).train(site_id=site_id)
+
+    assert json.loads(model.metrics_json)["feature_names"] == [
+        "duration_s",
+        "rms",
+    ]
 
 
 def test_training_snapshot_is_deterministic_and_tracks_reviews(training_env):

@@ -52,6 +52,30 @@ def _rows(per_label: int) -> list[TrainingRow]:
     return rows
 
 
+@pytest.fixture
+def trained_bundle_bytes(tmp_path: Path):
+    rows = _rows(20)
+    bundle, _ = train_model(rows, groups=[row.day for row in rows])
+    path = tmp_path / "model.bundle"
+    save_model_bundle(bundle, path)
+    return path.read_bytes(), bundle.feature_names
+
+
+def test_load_model_bundle_bytes_verifies_expected_digest(
+    trained_bundle_bytes,
+):
+    from das_sentinel.classifiers import supervised
+
+    raw, feature_names = trained_bundle_bytes
+    digest = sha256(raw).hexdigest()
+
+    loaded = supervised.load_model_bundle_bytes(raw, feature_names, digest)
+
+    assert loaded.feature_names == tuple(feature_names)
+    with pytest.raises(ValueError, match="SHA-256"):
+        supervised.load_model_bundle_bytes(raw, feature_names, "0" * 64)
+
+
 def test_training_rejects_less_than_twenty_per_class():
     rows = _rows(15)
 

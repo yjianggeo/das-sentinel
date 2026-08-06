@@ -27,6 +27,7 @@ from das_sentinel.artifacts import (
 )
 from das_sentinel.classifiers.fusion import fuse_classification
 from das_sentinel.classifiers.rules import RuleResult, score_rules
+from das_sentinel.classifiers.supervised import ModelBundle
 from das_sentinel.config import ProcessingProfile
 from das_sentinel.detectors.coherence import detect_coherence
 from das_sentinel.detectors.energy import detect_energy
@@ -46,12 +47,19 @@ class SourceChangedError(RuntimeError):
     """Raised when source identity changes during one analysis run."""
 
 
+class InvalidModelError(RuntimeError):
+    """Raised when a bound supervised model cannot be safely used."""
+
+
 @dataclass(frozen=True)
 class AnalysisContext:
     site_id: str = "unknown-site"
     site_timezone: str = "UTC"
+    processing_profile_id: str = "unknown-profile"
     profile_version: str = "profile-v1"
     pipeline_version: str = "pipeline-v1"
+    model_version_id: str | None = None
+    model_version: str | None = None
     cable_type: str = "unknown"
     device_config: str = "unknown"
     rule_profile: Mapping[str, Any] = field(default_factory=dict)
@@ -61,6 +69,7 @@ class AnalysisContext:
         values = (
             self.site_id,
             self.site_timezone,
+            self.processing_profile_id,
             self.profile_version,
             self.pipeline_version,
             self.cable_type,
@@ -68,6 +77,8 @@ class AnalysisContext:
         )
         if any(not isinstance(value, str) or not value.strip() for value in values):
             raise ValueError("analysis context string fields must be non-empty")
+        if (self.model_version_id is None) != (self.model_version is None):
+            raise ValueError("model version ID and version must be provided together")
         try:
             ZoneInfo(self.site_timezone)
         except ZoneInfoNotFoundError as error:
@@ -141,6 +152,7 @@ def analyze_file(
     backend: ArrayBackend,
     artifact_root: str | Path,
     context: AnalysisContext | None = None,
+    model_bundle: ModelBundle | None = None,
 ) -> FileAnalysis:
     """Analyze one DAS file in overlapping blocks and render review artifacts."""
     reader_source: Path | BinaryIO
@@ -282,7 +294,35 @@ def analyze_file(
                     }
                 )
             )
-            decision = fuse_classification(rule_result.scores, None, quality_flags)
+            try:
+                model_probabilities = (
+                    None
+                    if model_bundle is None
+                    else model_bundle.predict_probabilities(features)
+                )
+            except Exception as error:
+                raise InvalidModelError(
+                    "bound model prediction failed"
+                ) from error
+            decision = fuse_classification(
+                rule_result.scores,
+                model_probabilities,
+                quality_flags,
+            )
+            model_output = None
+            if model_probabilities is not None:
+                model_output = {
+                    "model_version_id": run_context.model_version_id,
+                    "probabilities": {
+                        label.value: probability
+                        for label, probability in model_probabilities.items()
+                    },
+                    "fused_scores": {
+                        label.value: score
+                        for label, score in decision.scores.items()
+                    },
+                    "reasons": list(decision.reasons),
+                }
             classified = replace(
                 event,
                 features=dict(features),
@@ -306,10 +346,10 @@ def analyze_file(
                 profile=profile_payload,
                 profile_version=run_context.profile_version,
                 pipeline_version=run_context.pipeline_version,
-                model_version="rules-only",
+                model_version=run_context.model_version or "rules-only",
                 backend_name=backend.name,
                 rule_output=_rule_output(rule_result, run_context),
-                model_output=None,
+                model_output=model_output,
             )
             _ensure_source_unchanged(source, source_fingerprint)
             if transaction is None:

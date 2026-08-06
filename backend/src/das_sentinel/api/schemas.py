@@ -347,6 +347,7 @@ class WorkerResultRequest(StrictSchema):
     worker_id: WorkerId
     source_file_id: str = Field(min_length=1, max_length=36)
     processing_profile_id: str = Field(min_length=1, max_length=36)
+    model_version_id: str | None = Field(default=None, max_length=36)
     profile_version: StrictInt = Field(ge=1, le=2**31 - 1)
     pipeline_version: PipelineVersion
     source_fingerprint: str = Field(pattern=r"^[0-9a-f]{64}$")

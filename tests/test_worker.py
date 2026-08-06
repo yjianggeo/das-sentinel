@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import os
 import threading
+import zipfile
 from dataclasses import replace
 from datetime import UTC, datetime
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -133,6 +135,11 @@ def _claim(
     source_fingerprint: str | None = None,
     source_size_bytes: int | None = None,
     source_mtime_ns: int | None = None,
+    model_version_id: str | None = None,
+    model_version: str | None = None,
+    model_artifact_path: str | None = None,
+    model_bundle_sha256: str | None = None,
+    model_feature_names: tuple[str, ...] | None = None,
 ) -> WorkerClaim:
     stat_result = source.stat()
     return WorkerClaim(
@@ -154,11 +161,11 @@ def _claim(
         profile_version=3,
         profile_payload=(profile or ProcessingProfile()).model_dump(mode="json"),
         pipeline_version="pipeline-v1",
-        model_version_id=None,
-        model_version=None,
-        model_artifact_path=None,
-        model_bundle_sha256=None,
-        model_feature_names=None,
+        model_version_id=model_version_id,
+        model_version=model_version,
+        model_artifact_path=model_artifact_path,
+        model_bundle_sha256=model_bundle_sha256,
+        model_feature_names=model_feature_names,
         attempt_count=1,
         worker_id="worker-a",
     )
@@ -272,6 +279,27 @@ def test_http_client_maps_server_errors_to_transient(status: int) -> None:
     client = HttpxWorkerClient("http://api", "w" * 40, transport=transport)
     with pytest.raises(WorkerTransientError):
         client.claim("worker-1")
+
+
+def _unsupported_compression_bundle() -> bytes:
+    buffer = BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("metadata.json", b"{}")
+        archive.writestr("model.skops", b"invalid")
+    raw = bytearray(buffer.getvalue())
+    for signature, compression_offset in (
+        (b"PK\x03\x04", 8),
+        (b"PK\x01\x02", 10),
+    ):
+        offset = 0
+        while (member_offset := raw.find(signature, offset)) >= 0:
+            method_offset = member_offset + compression_offset
+            raw[method_offset : method_offset + 2] = (99).to_bytes(
+                2,
+                "little",
+            )
+            offset = member_offset + len(signature)
+    return bytes(raw)
 
 
 @pytest.mark.parametrize("error_type", [httpx.ConnectError, httpx.ReadTimeout])
@@ -950,6 +978,55 @@ def test_worker_claim_rejects_partial_model_binding(tmp_path: Path):
         WorkerClaim.from_dict(payload)
 
 
+@pytest.mark.parametrize(
+    "raw_model",
+    [b"corrupt", _unsupported_compression_bundle()],
+    ids=("invalid-zip", "unsupported-compression"),
+)
+def test_bound_corrupt_model_fails_without_rules_fallback(
+    tmp_path: Path,
+    raw_model: bytes,
+):
+    source = tmp_path / "input.h5"
+    source.write_bytes(b"stable")
+    settings = _settings(tmp_path)
+    model_path = (
+        settings.app_data_dir
+        / "artifacts"
+        / "models"
+        / "model-1.bundle"
+    )
+    model_path.parent.mkdir(parents=True)
+    model_path.write_bytes(raw_model)
+    claim = _claim(
+        source,
+        model_version_id="model-1",
+        model_version="1",
+        model_artifact_path=str(model_path),
+        model_bundle_sha256=hashlib.sha256(raw_model).hexdigest(),
+        model_feature_names=("duration_s", "rms"),
+    )
+    protocol = FakeProtocol([claim])
+
+    def reject_rules_fallback(*args):
+        del args
+        raise RuntimeError("corrupt model used rules fallback")
+
+    worker = _worker(
+        tmp_path,
+        protocol,
+        reject_rules_fallback,
+        settings=settings,
+    )
+
+    outcome = worker.run_once()
+
+    assert outcome.error_code == "invalid_model"
+    assert protocol.heartbeats
+    assert protocol.failures[0][4] is False
+    assert protocol.results == []
+
+
 def test_result_payload_is_json_serializable_with_numpy_scalars(tmp_path):
     import json
 
@@ -1006,6 +1083,53 @@ def test_result_payload_is_json_serializable_with_numpy_scalars(tmp_path):
 
     encoded = json.dumps(payload)
     assert "event-1" in encoded
+
+
+def test_bound_model_result_payload_uses_one_model_identity_and_fusion_method(
+    tmp_path: Path,
+):
+    from das_sentinel.api.schemas import WorkerResultRequest
+    from das_sentinel.worker.main import _result_payload
+
+    source = tmp_path / "source.h5"
+    source.write_bytes(b"payload-test")
+    model_path = (
+        tmp_path
+        / "app-data"
+        / "artifacts"
+        / "models"
+        / "site-1"
+        / "7"
+        / "model.bundle"
+    )
+    model_path.parent.mkdir(parents=True)
+    claim = _claim(
+        source,
+        model_version_id="model-7",
+        model_version="7",
+        model_artifact_path=str(model_path),
+        model_bundle_sha256="7" * 64,
+        model_feature_names=("duration_s", "rms"),
+    )
+    analysis = _analysis(
+        source,
+        ArrayBackend("cpu", np),
+        tmp_path / "artifacts",
+    )
+
+    payload = _result_payload(
+        claim,
+        datetime(2026, 7, 30, tzinfo=UTC),
+        1000.0,
+        analysis,
+        requested_backend="cpu",
+        actual_backend="cpu",
+        fallback_reason=None,
+    )
+    validated = WorkerResultRequest.model_validate(payload)
+
+    assert validated.model_version_id == "model-7"
+    assert validated.events[0].classification.method == "fusion"
 
 
 def test_internal_result_schema_accepts_string_feature_values():

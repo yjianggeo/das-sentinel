@@ -487,6 +487,29 @@ def _claim_result_job(event_api):
     return job_id, _result_payload(ids, source_path)
 
 
+def _seed_active_result_model(event_api) -> str:
+    _, settings, sessions, _, ids = event_api
+    model_path = (
+        settings.app_data_dir
+        / "artifacts"
+        / "models"
+        / ids["site_a"]
+        / "7"
+        / "model.bundle"
+    )
+    with sessions.begin() as session:
+        model = Repositories(session).models.add(
+            site_id=ids["site_a"],
+            version="7",
+            artifact_path=str(model_path),
+            bundle_sha256="7" * 64,
+            status="active",
+            metrics={"feature_names": ["duration_s", "rms"]},
+        )
+        model_id = model.id
+    return model_id
+
+
 def test_internal_result_persists_complete_audit_graph_atomically(event_api):
     client, _, sessions, _, ids = event_api
     job_id, payload = _claim_result_job(event_api)
@@ -526,6 +549,69 @@ def test_internal_result_persists_complete_audit_graph_atomically(event_api):
             select(func.count()).select_from(Artifact)
             .where(Artifact.event_id == event.id)
         ) == 6
+
+
+def test_bound_model_result_persists_one_identity_and_fusion_method(event_api):
+    client, _, sessions, _, _ = event_api
+    model_id = _seed_active_result_model(event_api)
+    job_id, payload = _claim_result_job(event_api)
+    payload["model_version_id"] = model_id
+    payload["events"][0]["classification"]["method"] = "fusion"
+
+    response = client.post(
+        f"/api/v1/internal/jobs/{job_id}/result",
+        json=payload,
+        headers={"X-Worker-Token": WORKER_TOKEN},
+    )
+
+    assert response.status_code == 200
+    with sessions() as session:
+        run = session.scalar(
+            select(ProcessingRun).where(ProcessingRun.job_id == job_id)
+        )
+        assert run is not None
+        classification = session.scalar(
+            select(Classification)
+            .join(Event)
+            .where(Event.processing_run_id == run.id)
+        )
+        assert classification is not None
+        assert run.model_version_id == model_id
+        assert classification.model_version_id == model_id
+        assert classification.method == "fusion"
+
+
+def test_result_rejects_payload_model_identity_mismatch(event_api):
+    client, _, sessions, _, _ = event_api
+    job_id, payload = _claim_result_job(event_api)
+    payload["model_version_id"] = "00000000-0000-0000-0000-000000000007"
+    payload["events"][0]["classification"]["method"] = "fusion"
+
+    response = client.post(
+        f"/api/v1/internal/jobs/{job_id}/result",
+        json=payload,
+        headers={"X-Worker-Token": WORKER_TOKEN},
+    )
+
+    assert response.status_code == 409
+    with sessions() as session:
+        assert session.get(Job, job_id).status == "running"
+
+
+def test_result_rejects_method_without_model_identity(event_api):
+    client, _, sessions, _, _ = event_api
+    job_id, payload = _claim_result_job(event_api)
+    payload["events"][0]["classification"]["method"] = "fusion"
+
+    response = client.post(
+        f"/api/v1/internal/jobs/{job_id}/result",
+        json=payload,
+        headers={"X-Worker-Token": WORKER_TOKEN},
+    )
+
+    assert response.status_code == 422
+    with sessions() as session:
+        assert session.get(Job, job_id).status == "running"
 
 
 def test_rejected_result_rolls_back_every_row_and_keeps_job_running(event_api):

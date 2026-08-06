@@ -112,6 +112,7 @@ class ResultService:
         now = utc_now()
         run = self.repositories.runs.add(
             job_id=job.id,
+            model_version_id=payload.model_version_id,
             source_file_id=source.id,
             processing_profile_id=profile.id,
             pipeline_version=job.pipeline_version,
@@ -153,6 +154,7 @@ class ResultService:
                 decision_score=classification.decision_score,
                 method=classification.method,
                 reasons=classification.reasons,
+                model_version_id=payload.model_version_id,
             )
         if set(persisted_events) != set(events_by_uid):
             raise JobValidationError("result event identities are inconsistent")
@@ -187,12 +189,24 @@ class ResultService:
             raise JobConflictError("source file does not match claimed job")
         if payload.processing_profile_id != profile.id:
             raise JobConflictError("processing profile does not match claimed job")
+        if payload.model_version_id != job.model_version_id:
+            raise JobConflictError("model version does not match claimed job")
         if payload.profile_version != profile.version:
             raise JobConflictError("profile version does not match claimed job")
         if payload.pipeline_version != job.pipeline_version:
             raise JobConflictError("pipeline version does not match claimed job")
         if payload.source_fingerprint != source.fingerprint:
             raise JobConflictError("source fingerprint does not match claimed job")
+        expected_method = (
+            "fusion" if payload.model_version_id is not None else "rules"
+        )
+        if any(
+            event.classification.method != expected_method
+            for event in payload.events
+        ):
+            raise JobValidationError(
+                "classification method does not match model identity"
+            )
         if (
             payload.actual_backend == "cuda"
             and payload.backend_fallback_reason is not None

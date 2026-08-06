@@ -13,11 +13,17 @@ from typing import Any, Protocol
 import httpx
 import numpy as np
 
+from das_sentinel.classifiers.supervised import (
+    _MAX_BUNDLE_BYTES,
+    ModelBundle,
+    load_model_bundle_bytes,
+)
 from das_sentinel.config import ProcessingProfile, Settings
 from das_sentinel.pipeline import (
     AnalysisContext,
     BoundSource,
     FileAnalysis,
+    InvalidModelError,
     SourceChangedError,
     analyze_file,
 )
@@ -401,6 +407,42 @@ class Worker:
                 self.readers.resolve(bound_source.stream),
             )
 
+    def _load_bound_model(self, claim: WorkerClaim) -> ModelBundle | None:
+        binding = (
+            claim.model_version_id,
+            claim.model_version,
+            claim.model_artifact_path,
+            claim.model_bundle_sha256,
+            claim.model_feature_names,
+        )
+        if all(value is None for value in binding):
+            return None
+        if any(value is None for value in binding):
+            raise ValueError("all claim model binding fields must be present")
+        try:
+            model_root = (
+                self.settings.app_data_dir / "artifacts" / "models"
+            ).resolve(strict=True)
+            model_path = Path(claim.model_artifact_path)
+            with _open_anchored_source(
+                model_root,
+                model_path,
+                required_suffix=".bundle",
+            ) as anchored:
+                size_bytes = anchored.snapshot().size_bytes
+                if size_bytes > _MAX_BUNDLE_BYTES:
+                    raise ValueError("model bundle is too large")
+                raw = anchored.stream.read(_MAX_BUNDLE_BYTES)
+                if len(raw) != size_bytes:
+                    raise ValueError("model bundle could not be read completely")
+                return load_model_bundle_bytes(
+                    raw,
+                    claim.model_feature_names,
+                    claim.model_bundle_sha256,
+                )
+        except Exception as error:
+            raise InvalidModelError("bound model is invalid") from error
+
     def _analyze(
         self,
         claim: WorkerClaim,
@@ -424,37 +466,41 @@ class Worker:
         ):
             fallback_reason = "cuda_unavailable"
 
+        model_bundle = self._load_bound_model(claim)
         context = AnalysisContext(
             site_id=claim.site_id,
             site_timezone=claim.site_timezone,
+            processing_profile_id=claim.processing_profile_id,
             profile_version=str(claim.profile_version),
             pipeline_version=claim.pipeline_version,
+            model_version_id=claim.model_version_id,
+            model_version=claim.model_version,
             cable_type=claim.cable_type,
             device_config=requested_backend,
         )
-        try:
-            result = self.analyzer(
+
+        def analyze_with(selected_backend: ArrayBackend) -> FileAnalysis:
+            arguments = (
                 source,
                 reader,
                 profile,
-                backend,
+                selected_backend,
                 self.settings.app_data_dir / "artifacts",
                 context,
             )
+            if model_bundle is None:
+                return self.analyzer(*arguments)
+            return self.analyzer(*arguments, model_bundle)
+
+        try:
+            result = analyze_with(backend)
             return result, backend.name, fallback_reason
         except Exception as error:
             if backend.name != "cuda" or not _is_cuda_out_of_memory(error):
                 raise
             backend.clear_cache()
             cpu = self.backend_selector("cpu")
-            result = self.analyzer(
-                source,
-                reader,
-                profile,
-                cpu,
-                self.settings.app_data_dir / "artifacts",
-                context,
-            )
+            result = analyze_with(cpu)
             return result, "cpu", "cuda_out_of_memory"
 
     def _start_heartbeat(self, claim: WorkerClaim) -> None:
@@ -544,6 +590,8 @@ def _is_cuda_out_of_memory(error: BaseException) -> bool:
 
 
 def _failure_code(error: BaseException) -> str:
+    if isinstance(error, InvalidModelError):
+        return "invalid_model"
     if isinstance(error, ResultSubmissionError):
         return "persistence_failed"
     if isinstance(error, SourceChangedError):
@@ -554,7 +602,10 @@ def _failure_code(error: BaseException) -> str:
 
 
 def _failure_retry_eligible(error: BaseException) -> bool:
-    return not isinstance(error, (SourceChangedError, ValueError, TypeError))
+    return not isinstance(
+        error,
+        (InvalidModelError, SourceChangedError, ValueError, TypeError),
+    )
 
 
 def _json_safe(value: Any) -> Any:
@@ -620,7 +671,11 @@ def _result_payload(
                 "classification": {
                     "label": event.label.value,
                     "decision_score": event.decision_score,
-                    "method": "rules",
+                    "method": (
+                        "fusion"
+                        if claim.model_version_id is not None
+                        else "rules"
+                    ),
                     "reasons": list(event.reasons),
                 },
             }
@@ -629,6 +684,7 @@ def _result_payload(
         "worker_id": claim.worker_id,
         "source_file_id": claim.source_file_id,
         "processing_profile_id": claim.processing_profile_id,
+        "model_version_id": claim.model_version_id,
         "profile_version": claim.profile_version,
         "pipeline_version": claim.pipeline_version,
         "source_fingerprint": claim.source_fingerprint,
