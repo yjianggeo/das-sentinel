@@ -165,6 +165,9 @@ class Job(Base):
     processing_profile_id: Mapped[str] = mapped_column(
         ForeignKey("processing_profiles.id")
     )
+    model_version_id: Mapped[str | None] = mapped_column(
+        ForeignKey("model_versions.id"), nullable=True
+    )
     pipeline_version: Mapped[str] = mapped_column(String(128))
     status: Mapped[str] = mapped_column(String(16), default="queued")
     attempt_count: Mapped[int] = mapped_column(Integer, default=0)
@@ -333,10 +336,12 @@ class Review(Base):
             name="ck_review_label",
         ),
         Index("ix_reviews_event_created", "event_id", "created_at", "id"),
+        Index("uq_review_event_request", "event_id", "request_id", unique=True),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     event_id: Mapped[str] = mapped_column(ForeignKey("events.id"))
+    request_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     admin_id: Mapped[int | None] = mapped_column(ForeignKey("admins.id"), nullable=True)
     label: Mapped[str] = mapped_column(String(16))
     note: Mapped[str | None] = mapped_column(Text, nullable=True)

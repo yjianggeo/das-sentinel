@@ -10,11 +10,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
+from das_sentinel.classifiers.similarity import FeatureVectorizer
 from das_sentinel.persistence.models import (
     Job,
+    ModelVersion,
     ProcessingProfile,
     Site,
     SourceFile,
@@ -82,6 +84,11 @@ class JobClaim:
     profile_version: int
     profile_payload: Mapping[str, Any]
     pipeline_version: str
+    model_version_id: str | None
+    model_version: str | None
+    model_artifact_path: str | None
+    model_bundle_sha256: str | None
+    model_feature_names: tuple[str, ...] | None
     attempt_count: int
     worker_id: str
     heartbeat_at: datetime
@@ -133,6 +140,13 @@ class JobService:
                 Job.source_file_id == source.id,
                 Job.processing_profile_id == profile.id,
                 Job.pipeline_version == pipeline_version,
+                or_(
+                    Job.status.in_(("queued", "running", "succeeded")),
+                    and_(
+                        Job.status == "failed",
+                        Job.retry_eligible.is_(True),
+                    ),
+                ),
             )
             .order_by(Job.created_at, Job.id)
         )
@@ -183,6 +197,26 @@ class JobService:
         if row is None:
             return None
 
+        if row.attempt_count == 0:
+            source = self.session.get(SourceFile, row.source_file_id)
+            if source is None:
+                raise JobNotFoundError(
+                    f"source file not found: {row.source_file_id}"
+                )
+            active_model = self.session.scalars(
+                select(ModelVersion)
+                .where(
+                    ModelVersion.site_id == source.site_id,
+                    ModelVersion.status == "active",
+                )
+                .order_by(
+                    ModelVersion.published_at.desc(),
+                    ModelVersion.id.desc(),
+                )
+            ).first()
+            row.model_version_id = (
+                active_model.id if active_model is not None else None
+            )
         row.status = "running"
         row.attempt_count += 1
         row.worker_id = worker_id
@@ -403,6 +437,27 @@ class JobService:
         if row.worker_id is None or row.heartbeat_at is None:
             raise RuntimeError("claimed job is missing worker ownership")
         payload = freeze_json(json.loads(profile.payload_json))
+        model = None
+        model_feature_names = None
+        if row.model_version_id is not None:
+            model = self.session.get(ModelVersion, row.model_version_id)
+            if model is None:
+                raise JobNotFoundError(
+                    f"model version not found: {row.model_version_id}"
+                )
+            if model.site_id != source.site_id:
+                raise JobValidationError(
+                    "bound model and source file belong to different sites"
+                )
+            try:
+                metrics = json.loads(model.metrics_json)
+                model_feature_names = FeatureVectorizer(
+                    metrics["feature_names"]
+                ).feature_names
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as error:
+                raise JobValidationError(
+                    "bound model has an invalid feature schema"
+                ) from error
         return JobClaim(
             id=row.id,
             source_file_id=source.id,
@@ -418,6 +473,11 @@ class JobService:
             profile_version=profile.version,
             profile_payload=payload,
             pipeline_version=row.pipeline_version,
+            model_version_id=None if model is None else model.id,
+            model_version=None if model is None else model.version,
+            model_artifact_path=None if model is None else model.artifact_path,
+            model_bundle_sha256=None if model is None else model.bundle_sha256,
+            model_feature_names=model_feature_names,
             attempt_count=row.attempt_count,
             worker_id=row.worker_id,
             heartbeat_at=row.heartbeat_at,

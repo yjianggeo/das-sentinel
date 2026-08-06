@@ -188,6 +188,45 @@ def test_initial_migration_creates_all_tables_and_is_idempotent(tmp_path):
         engine.dispose()
 
 
+def test_hardening_migration_adds_model_binding_and_review_idempotency(
+    migrated_engine,
+):
+    inspector = inspect(migrated_engine)
+    job_columns = {
+        item["name"]: item for item in inspector.get_columns("jobs")
+    }
+    review_columns = {item["name"] for item in inspector.get_columns("reviews")}
+    review_indexes = {
+        tuple(item["column_names"]): item["unique"]
+        for item in inspector.get_indexes("reviews")
+    }
+    with migrated_engine.connect() as connection:
+        review_triggers = set(
+            connection.exec_driver_sql(
+                "SELECT name FROM sqlite_master "
+                "WHERE type = 'trigger' AND tbl_name = 'reviews'"
+            ).scalars()
+        )
+
+    job_foreign_keys = {
+        (
+            tuple(item["constrained_columns"]),
+            item["referred_table"],
+            tuple(item["referred_columns"]),
+        )
+        for item in inspector.get_foreign_keys("jobs")
+    }
+
+    assert job_columns["model_version_id"]["nullable"] is True
+    assert (("model_version_id",), "model_versions", ("id",)) in job_foreign_keys
+    assert "request_id" in review_columns
+    assert review_indexes[("event_id", "request_id")]
+    assert review_triggers >= {
+        "reviews_append_only_update",
+        "reviews_append_only_delete",
+    }
+
+
 def test_schema_has_no_foreign_key_dependency_cycle():
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")

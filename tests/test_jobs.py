@@ -17,12 +17,21 @@ from das_sentinel.persistence import (
 from das_sentinel.persistence.models import Job
 from das_sentinel.services.jobs import (
     MAX_SQLITE_INTEGER,
+    STALE_AFTER,
     JobConflictError,
     JobNotFoundError,
     JobService,
     JobValidationError,
 )
 from sqlalchemy import func, select
+
+
+@pytest.fixture(autouse=True)
+def safe_sqlite_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "das_sentinel.persistence.db.validate_selected_sqlite_runtime",
+        lambda: (3, 53, 3),
+    )
 
 
 @pytest.fixture
@@ -75,6 +84,25 @@ def test_enqueue_is_idempotent_for_source_profile_pipeline(job_database):
 
         assert second.id == first.id
         assert service.list() == [first]
+
+
+def test_enqueue_creates_new_job_after_nonretryable_failure(job_database):
+    with seeded_service(job_database) as (service, _, _, profile, source):
+        original = service.enqueue(source.id, profile.id, "pipeline-v1")
+        claim = service.claim("worker-a")
+        assert claim is not None
+        service.fail(
+            claim.id,
+            "worker-a",
+            error_code="invalid_model",
+            error_message="bundle digest mismatch",
+            retry_eligible=False,
+        )
+
+        replacement = service.enqueue(source.id, profile.id, "pipeline-v1")
+
+        assert replacement.id != original.id
+        assert replacement.attempt_count == 0
 
 
 def test_enqueue_requires_enabled_matching_site(job_database):
@@ -172,6 +200,86 @@ def test_claim_selects_oldest_and_returns_deeply_immutable_snapshot(job_database
         assert claim.profile_payload["bands"] == ((1, 4), (4, 20))
         with pytest.raises(TypeError):
             claim.profile_payload["device"] = "cpu"
+
+
+def test_first_claim_binds_active_model_and_stale_reclaim_keeps_it(job_database):
+    with seeded_service(job_database) as (service, repositories, site, profile, source):
+        active = repositories.models.add(
+            site_id=site.id,
+            version="7",
+            artifact_path=str(
+                service.artifact_root
+                / "models"
+                / site.id
+                / "7"
+                / "model.bundle"
+            ),
+            bundle_sha256="7" * 64,
+            status="active",
+            metrics={"feature_names": ["duration_s", "rms"]},
+        )
+        queued = service.enqueue(source.id, profile.id, "pipeline-v1")
+        first = service.claim("worker-a")
+        assert first is not None
+        assert first.id == queued.id
+        assert first.model_version_id == active.id
+        assert first.model_version == "7"
+        assert first.model_artifact_path == active.artifact_path
+        assert first.model_bundle_sha256 == active.bundle_sha256
+        assert first.model_feature_names == ("duration_s", "rms")
+        service.recover_stale(
+            now=first.heartbeat_at + STALE_AFTER + timedelta(seconds=1)
+        )
+        repositories.models.set_status(active.id, status="retired")
+        repositories.models.add(
+            site_id=site.id,
+            version="8",
+            artifact_path=str(
+                service.artifact_root
+                / "models"
+                / site.id
+                / "8"
+                / "model.bundle"
+            ),
+            bundle_sha256="8" * 64,
+            status="active",
+            metrics={"feature_names": ["duration_s", "rms"]},
+        )
+        second = service.claim("worker-b")
+        assert second is not None
+        assert second.model_version_id == active.id
+
+
+def test_first_claim_without_active_model_stays_rules_only_after_reclaim(job_database):
+    with seeded_service(job_database) as (service, repositories, site, profile, source):
+        service.enqueue(source.id, profile.id, "pipeline-v1")
+        first = service.claim("worker-a")
+        assert first is not None
+        assert first.model_version_id is None
+        assert first.model_version is None
+        assert first.model_artifact_path is None
+        assert first.model_bundle_sha256 is None
+        assert first.model_feature_names is None
+        service.recover_stale(
+            now=first.heartbeat_at + STALE_AFTER + timedelta(seconds=1)
+        )
+        repositories.models.add(
+            site_id=site.id,
+            version="1",
+            artifact_path=str(
+                service.artifact_root
+                / "models"
+                / site.id
+                / "1"
+                / "model.bundle"
+            ),
+            bundle_sha256="1" * 64,
+            status="active",
+            metrics={"feature_names": ["duration_s", "rms"]},
+        )
+        second = service.claim("worker-b")
+        assert second is not None
+        assert second.model_version_id is None
 
 
 def test_only_one_worker_claims_job(job_database):

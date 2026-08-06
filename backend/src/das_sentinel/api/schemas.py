@@ -202,9 +202,29 @@ class JobClaimResponse(StrictSchema):
     profile_version: int
     profile_payload: dict[str, Any]
     pipeline_version: str
+    model_version_id: str | None
+    model_version: str | None
+    model_artifact_path: str | None
+    model_bundle_sha256: str | None
+    model_feature_names: tuple[str, ...] | None
     attempt_count: int
     worker_id: str
     heartbeat_at: datetime
+
+    @model_validator(mode="after")
+    def validate_model_binding(self) -> JobClaimResponse:
+        values = (
+            self.model_version_id,
+            self.model_version,
+            self.model_artifact_path,
+            self.model_bundle_sha256,
+            self.model_feature_names,
+        )
+        if any(value is None for value in values) and not all(
+            value is None for value in values
+        ):
+            raise ValueError("all model binding fields must be present or absent")
+        return self
 
 
 class WorkerHeartbeatRequest(StrictSchema):

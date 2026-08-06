@@ -195,6 +195,22 @@ def test_enqueue_claim_heartbeat_complete_protocol_and_no_token_leak(api_client)
     assert claim.json()["site_data_root"] == str(settings.data_root)
     assert claim.json()["profile_version"] == 4
     assert claim.json()["profile_payload"] == {"device": "auto"}
+    assert {
+        name: claim.json()[name]
+        for name in (
+            "model_version_id",
+            "model_version",
+            "model_artifact_path",
+            "model_bundle_sha256",
+            "model_feature_names",
+        )
+    } == {
+        "model_version_id": None,
+        "model_version": None,
+        "model_artifact_path": None,
+        "model_bundle_sha256": None,
+        "model_feature_names": None,
+    }
 
     heartbeat = client.post(
         f"/api/v1/internal/jobs/{job_id}/heartbeat",
@@ -223,6 +239,50 @@ def test_enqueue_claim_heartbeat_complete_protocol_and_no_token_leak(api_client)
     exposed = created.text + claim.text + heartbeat.text + completed.text
     assert WORKER_TOKEN not in exposed
     assert "worker_token" not in exposed
+
+
+def test_claim_response_serializes_complete_model_binding(api_client):
+    client, settings, token, source_id, profile_id = api_client
+    with client.app.state.session_factory.begin() as session:
+        repositories = Repositories(session)
+        source = repositories.source_files.get(source_id)
+        assert source is not None
+        model = repositories.models.add(
+            site_id=source.site_id,
+            version="7",
+            artifact_path=str(settings.app_data_dir / "models" / "model.bundle"),
+            bundle_sha256="7" * 64,
+            status="active",
+            metrics={"feature_names": ["duration_s", "rms"]},
+        )
+        model_id = model.id
+
+    _enqueue(client, token, source_id, profile_id)
+    response = client.post(
+        "/api/v1/internal/jobs/claim",
+        json={"worker_id": "worker-a"},
+        headers={"X-Worker-Token": WORKER_TOKEN},
+    )
+
+    assert response.status_code == 200
+    assert {
+        name: response.json()[name]
+        for name in (
+            "model_version_id",
+            "model_version",
+            "model_artifact_path",
+            "model_bundle_sha256",
+            "model_feature_names",
+        )
+    } == {
+        "model_version_id": model_id,
+        "model_version": "7",
+        "model_artifact_path": str(
+            settings.app_data_dir / "models" / "model.bundle"
+        ),
+        "model_bundle_sha256": "7" * 64,
+        "model_feature_names": ["duration_s", "rms"],
+    }
 
 
 def test_claim_recovers_stale_job_without_api_restart(api_client) -> None:

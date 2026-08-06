@@ -65,6 +65,11 @@ class WorkerClaim:
     profile_version: int
     profile_payload: dict[str, Any]
     pipeline_version: str
+    model_version_id: str | None
+    model_version: str | None
+    model_artifact_path: str | None
+    model_bundle_sha256: str | None
+    model_feature_names: tuple[str, ...] | None
     attempt_count: int
     worker_id: str
     heartbeat_at: datetime = datetime(2026, 1, 1, tzinfo=UTC)
@@ -89,6 +94,11 @@ class WorkerClaim:
             profile_version=parsed.profile_version,
             profile_payload=parsed.profile_payload,
             pipeline_version=parsed.pipeline_version,
+            model_version_id=parsed.model_version_id,
+            model_version=parsed.model_version,
+            model_artifact_path=parsed.model_artifact_path,
+            model_bundle_sha256=parsed.model_bundle_sha256,
+            model_feature_names=parsed.model_feature_names,
             attempt_count=parsed.attempt_count,
             worker_id=parsed.worker_id,
             heartbeat_at=parsed.heartbeat_at,

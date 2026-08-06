@@ -154,6 +154,11 @@ def _claim(
         profile_version=3,
         profile_payload=(profile or ProcessingProfile()).model_dump(mode="json"),
         pipeline_version="pipeline-v1",
+        model_version_id=None,
+        model_version=None,
+        model_artifact_path=None,
+        model_bundle_sha256=None,
+        model_feature_names=None,
         attempt_count=1,
         worker_id="worker-a",
     )
@@ -918,6 +923,31 @@ def test_http_client_uses_only_worker_token_header_and_strict_claim_validation(
     assert seen[0].headers["x-worker-token"] == "top-secret"
     assert "cookie" not in seen[0].headers
     assert "top-secret" not in repr(client)
+
+
+def test_worker_claim_model_binding_round_trips(tmp_path: Path):
+    source = tmp_path / "input.h5"
+    source.write_bytes(b"stable")
+    bound = replace(
+        _claim(source),
+        model_version_id="model-7",
+        model_version="7",
+        model_artifact_path="C:/models/7/model.bundle",
+        model_bundle_sha256="7" * 64,
+        model_feature_names=("duration_s", "rms"),
+    )
+
+    assert WorkerClaim.from_dict(bound.to_dict()) == bound
+
+
+def test_worker_claim_rejects_partial_model_binding(tmp_path: Path):
+    source = tmp_path / "input.h5"
+    source.write_bytes(b"stable")
+    payload = _claim(source).to_dict()
+    payload["model_version_id"] = "model-7"
+
+    with pytest.raises(ValueError, match="all model binding fields"):
+        WorkerClaim.from_dict(payload)
 
 
 def test_result_payload_is_json_serializable_with_numpy_scalars(tmp_path):
