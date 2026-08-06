@@ -4,8 +4,12 @@ import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import numpy as np
 import pytest
+from das_sentinel.classifiers.similarity import FeatureVectorizer
 from das_sentinel.config import ProcessingProfile
+from das_sentinel.domain import EventRecord
+from das_sentinel.features import extract_features
 from das_sentinel.persistence import (
     Repositories,
     create_local_engine,
@@ -20,7 +24,36 @@ from das_sentinel.services.training import (
 )
 from sqlalchemy import select
 
+from tests.synthetic import preprocessed_block
+
 LABELS = ("earthquake", "blast", "traffic", "noise")
+
+
+def _real_training_features(site_id: str, label_index: int, index: int):
+    block = preprocessed_block(
+        np.tile(np.linspace(-1.0, 1.0, 80, dtype=np.float32)[:, None], (1, 4))
+    )
+    event = EventRecord(
+        event_id=f"feature-{label_index}-{index}",
+        start_sample=1_010,
+        end_sample=1_070,
+        peak_sample=1_040,
+        channel_start=0,
+        channel_stop=4,
+        evidence=(),
+    )
+    features = extract_features(
+        block,
+        event,
+        context={
+            "site_id": site_id,
+            "cable_type": "urban",
+            "device_config": "cpu",
+        },
+    )
+    features["duration_s"] = label_index * 100.0 + index
+    features["rms"] = label_index + index / 100.0
+    return features
 
 
 def _sessions(tmp_path: Path):
@@ -35,7 +68,6 @@ def _seed_site(
     *,
     per_label: int = 25,
     separable: bool = True,
-    include_context: bool = False,
 ) -> str:
     """One site, one current profile, reviewed events across five days."""
     with sessions.begin() as session:
@@ -45,7 +77,7 @@ def _seed_site(
             name="site-a",
             data_path="/data",
             timezone="UTC",
-            cable_type="borehole",
+            cable_type="urban",
         )
         profile = repositories.profiles.add(
             site_id=site.id,
@@ -71,21 +103,10 @@ def _seed_site(
         base = datetime(2026, 7, 1, tzinfo=UTC)
         for label_index, label in enumerate(LABELS):
             for index in range(per_label):
-                if separable:
-                    features = {
-                        "duration_s": label_index * 100.0 + index,
-                        "rms": label_index + index / 100.0,
-                    }
-                else:
-                    features = {"duration_s": 1.0, "rms": 1.0}
-                if include_context:
-                    features.update(
-                        {
-                            "site_id": site.id,
-                            "cable_type": "borehole",
-                            "device_config": "cpu",
-                        }
-                    )
+                features = _real_training_features(site.id, label_index, index)
+                if not separable:
+                    features["duration_s"] = 1.0
+                    features["rms"] = 1.0
                 event = repositories.events.add(
                     run_id=run.id,
                     event_uid=f"{label}-{index}",
@@ -133,19 +154,16 @@ def test_training_creates_candidate_not_active(training_env):
         assert Path(stored.artifact_path).exists()
 
 
-def test_training_service_preserves_context_strings_for_schema_boundary(
-    training_env,
-):
+def test_reviewed_rows_keep_extract_features_string_context(training_env):
     sessions, artifact_root = training_env
-    site_id = _seed_site(sessions, include_context=True)
+    site_id = _seed_site(sessions)
 
-    with sessions.begin() as session:
-        model = TrainingService(session, artifact_root).train(site_id=site_id)
+    with sessions() as session:
+        rows = TrainingService(session, artifact_root)._reviewed_rows(site_id)
 
-    assert json.loads(model.metrics_json)["feature_names"] == [
-        "duration_s",
-        "rms",
-    ]
+    assert rows[0].features["site_id"] == site_id
+    assert rows[0].features["cable_type"] == "urban"
+    FeatureVectorizer().transform(row.features for row in rows)
 
 
 def test_training_snapshot_is_deterministic_and_tracks_reviews(training_env):

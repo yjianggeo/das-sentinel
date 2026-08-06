@@ -170,7 +170,7 @@ def similar_events(
             SimpleNamespace(
                 event_id=peer.id,
                 features={
-                    str(name): float(value)
+                    str(name): value
                     for name, value in json.loads(peer.features_json).items()
                 },
             )
@@ -180,7 +180,7 @@ def similar_events(
             index = SimilarityIndex().fit(peers)
             result = index.query(
                 {
-                    str(name): float(value)
+                    str(name): value
                     for name, value in json.loads(event.features_json).items()
                 },
                 limit=limit + 1,

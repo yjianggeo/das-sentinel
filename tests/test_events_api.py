@@ -7,10 +7,13 @@ from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from datetime import UTC, datetime
 from pathlib import Path
 
+import numpy as np
 import pytest
 from argon2 import PasswordHasher
 from das_sentinel.api import create_app
 from das_sentinel.config import ProcessingProfile, Settings
+from das_sentinel.domain import EventRecord
+from das_sentinel.features import extract_features
 from das_sentinel.persistence import (
     Repositories,
     create_local_engine,
@@ -32,8 +35,65 @@ from fastapi.testclient import TestClient
 from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import func, select
 
+from tests.synthetic import preprocessed_block
+
 PASSWORD = "correct horse"
 WORKER_TOKEN = "worker-token-" + "x" * 32
+
+
+def _seed_events_with_extract_features_output(event_api, count: int) -> str:
+    client, _, sessions, _, ids = event_api
+    del client
+    block = preprocessed_block(
+        np.tile(np.linspace(-1.0, 1.0, 80, dtype=np.float32)[:, None], (1, 4))
+    )
+    record = EventRecord(
+        event_id="feature-template",
+        start_sample=1_010,
+        end_sample=1_070,
+        peak_sample=1_040,
+        channel_start=0,
+        channel_stop=4,
+        evidence=(),
+    )
+    template = extract_features(
+        block,
+        record,
+        context={
+            "site_id": ids["site_a"],
+            "cable_type": "urban",
+            "device_config": "cpu",
+        },
+    )
+    created = []
+    with sessions.begin() as session:
+        repositories = Repositories(session)
+        for index in range(count):
+            event = repositories.events.add(
+                run_id=ids["run_a"],
+                event_uid=f"real-feature-{index}",
+                start_sample=100 + index * 10,
+                end_sample=105 + index * 10,
+                channel_start=0,
+                channel_stop=4,
+                occurred_at=datetime(2026, 8, 1, 0, index, tzinfo=UTC),
+                features={**template, "rms": float(index + 1)},
+            )
+            repositories.events.add_classification(
+                event.id, label="traffic", decision_score=0.9, method="rules"
+            )
+            created.append(event.id)
+    return created[0]
+
+
+def test_similar_events_accept_real_string_context_features(event_api):
+    client, _, _, _, _ = event_api
+    event_id = _seed_events_with_extract_features_output(event_api, count=6)
+
+    response = client.get(f"/api/v1/events/{event_id}/similar?limit=5")
+
+    assert response.status_code == 200
+    assert len(response.json()) == 5
 
 
 def _settings(tmp_path: Path) -> Settings:

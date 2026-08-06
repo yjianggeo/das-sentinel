@@ -162,7 +162,7 @@ export interface EventRun {
 }
 
 export interface EventDetail extends EventSummary {
-  features: Record<string, number>;
+  features: Record<string, number | string>;
   evidence: EventEvidence[];
   machine_history: MachineClassification[];
   review_history: Review[];

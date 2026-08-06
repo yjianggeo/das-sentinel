@@ -50,7 +50,7 @@ class PublishGateError(TrainingServiceError):
 class TrainingRow:
     event_id: str
     label: str
-    features: dict[str, Any]
+    features: dict[str, float | str]
     group: str
 
 

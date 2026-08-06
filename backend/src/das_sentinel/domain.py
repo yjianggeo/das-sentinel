@@ -65,7 +65,7 @@ class EventRecord:
     channel_start: int
     channel_stop: int
     evidence: tuple[Candidate, ...]
-    features: dict[str, float] = field(default_factory=dict)
+    features: dict[str, float | str] = field(default_factory=dict)
     label: Label = Label.UNKNOWN
     decision_score: float = 0.0
     reasons: tuple[str, ...] = ()
