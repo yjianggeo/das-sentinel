@@ -1,9 +1,10 @@
-import { act, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { transferableAbortController } from "node:util";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, beforeAll, beforeEach } from "vitest";
+import ReviewForm from "../components/ReviewForm";
 import { renderApp } from "../test/render";
 
 const server = setupServer();
@@ -332,4 +333,100 @@ it("retries a failed review with the same UUID", async () => {
 
   expect(requests).toHaveLength(2);
   expect(requests[1].request_id).toBe(requests[0].request_id);
+});
+
+it("isolates an in-flight review when the selected event changes", async () => {
+  const first = deferredResponse(1);
+  const second = deferredResponse(1);
+  const firstBodies: Array<{ request_id: string }> = [];
+  const secondBodies: Array<{ request_id: string }> = [];
+  let secondAttempts = 0;
+  let reviewedCount = 0;
+  server.use(
+    http.post("/api/v1/events/event-1/reviews", async ({ request }) => {
+      firstBodies.push((await request.json()) as { request_id: string });
+      first.markStarted();
+      await first.promise;
+      first.markDelivered();
+      return HttpResponse.json(
+        {
+          id: 9,
+          label: "earthquake",
+          note: null,
+          created_at: "2026-07-26T11:00:00Z",
+        },
+        { status: 201 },
+      );
+    }),
+    http.post("/api/v1/events/event-2/reviews", async ({ request }) => {
+      secondBodies.push((await request.json()) as { request_id: string });
+      secondAttempts += 1;
+      if (secondAttempts === 1) {
+        second.markStarted();
+        await second.promise;
+        second.markDelivered();
+        return HttpResponse.error();
+      }
+      return HttpResponse.json(
+        {
+          id: 10,
+          label: "blast",
+          note: null,
+          created_at: "2026-07-26T11:01:00Z",
+        },
+        { status: 201 },
+      );
+    }),
+  );
+  const recordReview = () => {
+    reviewedCount += 1;
+  };
+  const { rerender } = render(
+    <ReviewForm
+      eventId="event-1"
+      similar={[]}
+      onReviewed={recordReview}
+      onSelectSimilar={() => undefined}
+    />,
+  );
+
+  await userEvent.selectOptions(screen.getByLabelText("人工标签"), "earthquake");
+  await userEvent.click(screen.getByRole("button", { name: "保存复核" }));
+  await first.started;
+
+  rerender(
+    <ReviewForm
+      eventId="event-2"
+      similar={[]}
+      onReviewed={recordReview}
+      onSelectSimilar={() => undefined}
+    />,
+  );
+  await userEvent.selectOptions(screen.getByLabelText("人工标签"), "blast");
+  await userEvent.click(screen.getByRole("button", { name: "保存复核" }));
+  await second.started;
+
+  await act(async () => {
+    first.resolve();
+    await first.delivered;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  const currentSave = screen.getByRole("button", { name: "保存复核" });
+  expect.soft(currentSave).toBeDisabled();
+  expect.soft(screen.queryByText("已保存")).not.toBeInTheDocument();
+  expect.soft(reviewedCount).toBe(0);
+
+  await act(async () => {
+    second.resolve();
+    await second.delivered;
+  });
+  await screen.findByRole("alert");
+  await userEvent.click(currentSave);
+  await screen.findByText("已保存");
+
+  expect(firstBodies).toHaveLength(1);
+  expect(secondBodies).toHaveLength(2);
+  expect(secondBodies[1].request_id).toBe(secondBodies[0].request_id);
+  expect(reviewedCount).toBe(1);
 });

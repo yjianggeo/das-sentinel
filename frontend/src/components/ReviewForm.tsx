@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { api, ApiError, type EventSummary } from "../api";
 
 const LABELS = [
@@ -26,8 +26,12 @@ export default function ReviewForm({
   const [busy, setBusy] = useState(false);
   const busyRef = useRef(false);
   const requestIdRef = useRef<string | null>(null);
+  const eventGenerationRef = useRef(0);
+  const activeSubmissionRef = useRef<object | null>(null);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
+    eventGenerationRef.current += 1;
+    activeSubmissionRef.current = null;
     busyRef.current = false;
     requestIdRef.current = null;
     setBusy(false);
@@ -41,19 +45,30 @@ export default function ReviewForm({
     busyRef.current = true;
     setBusy(true);
     requestIdRef.current ??= crypto.randomUUID();
+    const requestId = requestIdRef.current;
+    const eventGeneration = eventGenerationRef.current;
+    const submission = {};
+    activeSubmissionRef.current = submission;
+    const isCurrentSubmission = () =>
+      eventGeneration === eventGenerationRef.current &&
+      activeSubmissionRef.current === submission;
     try {
       await api.post(`/api/v1/events/${eventId}/reviews`, {
         label,
         note: note || null,
-        request_id: requestIdRef.current,
+        request_id: requestId,
       });
+      if (!isCurrentSubmission()) return;
       setStatus("saved");
       requestIdRef.current = null;
       onReviewed();
     } catch (cause) {
+      if (!isCurrentSubmission()) return;
       setStatus("error");
       setError(cause instanceof ApiError ? cause.message : "保存复核失败");
     } finally {
+      if (!isCurrentSubmission()) return;
+      activeSubmissionRef.current = null;
       busyRef.current = false;
       setBusy(false);
     }
