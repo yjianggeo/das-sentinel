@@ -62,12 +62,26 @@ def run_forever(
 def main() -> None:
     settings = Settings()  # type: ignore[call-arg]  # secrets come from DAS_* env
     worker_id = os.environ.get("DAS_WORKER_ID") or socket.gethostname()
-    if settings.worker_device == "cuda" or (
-        settings.worker_device == "auto" and select_backend("auto").name == "cuda"
-    ):
+    backend_selector = None
+    if settings.worker_device == "cuda":
         smoke_test_cuda()
+    elif settings.worker_device == "auto":
+        automatic_backend = select_backend("auto")
+        if automatic_backend.name == "cuda":
+            smoke_test_cuda()
+
+        def backend_selector(device: str):
+            if device == "cpu":
+                return select_backend("cpu")
+            return automatic_backend
+
     client: WorkerProtocol = HttpxWorkerClient(settings.api_url, settings.worker_token)
-    worker = Worker(settings=settings, client=client, worker_id=worker_id)
+    worker = Worker(
+        settings=settings,
+        client=client,
+        worker_id=worker_id,
+        backend_selector=backend_selector,
+    )
     run_forever(worker)
 
 

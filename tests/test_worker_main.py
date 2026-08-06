@@ -71,19 +71,49 @@ def test_fatal_protocol_error_exits_without_retry() -> None:
 
 
 @pytest.mark.parametrize(
-    ("worker_device", "capability", "expected_calls"),
+    ("worker_device", "capability", "profile_device", "expected_calls"),
     [
-        ("auto", "cuda", ["select:auto", "smoke", "client", "claim"]),
-        ("auto", "cpu", ["select:auto", "client", "claim"]),
-        ("cpu", None, ["client", "claim"]),
-        ("cuda", None, ["smoke", "client", "claim"]),
+        (
+            "auto",
+            "cuda",
+            "cuda",
+            ["select:auto", "smoke", "client", "claim", "backend:cuda"],
+        ),
+        (
+            "auto",
+            "cuda",
+            "auto",
+            ["select:auto", "smoke", "client", "claim", "backend:cuda"],
+        ),
+        (
+            "auto",
+            "cpu",
+            "cuda",
+            ["select:auto", "client", "claim", "backend:cpu"],
+        ),
+        (
+            "auto",
+            "cpu",
+            "auto",
+            ["select:auto", "client", "claim", "backend:cpu"],
+        ),
+        ("cpu", None, None, ["client", "claim"]),
+        ("cuda", None, None, ["smoke", "client", "claim"]),
     ],
-    ids=("auto-cuda", "auto-cpu", "explicit-cpu", "explicit-cuda"),
+    ids=(
+        "auto-cuda-profile-cuda",
+        "auto-cuda-profile-auto",
+        "auto-cpu-profile-cuda",
+        "auto-cpu-profile-auto",
+        "explicit-cpu",
+        "explicit-cuda",
+    ),
 )
 def test_worker_startup_gates_cuda_smoke_before_client_and_claim(
     monkeypatch: pytest.MonkeyPatch,
     worker_device: str,
     capability: str | None,
+    profile_device: str | None,
     expected_calls: list[str],
 ) -> None:
     calls = []
@@ -103,12 +133,16 @@ def test_worker_startup_gates_cuda_smoke_before_client_and_claim(
             calls.append("claim")
 
     class FakeWorker:
-        def __init__(self, *, client, **kwargs):
+        def __init__(self, *, client, backend_selector=None, **kwargs):
             del kwargs
             self.client = client
+            self.backend_selector = backend_selector
 
         def run_once(self):
             self.client.claim("worker")
+            if profile_device is not None:
+                assert self.backend_selector is not None
+                calls.append(f"backend:{self.backend_selector(profile_device).name}")
             return WorkerOutcome(status="idle")
 
     def select(device: str) -> SimpleNamespace:
