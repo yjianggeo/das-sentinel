@@ -57,6 +57,16 @@ jobs:
           exit 1
       - run: docker compose -f compose.yaml -f compose.cpu.yaml exec -T api das-sentinel admin init --password ci-admin-password
       - run: docker compose -f compose.yaml -f compose.cpu.yaml up -d worker
+      - name: Wait for worker to be running
+        run: |
+          for attempt in $(seq 1 30); do
+            worker_services="$(docker compose -f compose.yaml -f compose.cpu.yaml ps --status running --services worker)"
+            if [ "$worker_services" = "worker" ]; then
+              exit 0
+            fi
+            sleep 2
+          done
+          exit 1
       - run: docker compose -f compose.yaml -f compose.cpu.yaml exec -T api python -c "import pysqlite3.dbapi2 as db; assert db.sqlite_version == '3.53.3'"
       - if: always()
         run: docker compose -f compose.yaml -f compose.cpu.yaml logs --no-color

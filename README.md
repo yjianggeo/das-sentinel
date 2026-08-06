@@ -22,7 +22,7 @@ ZD/PRODML HDF5 采集文件做幂等分析，产出事件、证据图与机器�
 CPU 部署：
 
 ```bash
-cp .env.example .env   # 填写 DAS_DATA_ROOT 与两个密钥
+cp .env.example .env   # 填写 DAS_HOST_DATA_ROOT、DAS_SESSION_SECRET 与 DAS_WORKER_TOKEN
 docker compose -f compose.yaml -f compose.cpu.yaml up -d --build
 ```
 
@@ -48,7 +48,7 @@ cd frontend && npm ci && npm test -- --run && npm run build
 本地启动 API（开发态）：
 
 ```bash
-uvicorn das_sentinel.api.app:app --reload
+uvicorn das_sentinel.api.app:create_runtime_app --factory --reload
 ```
 
 ## 文档

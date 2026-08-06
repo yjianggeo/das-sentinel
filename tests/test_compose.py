@@ -145,3 +145,49 @@ def test_ci_declares_required_release_jobs() -> None:
         "cpu-container",
         "gpu-image-build",
     }
+
+
+def test_readme_uses_current_runtime_environment_and_factory_entrypoint() -> None:
+    readme = (ROOT / "README.md").read_text("utf-8")
+    quickstart = readme.split("## 本地开发", maxsplit=1)[0]
+    assert "DAS_HOST_DATA_ROOT" in quickstart
+    assert "DAS_DATA_ROOT" not in quickstart
+    assert "uvicorn das_sentinel.api.app:create_runtime_app --factory --reload" in readme
+
+
+def test_ci_enforces_all_release_gates() -> None:
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text("utf-8"))
+
+    def run_steps(job_name: str) -> str:
+        return "\n".join(
+            step["run"]
+            for step in workflow["jobs"][job_name]["steps"]
+            if "run" in step
+        )
+
+    python_steps = run_steps("python")
+    assert 'docker/build-pysqlite3-wheel.sh "$RUNNER_TEMP/wheels"' in python_steps
+    assert "validate_selected_sqlite_runtime() == (3, 53, 3)" in python_steps
+    assert "ruff check ." in python_steps
+    assert "pytest -q" in python_steps
+
+    frontend_steps = run_steps("frontend")
+    assert "npm test -- --run" in frontend_steps
+    assert "npm run build" in frontend_steps
+
+    cpu_steps = workflow["jobs"]["cpu-container"]["steps"]
+    cpu_runs = "\n".join(step["run"] for step in cpu_steps if "run" in step)
+    assert "json.load(urllib.request.urlopen('http://127.0.0.1:8000/healthz')) == {'status':'ok'}" in cpu_runs
+    assert "das-sentinel admin init --password ci-admin-password" in cpu_runs
+    assert "docker compose -f compose.yaml -f compose.cpu.yaml up -d worker" in cpu_runs
+    worker_check = next(step for step in cpu_steps if step.get("name") == "Wait for worker to be running")
+    assert "seq 1 30" in worker_check["run"]
+    assert "ps --status running --services worker" in worker_check["run"]
+    assert '"$worker_services" = "worker"' in worker_check["run"]
+    always_runs = "\n".join(step["run"] for step in cpu_steps if step.get("if") == "always()")
+    assert "logs --no-color" in always_runs
+    assert "down --volumes --remove-orphans" in always_runs
+
+    gpu_steps = run_steps("gpu-image-build")
+    assert "docker build -f docker/Dockerfile.gpu -t das-sentinel-gpu:ci ." in gpu_steps
+    assert "smoke_test_cuda" not in gpu_steps
