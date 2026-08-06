@@ -1,11 +1,10 @@
 from pathlib import Path
 
 import pytest
-from fastapi.testclient import TestClient
-
 from das_sentinel.api.app import create_app
 from das_sentinel.config import Settings
 from das_sentinel.persistence import upgrade_database
+from fastapi.testclient import TestClient
 
 
 @pytest.fixture

@@ -2,13 +2,13 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import das_sentinel.runtime as runtime
-from fastapi import FastAPI
-from pydantic import ValidationError
-
+from das_sentinel import runtime
 from das_sentinel.api.app import create_runtime_app
 from das_sentinel.config import Settings
+from das_sentinel.persistence.db import SQLiteRuntimeError
 from das_sentinel.runtime import RuntimeProbeError, probe_storage
+from fastapi import FastAPI
+from pydantic import ValidationError
 
 
 def _runtime_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
@@ -95,3 +95,16 @@ def test_runtime_preflight_loads_settings_and_validates_selected_sqlite(
     settings = runtime.preflight_from_environment()
 
     assert settings.data_root == tmp_path / "data"
+
+
+def test_runtime_preflight_rejects_unsafe_selected_sqlite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _runtime_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "das_sentinel.persistence.db._sqlite_driver",
+        lambda: SimpleNamespace(sqlite_version="3.51.1"),
+    )
+
+    with pytest.raises(SQLiteRuntimeError, match="3.51.3"):
+        runtime.preflight_from_environment()
