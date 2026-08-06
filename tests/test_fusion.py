@@ -45,6 +45,7 @@ def test_two_overlapping_normal_candidates_form_event(profile):
         100.0,
         "site-a",
         "v1",
+        "profile-a",
     )
 
     assert len(events) == 1
@@ -52,33 +53,79 @@ def test_two_overlapping_normal_candidates_form_event(profile):
 
 
 def test_single_weak_candidate_stays_out_of_review_queue(profile):
-    assert fuse_candidates([candidate("energy", 100, 180, 0.45)], profile, 100.0, "site-a", "v1") == []
+    assert fuse_candidates([candidate("energy", 100, 180, 0.45)], profile, 100.0, "site-a", "v1", "profile-a") == []
 
 
 def test_event_id_is_deterministic(profile):
-    first = fuse_candidates([candidate("stalta", 100, 180, 0.95)], profile, 100.0, "s", "v1")[0]
-    second = fuse_candidates([candidate("stalta", 100, 180, 0.95)], profile, 100.0, "s", "v1")[0]
+    first = fuse_candidates([candidate("stalta", 100, 180, 0.95)], profile, 100.0, "s", "v1", "profile-a")[0]
+    second = fuse_candidates([candidate("stalta", 100, 180, 0.95)], profile, 100.0, "s", "v1", "profile-a")[0]
 
     assert first.event_id == second.event_id
 
 
-def test_source_fingerprint_namespaces_event_id_without_breaking_legacy_calls(profile):
+def test_event_uid_is_stable_within_profile_and_changes_between_profiles(profile):
+    """Dropping profile identity from UUID input would collide immutable profiles."""
+    evidence = [
+        Candidate(
+            detector="energy",
+            start_sample=10,
+            end_sample=20,
+            peak_sample=15,
+            channel_start=2,
+            channel_stop=6,
+            score=0.95,
+        )
+    ]
+
+    first = fuse_candidates(
+        evidence,
+        profile,
+        100.0,
+        "site-a",
+        "pipeline-v1",
+        "profile-a",
+        source_fingerprint="a" * 64,
+    )[0]
+    repeat = fuse_candidates(
+        evidence,
+        profile,
+        100.0,
+        "site-a",
+        "pipeline-v1",
+        "profile-a",
+        source_fingerprint="a" * 64,
+    )[0]
+    changed = fuse_candidates(
+        evidence,
+        profile,
+        100.0,
+        "site-a",
+        "pipeline-v1",
+        "profile-b",
+        source_fingerprint="a" * 64,
+    )[0]
+
+    assert first.event_id == repeat.event_id
+    assert first.event_id != changed.event_id
+
+
+def test_source_fingerprint_namespaces_event_id(profile):
     evidence = [candidate("stalta", 100, 180, 0.95)]
 
-    legacy = fuse_candidates(evidence, profile, 100.0, "s", "v1")[0]
+    baseline = fuse_candidates(evidence, profile, 100.0, "s", "v1", "profile-a")[0]
     first = fuse_candidates(
-        evidence, profile, 100.0, "s", "v1", source_fingerprint="source-a"
+        evidence, profile, 100.0, "s", "v1", "profile-a", source_fingerprint="source-a"
     )[0]
     repeated = fuse_candidates(
-        evidence, profile, 100.0, "s", "v1", source_fingerprint="source-a"
+        evidence, profile, 100.0, "s", "v1", "profile-a", source_fingerprint="source-a"
     )[0]
     second = fuse_candidates(
-        evidence, profile, 100.0, "s", "v1", source_fingerprint="source-b"
+        evidence, profile, 100.0, "s", "v1", "profile-a", source_fingerprint="source-b"
     )[0]
 
     assert first.event_id == repeated.event_id
     assert first.event_id != second.event_id
-    assert legacy.event_id not in {first.event_id, second.event_id}
+    assert baseline.event_id not in {first.event_id, second.event_id}
 
 
 def test_candidates_merge_across_offsets_when_gap_is_within_sample_rate_window(profile):
@@ -88,6 +135,7 @@ def test_candidates_merge_across_offsets_when_gap_is_within_sample_rate_window(p
         100.0,
         "site-a",
         "v1",
+        "profile-a",
     )
 
     assert len(events) == 1
@@ -101,6 +149,7 @@ def test_candidates_outside_sample_rate_converted_gap_do_not_merge(profile):
         100.0,
         "site-a",
         "v1",
+        "profile-a",
     )
 
     assert events == []
@@ -115,6 +164,7 @@ def test_fractional_merge_gap_does_not_round_up_to_an_extra_sample(profile):
         100.0,
         "site-a",
         "v1",
+        "profile-a",
     )
 
     assert events == []
@@ -129,6 +179,7 @@ def test_fractional_merge_gap_allows_zero_sample_gap(profile):
         100.0,
         "site-a",
         "v1",
+        "profile-a",
     )
 
     assert len(events) == 1
@@ -138,7 +189,7 @@ def test_rejects_negative_merge_gap(profile):
     invalid_profile = profile.model_copy(update={"merge_gap_seconds": -0.01})
 
     with pytest.raises(ValueError, match="merge_gap_seconds must be nonnegative"):
-        fuse_candidates([], invalid_profile, 100.0, "site-a", "v1")
+        fuse_candidates([], invalid_profile, 100.0, "site-a", "v1", "profile-a")
 
 
 def test_spatially_disjoint_candidates_do_not_merge(profile):
@@ -151,6 +202,7 @@ def test_spatially_disjoint_candidates_do_not_merge(profile):
         100.0,
         "site-a",
         "v1",
+        "profile-a",
     )
 
     assert events == []
@@ -166,6 +218,7 @@ def test_spatially_adjacent_candidates_merge(profile):
         100.0,
         "site-a",
         "v1",
+        "profile-a",
     )
 
     assert len(events) == 1
@@ -179,6 +232,7 @@ def test_multiple_candidates_from_one_detector_family_do_not_satisfy_normal_gate
         100.0,
         "site-a",
         "v1",
+        "profile-a",
     )
 
     assert events == []
@@ -191,6 +245,7 @@ def test_exact_normal_threshold_requires_two_families(profile):
         100.0,
         "site-a",
         "v1",
+        "profile-a",
     )
 
     assert len(event) == 1
@@ -211,13 +266,14 @@ def test_quality_flag_vetoes_otherwise_strong_single_candidate(profile):
         100.0,
         "site-a",
         "v1",
+        "profile-a",
     )
 
     assert events == []
 
 
 def test_exact_strong_threshold_allows_one_quality_valid_candidate(profile):
-    events = fuse_candidates([candidate("stalta", 100, 180, 0.85)], profile, 100.0, "site-a", "v1")
+    events = fuse_candidates([candidate("stalta", 100, 180, 0.85)], profile, 100.0, "site-a", "v1", "profile-a")
 
     assert len(events) == 1
 
@@ -228,8 +284,8 @@ def test_input_order_does_not_change_event_or_evidence_order(profile):
         candidate("stalta", 100, 180, 0.65, peak_sample=140),
     ]
 
-    forward = fuse_candidates(candidates, profile, 100.0, "site-a", "v1")
-    reversed_input = fuse_candidates(list(reversed(candidates)), profile, 100.0, "site-a", "v1")
+    forward = fuse_candidates(candidates, profile, 100.0, "site-a", "v1", "profile-a")
+    reversed_input = fuse_candidates(list(reversed(candidates)), profile, 100.0, "site-a", "v1", "profile-a")
 
     assert forward == reversed_input
     assert [e.detector for e in forward[0].evidence] == ["energy", "stalta"]
@@ -239,7 +295,7 @@ def test_event_uses_highest_score_peak_and_all_evidence(profile):
     low = candidate("stalta", 100, 180, 0.65, peak_sample=130)
     high = candidate("energy", 120, 190, 0.90, peak_sample=165)
 
-    event = fuse_candidates([low, high], profile, 100.0, "site-a", "v1")[0]
+    event = fuse_candidates([low, high], profile, 100.0, "site-a", "v1", "profile-a")[0]
 
     assert event.peak_sample == 165
     assert event.evidence == (high, low)
@@ -248,4 +304,4 @@ def test_event_uses_highest_score_peak_and_all_evidence(profile):
 @pytest.mark.parametrize("sample_rate_hz", [0.0, -1.0, float("inf"), float("nan")])
 def test_rejects_nonpositive_or_nonfinite_sample_rate(profile, sample_rate_hz):
     with pytest.raises(ValueError, match="sample_rate_hz must be positive and finite"):
-        fuse_candidates([], profile, sample_rate_hz, "site-a", "v1")
+        fuse_candidates([], profile, sample_rate_hz, "site-a", "v1", "profile-a")

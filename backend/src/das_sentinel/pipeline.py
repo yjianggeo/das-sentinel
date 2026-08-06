@@ -223,6 +223,7 @@ def analyze_file(
         metadata.sample_rate_hz,
         run_context.site_id,
         run_context.pipeline_version,
+        run_context.processing_profile_id,
         source_fingerprint=source_fingerprint,
     )
     timings["fuse"] += _elapsed_ms(fuse_started)

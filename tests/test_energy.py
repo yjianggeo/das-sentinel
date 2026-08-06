@@ -67,6 +67,18 @@ def test_energy_keeps_event_at_first_complete_rms_window(profile):
     assert candidates[0].start_sample == 1_049
 
 
+def test_energy_keeps_event_in_last_complete_rms_window(profile):
+    """Masking the trailing complete RMS windows would lose this event."""
+    data = np.full((800, 5), 0.01, dtype=np.float32)
+    time = np.arange(610, 800, dtype=np.float32) / 100.0
+    data[610:800, :4] += (3.0 * np.sin(2 * np.pi * 8.0 * time))[:, None]
+
+    candidates = detect_energy(preprocessed_block(data), profile)
+
+    assert len(candidates) == 1
+    assert candidates[0].end_sample >= 1_799
+
+
 def test_energy_ignores_bad_channel_when_selecting_peak(profile):
     """Including a masked channel in peak selection would move this peak to the large spike."""
     data = np.full((800, 5), 0.01, dtype=np.float32)

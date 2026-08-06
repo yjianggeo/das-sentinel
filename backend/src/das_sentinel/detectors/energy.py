@@ -75,7 +75,6 @@ def detect_energy(block: PreprocessedBlock, profile: ProcessingProfile) -> list[
     active_channels = (ratio >= profile.energy_ratio_threshold) & good[None, :]
     coincidence = xp.sum(active_channels, axis=1)
     active = coincidence >= profile.min_coincidence
-    active[-window:] = False
     active_cpu = _to_numpy(active, block.backend_name)
 
     min_duration = max(1, round(profile.min_duration_seconds * block.sample_rate_hz))

@@ -56,6 +56,7 @@ def _event_from_evidence(
     evidence: tuple[Candidate, ...],
     site_id: str,
     pipeline_version: str,
+    processing_profile_id: str,
     source_fingerprint: str | None,
 ) -> EventRecord:
     ordered_evidence = tuple(sorted(evidence, key=_evidence_key))
@@ -67,9 +68,11 @@ def _event_from_evidence(
     end_sample = max(candidate.end_sample for candidate in ordered_evidence)
     channel_start = min(candidate.channel_start for candidate in ordered_evidence)
     channel_stop = max(candidate.channel_stop for candidate in ordered_evidence)
-    event_name = f"{site_id}|{pipeline_version}|{peak_candidate.peak_sample}|{channel_start}|{channel_stop}"
-    if source_fingerprint is not None:
-        event_name = f"{event_name}|source_fingerprint={source_fingerprint}"
+    event_name = (
+        f"site={site_id}|profile={processing_profile_id}|pipeline={pipeline_version}|"
+        f"source={source_fingerprint or 'unknown'}|peak={peak_candidate.peak_sample}|"
+        f"channels={channel_start}:{channel_stop}"
+    )
     return EventRecord(
         event_id=str(uuid5(NAMESPACE_URL, event_name)),
         start_sample=start_sample,
@@ -87,6 +90,7 @@ def fuse_candidates(
     sample_rate_hz: float,
     site_id: str,
     pipeline_version: str,
+    processing_profile_id: str,
     *,
     source_fingerprint: str | None = None,
 ) -> list[EventRecord]:
@@ -113,7 +117,7 @@ def fuse_candidates(
 
     events = [
         _event_from_evidence(
-            group, site_id, pipeline_version, source_fingerprint
+            group, site_id, pipeline_version, processing_profile_id, source_fingerprint
         )
         for group in groups
         if _passes_gate(group, profile)

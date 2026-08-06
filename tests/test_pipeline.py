@@ -256,6 +256,52 @@ def test_pipeline_uses_bound_model_and_records_model_evidence(
     assert captured[0].model_output["probabilities"]["traffic"] == 0.97
 
 
+def test_pipeline_keeps_profile_artifacts_separate_and_deterministic(
+    tmp_path, monkeypatch
+):
+    """Omitting profile identity from fusion would make two profile runs collide."""
+    from das_sentinel import pipeline
+
+    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
+    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
+    monkeypatch.setattr(
+        pipeline,
+        "render_event_artifacts",
+        _empty_artifact_manifest,
+    )
+    source_path = tmp_path / "source.h5"
+    artifact_root = tmp_path / "artifacts"
+    _write_boundary_file(source_path)
+
+    def analyze(profile_id: str):
+        return pipeline.analyze_file(
+            source_path,
+            ZdHdf5Reader(),
+            _profile(),
+            select_backend("cpu"),
+            artifact_root,
+            pipeline.AnalysisContext(
+                site_id="site-a",
+                processing_profile_id=profile_id,
+                profile_version="1",
+                pipeline_version="v1",
+            ),
+        )
+
+    first = analyze("profile-a")
+    changed = analyze("profile-b")
+    repeat = analyze("profile-a")
+
+    first_event_id = first.events[0].event_id
+    changed_event_id = changed.events[0].event_id
+    assert first_event_id != changed_event_id
+    assert repeat.events[0].event_id == first_event_id
+    assert (artifact_root / first_event_id).is_dir()
+    assert (artifact_root / changed_event_id).is_dir()
+
+
 def test_pipeline_wraps_bound_model_prediction_errors(tmp_path, monkeypatch):
     from das_sentinel import pipeline
 
