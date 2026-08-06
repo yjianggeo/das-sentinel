@@ -136,7 +136,8 @@ def test_baseline_file_stays_under_memory_budget(tmp_path, monkeypatch):
     baseline_h5 = tmp_path / "baseline.h5"
     _write_baseline_h5(baseline_h5)
     detector_calls = {"energy": 0, "coherence": 0, "trajectory": 0}
-    preprocess_bands = []
+    detector_filter_bands = []
+    artifact_preprocess_bands = []
     original_energy = pipeline.detect_energy
     original_coherence = pipeline.detect_coherence
     original_trajectory = pipeline.detect_trajectories
@@ -154,14 +155,21 @@ def test_baseline_file_stays_under_memory_budget(tmp_path, monkeypatch):
         detector_calls["trajectory"] += 1
         return original_trajectory(*args)
 
+    original_filter = pipeline.filter_prepared_signal
+
+    def tracked_filter(prepared, low_hz, high_hz, backend):
+        detector_filter_bands.append((low_hz, high_hz))
+        return original_filter(prepared, low_hz, high_hz, backend)
+
     def tracked_preprocess(block, profile, backend, band):
-        preprocess_bands.append(band)
+        artifact_preprocess_bands.append(band)
         return original_preprocess(block, profile, backend, band)
 
     monkeypatch.setattr(pipeline, "detect_stalta", _fixed_capacity_event)
     monkeypatch.setattr(pipeline, "detect_energy", tracked_energy)
     monkeypatch.setattr(pipeline, "detect_coherence", tracked_coherence)
     monkeypatch.setattr(pipeline, "detect_trajectories", tracked_trajectory)
+    monkeypatch.setattr(pipeline, "filter_prepared_signal", tracked_filter)
     monkeypatch.setattr(pipeline, "_preprocess_for_band", tracked_preprocess)
     profile = ProcessingProfile(
         block_seconds=20.0,
@@ -176,10 +184,11 @@ def test_baseline_file_stays_under_memory_budget(tmp_path, monkeypatch):
     assert len(result.analysis.events) == 1
     assert len(result.analysis.artifacts) == 1
     assert detector_calls == {"energy": 4, "coherence": 4, "trajectory": 4}
-    assert preprocess_bands.count((2.0, 40.0)) == 5
-    assert preprocess_bands.count((0.5, 80.0)) == 4
-    assert preprocess_bands.count((1.0, 40.0)) == 4
-    assert preprocess_bands.count((1.0, 30.0)) == 4
+    assert detector_filter_bands.count((2.0, 40.0)) == 4
+    assert detector_filter_bands.count((0.5, 80.0)) == 4
+    assert detector_filter_bands.count((1.0, 40.0)) == 4
+    assert detector_filter_bands.count((1.0, 30.0)) == 4
+    assert artifact_preprocess_bands == [(2.0, 40.0)]
     assert set(result.analysis.artifacts[0].files) == {
         "waterfall_raw",
         "waterfall_filtered",

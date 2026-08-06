@@ -6,9 +6,29 @@ from das_sentinel.domain import DasBlock, DasMetadata
 from das_sentinel.signal.backend import select_backend
 from das_sentinel.signal.preprocess import (
     fft_bandpass,
+    filter_prepared_signal,
     find_bad_channels,
+    prepare_signal,
     preprocess_block,
 )
+
+
+def _shared_block() -> DasBlock:
+    rng = np.random.default_rng(42)
+    data = rng.normal(0.0, 0.1, size=(400, 8)).astype(np.float32)
+    data[:, 7] = 0.0
+    data[10, 6] = np.nan
+    return DasBlock(
+        data=data,
+        metadata=DasMetadata(
+            source_path="synthetic.h5",
+            start_time_utc=datetime(2026, 8, 6, tzinfo=UTC),
+            sample_rate_hz=100.0,
+            channel_distance_m=np.arange(8, dtype=np.float32) * 4.0,
+            unit="strain_rate",
+        ),
+        sample_offset=1_000,
+    )
 
 
 def test_cpu_fft_bandpass_preserves_ten_hz_and_removes_dc():
@@ -69,3 +89,42 @@ def test_preprocess_returns_backend_data_without_mutating_input():
     assert result.bad_channel_mask.tolist() == [False, True, False]
     assert isinstance(result.data, np.ndarray)
     np.testing.assert_array_equal(block.data, original)
+
+
+def test_prepare_then_filter_matches_preprocess_block():
+    """Catches a split that changes the compatibility preprocessing result."""
+    block = _shared_block()
+    profile = ProcessingProfile()
+    backend = select_backend("cpu")
+
+    expected = preprocess_block(block, profile, backend)
+    prepared = prepare_signal(block, profile, backend)
+    actual = filter_prepared_signal(
+        prepared,
+        profile.stalta_freq_low_hz,
+        profile.stalta_freq_high_hz,
+        backend,
+    )
+
+    np.testing.assert_allclose(actual.data, expected.data, rtol=1e-6, atol=1e-6)
+    np.testing.assert_array_equal(actual.bad_channel_mask, expected.bad_channel_mask)
+    assert actual.sample_offset == expected.sample_offset
+    assert actual.sample_rate_hz == expected.sample_rate_hz
+    np.testing.assert_array_equal(
+        actual.channel_distance_m, expected.channel_distance_m
+    )
+
+
+def test_filter_prepared_signal_keeps_prepared_values_independent_and_unchanged():
+    """Catches filtering that aliases or mutates preparation state."""
+    block = _shared_block()
+    backend = select_backend("cpu")
+    prepared = prepare_signal(block, ProcessingProfile(), backend)
+    prepared_data = prepared.data.copy()
+    prepared_spectrum = prepared.spectrum.copy()
+
+    block.data[0, 0] += 1.0
+    filter_prepared_signal(prepared, 2.0, 40.0, backend)
+
+    np.testing.assert_array_equal(prepared.data, prepared_data)
+    np.testing.assert_array_equal(prepared.spectrum, prepared_spectrum)

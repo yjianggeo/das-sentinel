@@ -19,7 +19,7 @@ from das_sentinel.config import ProcessingProfile
 from das_sentinel.domain import Candidate, Label
 from das_sentinel.readers.zd_hdf5 import ZdHdf5Reader
 from das_sentinel.signal.backend import select_backend
-from das_sentinel.signal.preprocess import PreprocessedBlock
+from das_sentinel.signal.preprocess import PreparedSignal, PreprocessedBlock
 
 
 def _write_boundary_file(path: Path) -> np.ndarray:
@@ -431,6 +431,90 @@ def test_pipeline_merges_cross_block_event_and_preserves_artifact_inputs(
     assert event.features["device_config"] == "interrogator-a"
 
 
+def test_pipeline_preprocessing_golden_preserves_review_identity(tmp_path, monkeypatch):
+    """Catches preprocessing changes that drift review-visible pipeline output."""
+    from das_sentinel import pipeline
+
+    source_path = tmp_path / "golden-boundary.h5"
+    _write_boundary_file(source_path)
+    captured: dict[str, str | None] = {}
+
+    def capture_artifacts(data, event, features, out_dir):
+        del features
+        captured["raw_sha256"] = hashlib.sha256(
+            data.raw_data.tobytes()
+        ).hexdigest()
+        captured["filtered_sha256"] = hashlib.sha256(
+            data.filtered_data.tobytes()
+        ).hexdigest()
+        captured["model_output"] = data.model_output
+        (Path(out_dir) / event.event_id).mkdir(parents=True)
+        return ArtifactManifest(event.event_id, {})
+
+    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
+    monkeypatch.setattr(pipeline, "detect_energy", _fixed_energy)
+    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
+    monkeypatch.setattr(pipeline, "render_event_artifacts", capture_artifacts)
+    monkeypatch.setattr(
+        pipeline, "_source_fingerprint", lambda path: "baseline-source-fingerprint"
+    )
+    monkeypatch.setattr(
+        pipeline, "_ensure_source_unchanged", lambda path, expected: None
+    )
+
+    result = pipeline.analyze_file(
+        source_path,
+        ZdHdf5Reader(),
+        _profile(),
+        select_backend("cpu"),
+        tmp_path / "artifacts",
+        pipeline.AnalysisContext(
+            site_id="well-a",
+            site_timezone="Asia/Shanghai",
+            processing_profile_id="profile-a",
+            profile_version="profile-7",
+            pipeline_version="pipeline-3",
+            cable_type="downhole",
+            device_config="interrogator-a",
+            rule_profile={"traffic_velocity_mps": (3.0, 45.0)},
+        ),
+    )
+
+    assert len(result.events) == 1
+    event = result.events[0]
+    assert event.event_id == "fb2d78ee-58b5-5ce8-a3ae-73394c82762a"
+    assert (
+        event.start_sample,
+        event.end_sample,
+        event.peak_sample,
+        event.channel_start,
+        event.channel_stop,
+    ) == (184, 197, 190, 1, 5)
+    assert event.label == Label.UNKNOWN
+    assert round(event.decision_score, 12) == 0.5
+    assert [
+        (
+            candidate.detector,
+            candidate.start_sample,
+            candidate.end_sample,
+            candidate.peak_sample,
+            candidate.channel_start,
+            candidate.channel_stop,
+            round(candidate.score, 12),
+        )
+        for candidate in event.evidence
+    ] == [
+        ("energy", 184, 197, 191, 1, 5, 0.8),
+        ("stalta", 185, 196, 190, 1, 5, 0.9),
+    ]
+    assert captured == {
+        "raw_sha256": "15da6dc903a195b76cf94de794e4818e1646d4fcab6ede1693380c95db6bd0f3",
+        "filtered_sha256": "eef5c31d1e0a124511189229ab80d3cffc1e69d38195e7d8badcff4e247211d2",
+        "model_output": None,
+    }
+
+
 def test_pipeline_default_block_and_lta_detect_real_stalta_event(tmp_path, monkeypatch):
     from das_sentinel import pipeline
 
@@ -527,15 +611,27 @@ def test_non_stalta_detectors_search_only_the_logical_block(
     source_path = tmp_path / f"history-{detector_name}.h5"
     _write_history_dominance_file(source_path)
 
-    def identity_preprocess(block, profile, backend, band):
-        del profile, band
-        return PreprocessedBlock(
+    def identity_prepare(block, profile, backend):
+        del profile
+        return PreparedSignal(
             data=backend.asarray(block.data),
+            spectrum=None,
             bad_channel_mask=np.zeros(block.data.shape[1], dtype=bool),
             backend_name=backend.name,
             sample_offset=block.sample_offset,
             sample_rate_hz=block.metadata.sample_rate_hz,
             channel_distance_m=block.metadata.channel_distance_m,
+        )
+
+    def identity_filter(prepared, low_hz, high_hz, backend):
+        del low_hz, high_hz
+        return PreprocessedBlock(
+            data=prepared.data,
+            bad_channel_mask=prepared.bad_channel_mask,
+            backend_name=backend.name,
+            sample_offset=prepared.sample_offset,
+            sample_rate_hz=prepared.sample_rate_hz,
+            channel_distance_m=prepared.channel_distance_m,
         )
 
     def strongest_signal(block, *args):
@@ -557,7 +653,8 @@ def test_non_stalta_detectors_search_only_the_logical_block(
             )
         ]
 
-    monkeypatch.setattr(pipeline, "_preprocess_for_band", identity_preprocess)
+    monkeypatch.setattr(pipeline, "prepare_signal", identity_prepare)
+    monkeypatch.setattr(pipeline, "filter_prepared_signal", identity_filter)
     monkeypatch.setattr(pipeline, "detect_stalta", _no_candidates)
     monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
     monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
@@ -1145,17 +1242,17 @@ def test_detect_block_releases_each_distinct_band_before_next(
     )
     references = []
     bands = []
-    original_preprocess = pipeline._preprocess_for_band
+    original_filter = pipeline.filter_prepared_signal
 
-    def tracked_preprocess(block, profile, backend, band):
+    def tracked_filter(prepared, low_hz, high_hz, backend):
         gc.collect()
         assert all(reference() is None for reference in references)
-        prepared = original_preprocess(block, profile, backend, band)
-        references.append(weakref.ref(prepared))
-        bands.append(band)
-        return prepared
+        filtered = original_filter(prepared, low_hz, high_hz, backend)
+        references.append(weakref.ref(filtered))
+        bands.append((low_hz, high_hz))
+        return filtered
 
-    monkeypatch.setattr(pipeline, "_preprocess_for_band", tracked_preprocess)
+    monkeypatch.setattr(pipeline, "filter_prepared_signal", tracked_filter)
     monkeypatch.setattr(pipeline, "detect_stalta", _no_candidates)
     monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
     monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
@@ -1169,6 +1266,50 @@ def test_detect_block_releases_each_distinct_band_before_next(
     )
 
     assert bands == [(0.5, 4.0), (1.0, 3.0), (2.0, 4.0)]
+
+
+def test_detect_block_uses_one_forward_fft_per_temporal_source(tmp_path, monkeypatch):
+    """Catches preprocessing once per detector band instead of source range."""
+    from das_sentinel import pipeline
+
+    source_path = tmp_path / "fft-count.h5"
+    _write_boundary_file(source_path)
+    block = ZdHdf5Reader().read_block(source_path, 0, 200)
+    profile = _profile().model_copy(
+        update={
+            "stalta_freq_low_hz": 0.5,
+            "stalta_freq_high_hz": 1.0,
+            "energy_bands_hz": ((1.0, 2.0),),
+            "coherence_freq_low_hz": 2.0,
+            "coherence_freq_high_hz": 3.0,
+            "trajectory_freq_low_hz": 3.0,
+            "trajectory_freq_high_hz": 4.0,
+        }
+    )
+    backend = select_backend("cpu")
+    calls = 0
+    original_rfft = backend.xp.fft.rfft
+
+    def counted_rfft(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original_rfft(*args, **kwargs)
+
+    monkeypatch.setattr(backend.xp.fft, "rfft", counted_rfft)
+    monkeypatch.setattr(pipeline, "detect_stalta", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
+
+    pipeline._detect_block(
+        block,
+        profile,
+        backend,
+        {name: 0.0 for name in pipeline._TIMING_NAMES},
+        logical_start=50,
+    )
+
+    assert calls == 2
 
 
 @pytest.mark.parametrize("sample_rate_hz", [float("nan"), 0.0, -1.0])

@@ -38,7 +38,12 @@ from das_sentinel.features import extract_features
 from das_sentinel.fusion import fuse_candidates
 from das_sentinel.readers.base import DasReader
 from das_sentinel.signal.backend import ArrayBackend
-from das_sentinel.signal.preprocess import PreprocessedBlock, preprocess_block
+from das_sentinel.signal.preprocess import (
+    PreprocessedBlock,
+    filter_prepared_signal,
+    prepare_signal,
+    preprocess_block,
+)
 
 _TIMING_NAMES = ("read", "preprocess", "detect", "fuse", "classify", "render")
 
@@ -403,46 +408,49 @@ def _detect_block(
 ) -> list[Candidate]:
     found: list[Candidate] = []
     logical_block = _logical_detector_block(block, logical_start)
-    grouped: dict[
-        tuple[tuple[float, float], int, int],
-        tuple[DasBlock, list[str]],
-    ] = {}
+    grouped: dict[tuple[int, int], tuple[DasBlock, list[str]]] = {}
     for detector in ("stalta", "energy", "coherence", "trajectory"):
         detector_source = block if detector == "stalta" else logical_block
-        band = _detector_band(profile, detector)
         key = (
-            band,
             detector_source.sample_offset,
             detector_source.data.shape[0],
         )
         if key not in grouped:
             grouped[key] = (detector_source, [])
         grouped[key][1].append(detector)
-    for (band, _, _), (detector_source, detectors) in grouped.items():
+    for detector_source, detectors in grouped.values():
         preprocess_started = time.perf_counter()
-        prepared_block = _preprocess_for_band(
-            detector_source, profile, backend, band
-        )
+        prepared_signal = prepare_signal(detector_source, profile, backend)
         timings["preprocess"] += _elapsed_ms(preprocess_started)
+        bands: dict[tuple[float, float], list[str]] = {}
         for detector in detectors:
-            detector_block = prepared_block
-            if detector == "trajectory" and detector_block.backend_name != "cpu":
-                detector_block = replace(
-                    detector_block,
-                    data=np.asarray(
-                        backend.asnumpy(detector_block.data), dtype=np.float32
-                    ),
-                    backend_name="cpu",
-                )
-            detect_started = time.perf_counter()
-            found.extend(
-                _run_detector(detector, detector_block, profile, backend)
+            bands.setdefault(_detector_band(profile, detector), []).append(detector)
+        for band, band_detectors in bands.items():
+            preprocess_started = time.perf_counter()
+            prepared_block = filter_prepared_signal(
+                prepared_signal, band[0], band[1], backend
             )
-            timings["detect"] += _elapsed_ms(detect_started)
-            del detector_block
-        del prepared_block
-        if hasattr(backend, "clear_cache"):
-            backend.clear_cache()
+            timings["preprocess"] += _elapsed_ms(preprocess_started)
+            for detector in band_detectors:
+                detector_block = prepared_block
+                if detector == "trajectory" and detector_block.backend_name != "cpu":
+                    detector_block = replace(
+                        detector_block,
+                        data=np.asarray(
+                            backend.asnumpy(detector_block.data), dtype=np.float32
+                        ),
+                        backend_name="cpu",
+                    )
+                detect_started = time.perf_counter()
+                found.extend(
+                    _run_detector(detector, detector_block, profile, backend)
+                )
+                timings["detect"] += _elapsed_ms(detect_started)
+                del detector_block
+            del prepared_block
+        del prepared_signal
+    if hasattr(backend, "clear_cache"):
+        backend.clear_cache()
     return found
 
 

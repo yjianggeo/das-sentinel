@@ -20,6 +20,19 @@ class PreprocessedBlock:
     channel_distance_m: np.ndarray
 
 
+@dataclass(frozen=True)
+class PreparedSignal:
+    """Band-independent preprocessing state for one temporal DAS range."""
+
+    data: Any
+    spectrum: Any
+    bad_channel_mask: np.ndarray
+    backend_name: str
+    sample_offset: int
+    sample_rate_hz: float
+    channel_distance_m: np.ndarray
+
+
 def find_bad_channels(data: Any, rms_z: float = 8.0) -> np.ndarray:
     """Flag channels containing non-finite values, no energy, or RMS outliers."""
     values = np.asarray(data)
@@ -96,10 +109,10 @@ def _robust_scale(data: Any, bad_channel_mask: np.ndarray, xp: Any) -> Any:
     return scaled
 
 
-def preprocess_block(
+def prepare_signal(
     block: DasBlock, profile: ProcessingProfile, backend: ArrayBackend
-) -> PreprocessedBlock:
-    """Detrend, optionally de-common-mode, band-pass, and robustly scale a DAS block."""
+) -> PreparedSignal:
+    """Prepare one temporal DAS range for deterministic per-band filtering."""
     xp = backend.xp
     bad_channel_mask = find_bad_channels(block.data, profile.bad_channel_rms_z)
     data = backend.asarray(block.data, dtype=xp.float32).copy()
@@ -108,19 +121,59 @@ def preprocess_block(
     good_channels = np.flatnonzero(~bad_channel_mask)
     if profile.common_mode_removal and good_channels.size:
         data = data - xp.median(data[:, good_channels], axis=1, keepdims=True)
-    data = fft_bandpass(
-        data,
-        block.metadata.sample_rate_hz,
-        profile.stalta_freq_low_hz,
-        profile.stalta_freq_high_hz,
-        backend,
-    )
-    data = _robust_scale(data, bad_channel_mask, xp)
-    return PreprocessedBlock(
+    return PreparedSignal(
         data=data,
-        bad_channel_mask=bad_channel_mask,
+        spectrum=xp.fft.rfft(data, axis=0),
+        bad_channel_mask=bad_channel_mask.copy(),
         backend_name=backend.name,
         sample_offset=block.sample_offset,
         sample_rate_hz=block.metadata.sample_rate_hz,
         channel_distance_m=block.metadata.channel_distance_m.copy(),
+    )
+
+
+def filter_prepared_signal(
+    prepared: PreparedSignal,
+    low_hz: float,
+    high_hz: float,
+    backend: ArrayBackend,
+) -> PreprocessedBlock:
+    """Filter and robustly scale a prepared range without another forward FFT."""
+    if prepared.backend_name != backend.name:
+        raise ValueError("prepared signal backend does not match filter backend")
+    if prepared.sample_rate_hz <= 0 or not 0 <= low_hz < high_hz:
+        raise ValueError(
+            "frequency range must satisfy 0 <= low < high and sample rate must be positive"
+        )
+    xp = backend.xp
+    frequency = xp.fft.rfftfreq(
+        prepared.data.shape[0], d=1.0 / prepared.sample_rate_hz
+    )
+    gain = _raised_cosine_band_gain(frequency, low_hz, high_hz, xp)
+    data = xp.fft.irfft(
+        prepared.spectrum * gain[:, None],
+        n=prepared.data.shape[0],
+        axis=0,
+    ).astype(prepared.data.dtype)
+    data = _robust_scale(data, prepared.bad_channel_mask, xp)
+    return PreprocessedBlock(
+        data=data,
+        bad_channel_mask=prepared.bad_channel_mask.copy(),
+        backend_name=backend.name,
+        sample_offset=prepared.sample_offset,
+        sample_rate_hz=prepared.sample_rate_hz,
+        channel_distance_m=prepared.channel_distance_m.copy(),
+    )
+
+
+def preprocess_block(
+    block: DasBlock, profile: ProcessingProfile, backend: ArrayBackend
+) -> PreprocessedBlock:
+    """Detrend, optionally de-common-mode, band-pass, and robustly scale a DAS block."""
+    prepared = prepare_signal(block, profile, backend)
+    return filter_prepared_signal(
+        prepared,
+        profile.stalta_freq_low_hz,
+        profile.stalta_freq_high_hz,
+        backend,
     )
