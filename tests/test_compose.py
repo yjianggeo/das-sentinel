@@ -171,6 +171,10 @@ def _assert_ci_release_gates(workflow: dict) -> None:
         "cpu-container",
         "gpu-image-build",
     }
+    for job_name in ("python", "frontend", "cpu-container", "gpu-image-build"):
+        assert workflow["jobs"][job_name]["steps"][0] == {
+            "uses": "actions/checkout@v4"
+        }
 
     python_job = workflow["jobs"]["python"]
     assert python_job["steps"][1] == {
@@ -201,6 +205,7 @@ def _assert_ci_release_gates(workflow: dict) -> None:
     assert _run_steps(frontend_job) == ["npm ci", "npm test -- --run", "npm run build"]
 
     cpu_job = workflow["jobs"]["cpu-container"]
+    assert cpu_job.get("env") == {"COMPOSE_PROJECT_NAME": "das-sentinel-ci"}
     cpu_steps = cpu_job["steps"]
     assert cpu_steps[1] == {
         "run": "docker build -f docker/Dockerfile.cpu -t das-sentinel:ci ."
@@ -299,6 +304,16 @@ def test_ci_gate_contract_rejects_missing_steps(job_name: str, step_index: int) 
 
 
 @pytest.mark.parametrize(
+    "job_name", ["python", "frontend", "cpu-container", "gpu-image-build"]
+)
+def test_ci_gate_contract_rejects_downgraded_checkout(job_name: str) -> None:
+    workflow = deepcopy(_ci_workflow())
+    workflow["jobs"][job_name]["steps"][0] = {"uses": "actions/checkout@v3"}
+    with pytest.raises(AssertionError):
+        _assert_ci_release_gates(workflow)
+
+
+@pytest.mark.parametrize(
     "mutate",
     [
         pytest.param(
@@ -360,6 +375,16 @@ def test_ci_gate_contract_rejects_missing_steps(job_name: str, step_index: int) 
                 "run", "docker compose ps worker"
             ),
             id="unbounded-worker-contract",
+        ),
+        pytest.param(
+            lambda workflow: workflow["jobs"]["cpu-container"].pop("env"),
+            id="missing-cpu-project-environment",
+        ),
+        pytest.param(
+            lambda workflow: workflow["jobs"]["cpu-container"].__setitem__(
+                "env", {"COMPOSE_PROJECT_NAME": "shared"}
+            ),
+            id="shared-cpu-project-environment",
         ),
         pytest.param(
             lambda workflow: workflow["jobs"]["cpu-container"]["steps"][10].__setitem__(
