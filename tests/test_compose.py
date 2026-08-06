@@ -135,3 +135,13 @@ def test_cpu_image_pins_verified_static_sqlite() -> None:
     )
     assert "build_static bdist_wheel" in builder
     assert "SELECT sqlite_version()" in dockerfile
+
+
+def test_ci_declares_required_release_jobs() -> None:
+    workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text("utf-8"))
+    assert set(workflow["jobs"]) >= {
+        "python",
+        "frontend",
+        "cpu-container",
+        "gpu-image-build",
+    }

@@ -56,3 +56,24 @@ uvicorn das_sentinel.api.app:app --reload
 - `docs/operations.md` — 备份、重启恢复、失败重试、健康检查、E2E 验收。
 - `docs/site-calibration.md` — 新站点标定流程与准确率声明边界。
 - `docs/acceptance-report.md` — 验收证据（测试、基准、真实数据只读冒烟）。
+
+## Deployment safeguards
+
+For CPU/NAS first boot, create `.env` with real `DAS_HOST_DATA_ROOT`,
+`DAS_SESSION_SECRET`, and `DAS_WORKER_TOKEN` values, then start the API and
+confirm that `curl -fsS http://127.0.0.1:8000/healthz` returns
+`{"status":"ok"}` before initializing the administrator and starting the
+worker. The complete command sequence is in `docs/operations.md`.
+
+GPU image construction (`docker build -f docker/Dockerfile.gpu ...`) is
+separate from the target-GPU CuPy smoke test; an image build is not proof of a
+CUDA runtime. New jobs bind the currently published model, and their visible
+machine decision includes the `fusion` method. An `invalid_model` failure must
+be repaired by publishing a valid model and then rescanning or re-enqueueing;
+it is never automatically retried.
+
+Human review submissions are idempotent for one event and one `request_id`:
+the first request appends one audit row, while a replay returns that row without
+appending another. This BrowserRouter plus REST application does not use the
+unstable React Server Components APIs covered by the React Router advisory; do
+not add RSC APIs before a dependency upgrade.

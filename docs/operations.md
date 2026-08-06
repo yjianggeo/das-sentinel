@@ -63,7 +63,7 @@ das-sentinel jobs retry <job-id>
 
 `e2e/` 下的 Playwright 用例需要一个播种好的本地栈。`e2e/seed_stack.py` 会创建
 隔离数据目录（默认 `%TEMP%\das-sentinel-e2e`，可用 `E2E_STACK_DIR` 覆盖——SQLite
-不允许网络路径），写入一个含合成 STA/LTA 事件的 HDF5，播种管理员
+不允许网络路径），写入两个发生时间相差一小时的合成 STA/LTA HDF5，播种管理员
 （密码 `test-admin-password`）、站点与处理档案，启动 API（127.0.0.1:8000）并用
 内嵌 worker 处理队列：
 
@@ -82,3 +82,49 @@ python scripts/benchmark_baseline.py --device cpu --out docs/acceptance-report.m
 脚本生成（或复用）`1000 通道 × 1000 Hz × 60 s` 的合成文件，记录墙钟时间、峰值
 RSS、后端选择与重复运行一致性。验收标准：指定 4-CPU 验收机上峰值 RSS < 4 GB、
 基线平均处理 < 60 s。
+
+## Phase 1 deployment and recovery boundaries
+
+For a CPU/NAS first boot, create a non-example `.env`, start the API, and
+verify the JSON health response before creating the administrator and starting
+the worker:
+
+```bash
+cp .env.example .env
+# Set DAS_HOST_DATA_ROOT plus freshly generated DAS_SESSION_SECRET and DAS_WORKER_TOKEN.
+docker compose -f compose.yaml -f compose.cpu.yaml up -d --build api
+curl -fsS http://127.0.0.1:8000/healthz    # {"status":"ok"}
+docker compose -f compose.yaml -f compose.cpu.yaml exec api \
+  das-sentinel admin init --password '<admin-password>'
+docker compose -f compose.yaml -f compose.cpu.yaml up -d worker
+```
+
+The GPU image can be built independently of a GPU runtime:
+
+```bash
+docker build -f docker/Dockerfile.gpu -t das-sentinel-gpu:phase1 .
+```
+
+That build is not CUDA evidence. Only a target NVIDIA host with a compatible
+driver, NVIDIA Container Toolkit, and CuPy can run the runtime smoke check:
+
+```bash
+docker run --rm --gpus all --entrypoint python das-sentinel-gpu:phase1 \
+  -c "from das_sentinel.signal.backend import smoke_test_cuda; smoke_test_cuda()"
+```
+
+Published models are trained from reviewed events, validated, then explicitly
+published. A newly claimed job binds the current published model identity; its
+event exposes the resulting `fusion` classification method alongside the other
+machine decisions. If a job fails with `invalid_model`, repair and publish a
+valid model, then rescan or re-enqueue the source file. The failed claim is not
+automatically retried because its bound model identity is immutable.
+
+A review `request_id` is idempotent per event: the initial request creates one
+audit row (`201`), while a concurrent or later replay returns that same row
+(`200`) without appending a second row. A new request ID intentionally appends
+another review record.
+
+The React Router advisory concerning unstable React Server Components APIs does
+not apply to the current BrowserRouter plus REST client architecture. Do not
+introduce RSC APIs before upgrading the affected React Router dependency.

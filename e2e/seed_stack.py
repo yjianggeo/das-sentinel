@@ -1,7 +1,7 @@
 """Seed and serve a local DAS Sentinel stack for the Playwright e2e suite.
 
-Creates an isolated app-data/raw pair, writes one synthetic HDF5 containing a
-strong multi-channel STA/LTA event, seeds admin + site + processing profile,
+Creates an isolated app-data/raw pair, writes two synthetic HDF5 files containing
+strong multi-channel STA/LTA events, seeds admin + site + processing profile,
 runs migrations, serves the API on 127.0.0.1:8000, scans (real 10 s stability
 window), drains the queue with an in-process worker, then keeps serving until
 Ctrl+C.
@@ -49,10 +49,10 @@ STACK_DIR = Path(
 ).resolve()
 
 
-def write_event_file(path: Path) -> None:
+def write_event_file(path: Path, start_time_utc: datetime) -> None:
     sample_rate_hz = 200.0
     sample_count = round(20.0 * sample_rate_hz)
-    start = datetime(2026, 7, 26, tzinfo=UTC)
+    start = start_time_utc.astimezone(UTC)
     rng = np.random.default_rng(20260730)
     raw_data = rng.normal(0.0, 0.02, (sample_count, 8)).astype(np.float32)
     event_start = round(15.0 * sample_rate_hz)
@@ -81,7 +81,14 @@ def main() -> None:
     app_data = (STACK_DIR / "app-data").resolve()
     raw.mkdir(parents=True)
     app_data.mkdir()
-    write_event_file(raw / "synthetic-earthquake.h5")
+    write_event_file(
+        raw / "synthetic-earthquake-00.h5",
+        datetime(2026, 7, 26, tzinfo=UTC),
+    )
+    write_event_file(
+        raw / "synthetic-earthquake-01.h5",
+        datetime(2026, 7, 26, 1, tzinfo=UTC),
+    )
 
     settings = Settings(
         data_root=raw,
@@ -139,7 +146,7 @@ def main() -> None:
     print(f"enqueued {len(enqueued.json())} job(s)", flush=True)
     jobs_listed = client.get("/api/v1/jobs").json()
     print(f"jobs via API: {len(jobs_listed)}", flush=True)
-    assert len(jobs_listed) == 1, jobs_listed
+    assert len(jobs_listed) == 2, jobs_listed
 
     worker = Worker(
         settings=settings,
@@ -147,7 +154,7 @@ def main() -> None:
         worker_id="e2e-worker",
         heartbeat_interval_seconds=1.0,
     )
-    for _ in range(5):
+    for _ in range(len(jobs_listed) + 1):
         outcome = worker.run_once()
         print(f"worker: {outcome.status}", flush=True)
         if outcome.status == "idle":
@@ -155,8 +162,8 @@ def main() -> None:
 
     events = client.get("/api/v1/events").json()
     print(f"events visible: {len(events)}", flush=True)
-    if not events:
-        raise RuntimeError("seed produced no events; aborting e2e setup")
+    if len(events) < 2:
+        raise RuntimeError("seed produced fewer than two events; aborting e2e setup")
     print(f"serving seeded stack at {BASE} — press Ctrl+C to stop", flush=True)
     try:
         while True:
