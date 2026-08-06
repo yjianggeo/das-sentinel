@@ -456,11 +456,15 @@ def test_settings_device_overrides_profile_device(tmp_path: Path):
     assert protocol.results[0][1]["requested_backend"] == "cpu"
 
 
-def test_auto_settings_uses_profile_device(tmp_path: Path):
+@pytest.mark.parametrize("profile_device", ["cuda", "auto"])
+def test_auto_settings_uses_cuda_when_profile_allows_it(
+    tmp_path: Path,
+    profile_device: str,
+):
     source = tmp_path / "input.h5"
     source.write_bytes(b"stable")
     protocol = FakeProtocol(
-        [_claim(source, profile=ProcessingProfile(device="cuda"))]
+        [_claim(source, profile=ProcessingProfile(device=profile_device))]
     )
     selected: list[str] = []
 
@@ -478,7 +482,8 @@ def test_auto_settings_uses_profile_device(tmp_path: Path):
     )
 
     assert worker.run_once().status == "succeeded"
-    assert selected == ["cuda"]
+    assert selected == [profile_device]
+    assert protocol.results[0][1]["actual_backend"] == "cuda"
 
 
 def test_worker_falls_back_once_when_cuda_is_unavailable(tmp_path: Path):

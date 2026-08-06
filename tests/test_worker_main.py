@@ -70,10 +70,25 @@ def test_fatal_protocol_error_exits_without_retry() -> None:
         run_forever(worker, max_iterations=1, sleep=lambda _: None)
 
 
-def test_cuda_smoke_runs_before_http_client_construction(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("worker_device", "capability", "expected_calls"),
+    [
+        ("auto", "cuda", ["select:auto", "smoke", "client", "claim"]),
+        ("auto", "cpu", ["select:auto", "client", "claim"]),
+        ("cpu", None, ["client", "claim"]),
+        ("cuda", None, ["smoke", "client", "claim"]),
+    ],
+    ids=("auto-cuda", "auto-cpu", "explicit-cpu", "explicit-cuda"),
+)
+def test_worker_startup_gates_cuda_smoke_before_client_and_claim(
+    monkeypatch: pytest.MonkeyPatch,
+    worker_device: str,
+    capability: str | None,
+    expected_calls: list[str],
+) -> None:
     calls = []
     settings = SimpleNamespace(
-        worker_device="cuda",
+        worker_device=worker_device,
         api_url="http://api",
         worker_token="w" * 40,
     )
@@ -83,17 +98,32 @@ def test_cuda_smoke_runs_before_http_client_construction(monkeypatch) -> None:
             del api_url, worker_token
             calls.append("client")
 
+        def claim(self, worker_id):
+            del worker_id
+            calls.append("claim")
+
+    class FakeWorker:
+        def __init__(self, *, client, **kwargs):
+            del kwargs
+            self.client = client
+
+        def run_once(self):
+            self.client.claim("worker")
+            return WorkerOutcome(status="idle")
+
+    def select(device: str) -> SimpleNamespace:
+        calls.append(f"select:{device}")
+        if capability is None:
+            pytest.fail(f"unexpected backend probe: {device}")
+        return SimpleNamespace(name=capability)
+
     monkeypatch.setattr(worker_main, "Settings", lambda: settings)
-    monkeypatch.setattr(
-        worker_main,
-        "smoke_test_cuda",
-        lambda: calls.append("smoke"),
-        raising=False,
-    )
+    monkeypatch.setattr(worker_main, "select_backend", select)
+    monkeypatch.setattr(worker_main, "smoke_test_cuda", lambda: calls.append("smoke"))
     monkeypatch.setattr(worker_main, "HttpxWorkerClient", FakeClient)
-    monkeypatch.setattr(worker_main, "Worker", lambda **kwargs: object())
-    monkeypatch.setattr(worker_main, "run_forever", lambda worker: None)
+    monkeypatch.setattr(worker_main, "Worker", FakeWorker)
+    monkeypatch.setattr(worker_main, "run_forever", lambda worker: worker.run_once())
 
     worker_main.main()
 
-    assert calls == ["smoke", "client"]
+    assert calls == expected_calls

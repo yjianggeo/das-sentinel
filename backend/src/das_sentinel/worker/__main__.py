@@ -15,7 +15,7 @@ from collections.abc import Callable
 from typing import Protocol
 
 from das_sentinel.config import Settings
-from das_sentinel.signal.backend import smoke_test_cuda
+from das_sentinel.signal.backend import select_backend, smoke_test_cuda
 from das_sentinel.worker.main import (
     HttpxWorkerClient,
     Worker,
@@ -62,7 +62,9 @@ def run_forever(
 def main() -> None:
     settings = Settings()  # type: ignore[call-arg]  # secrets come from DAS_* env
     worker_id = os.environ.get("DAS_WORKER_ID") or socket.gethostname()
-    if settings.worker_device == "cuda":
+    if settings.worker_device == "cuda" or (
+        settings.worker_device == "auto" and select_backend("auto").name == "cuda"
+    ):
         smoke_test_cuda()
     client: WorkerProtocol = HttpxWorkerClient(settings.api_url, settings.worker_token)
     worker = Worker(settings=settings, client=client, worker_id=worker_id)
