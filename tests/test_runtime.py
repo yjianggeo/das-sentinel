@@ -1,6 +1,8 @@
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
+import das_sentinel.runtime as runtime
 from fastapi import FastAPI
 from pydantic import ValidationError
 
@@ -72,3 +74,24 @@ def test_storage_probe_normalizes_app_data_failures(tmp_path: Path) -> None:
         probe_storage(settings)
 
     assert settings.session_secret not in str(error.value)
+
+
+def test_entrypoint_preflights_before_migration() -> None:
+    text = Path("docker/entrypoint-api.sh").read_text(encoding="utf-8")
+    assert text.index("python -m das_sentinel.runtime") < text.index("alembic upgrade head")
+    assert "--factory" in text
+    assert "create_runtime_app" in text
+
+
+def test_runtime_preflight_loads_settings_and_validates_selected_sqlite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _runtime_env(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        "das_sentinel.persistence.db._sqlite_driver",
+        lambda: SimpleNamespace(sqlite_version="3.53.3"),
+    )
+
+    settings = runtime.preflight_from_environment()
+
+    assert settings.data_root == tmp_path / "data"

@@ -4,6 +4,7 @@ from das_sentinel.persistence.db import (
     create_local_engine,
     session_factory,
     upgrade_database,
+    validate_selected_sqlite_runtime,
 )
 from das_sentinel.persistence.repositories import Repositories
 
@@ -14,4 +15,5 @@ __all__ = [
     "create_local_engine",
     "session_factory",
     "upgrade_database",
+    "validate_selected_sqlite_runtime",
 ]

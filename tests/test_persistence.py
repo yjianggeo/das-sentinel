@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import warnings
 from datetime import UTC, datetime, timedelta, timezone
+from types import SimpleNamespace
 
 import pytest
 from das_sentinel.persistence.db import (
@@ -13,6 +14,7 @@ from das_sentinel.persistence.db import (
     session_factory,
     upgrade_database,
     validate_local_sqlite_url,
+    validate_selected_sqlite_runtime,
     validate_sqlite_runtime,
 )
 from das_sentinel.persistence.models import Base, ProcessingProfile
@@ -37,6 +39,58 @@ EXPECTED_TABLES = {
     "model_versions",
     "artifacts",
 }
+
+
+class _SafeVersionCursor:
+    def __init__(self, cursor):
+        self._cursor = cursor
+        self._sqlite_version_requested = False
+
+    def execute(self, statement, *args, **kwargs):
+        self._sqlite_version_requested = statement == "SELECT sqlite_version()"
+        return self._cursor.execute(statement, *args, **kwargs)
+
+    def fetchone(self):
+        if self._sqlite_version_requested:
+            self._sqlite_version_requested = False
+            self._cursor.fetchone()
+            return ("3.53.3",)
+        return self._cursor.fetchone()
+
+    def __getattr__(self, name):
+        return getattr(self._cursor, name)
+
+
+class _SafeVersionConnection:
+    def __init__(self, connection):
+        self._connection = connection
+
+    def cursor(self, *args, **kwargs):
+        return _SafeVersionCursor(self._connection.cursor(*args, **kwargs))
+
+    def __getattr__(self, name):
+        return getattr(self._connection, name)
+
+
+class _SafeVersionSQLiteDriver:
+    sqlite_version = "3.53.3"
+
+    def __init__(self, driver):
+        self._driver = driver
+
+    def connect(self, *args, **kwargs):
+        return _SafeVersionConnection(self._driver.connect(*args, **kwargs))
+
+    def __getattr__(self, name):
+        return getattr(self._driver, name)
+
+
+@pytest.fixture(autouse=True)
+def safe_sqlite_driver_for_migration_tests(monkeypatch):
+    from das_sentinel.persistence import db
+
+    selected = db._sqlite_driver()
+    monkeypatch.setattr(db, "_sqlite_driver", lambda: _SafeVersionSQLiteDriver(selected))
 
 
 @pytest.fixture
@@ -365,6 +419,34 @@ def test_sqlite_runtime_gate_requires_fixed_version_or_explicit_patch():
         "3.50.4",
         patched_versions={"3.50.4"},
     ) == (3, 50, 4)
+
+
+def test_selected_sqlite_driver_is_the_runtime_being_validated(monkeypatch):
+    selected = SimpleNamespace(sqlite_version="3.53.3")
+    monkeypatch.setattr("das_sentinel.persistence.db._sqlite_driver", lambda: selected)
+    assert validate_selected_sqlite_runtime() == (3, 53, 3)
+
+
+def test_selected_sqlite_driver_rejects_unsafe_version(monkeypatch):
+    selected = SimpleNamespace(sqlite_version="3.51.1")
+    monkeypatch.setattr("das_sentinel.persistence.db._sqlite_driver", lambda: selected)
+    with pytest.raises(SQLiteRuntimeError, match="3.51.3"):
+        validate_selected_sqlite_runtime()
+
+
+def test_upgrade_rejects_unsafe_driver_before_alembic(monkeypatch, tmp_path):
+    selected = SimpleNamespace(sqlite_version="3.51.1")
+    migration_called = False
+
+    def record_upgrade(*args, **kwargs):
+        nonlocal migration_called
+        migration_called = True
+
+    monkeypatch.setattr("das_sentinel.persistence.db._sqlite_driver", lambda: selected)
+    monkeypatch.setattr("das_sentinel.persistence.db.command.upgrade", record_upgrade)
+    with pytest.raises(SQLiteRuntimeError):
+        upgrade_database(f"sqlite+pysqlite:///{tmp_path / 'unsafe.sqlite3'}")
+    assert migration_called is False
 
 
 class _StubResult:

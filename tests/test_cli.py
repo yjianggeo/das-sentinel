@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 from das_sentinel.cli import app
@@ -9,6 +10,17 @@ from typer.testing import CliRunner
 from tests.fixtures import write_zd_h5
 
 runner = CliRunner()
+
+
+@pytest.fixture(autouse=True)
+def safe_sqlite_runtime(monkeypatch):
+    monkeypatch.setattr(
+        "das_sentinel.cli.sqlite3", SimpleNamespace(sqlite_version="3.53.3")
+    )
+    monkeypatch.setattr(
+        "das_sentinel.persistence.db.validate_selected_sqlite_runtime",
+        lambda: (3, 53, 3),
+    )
 
 
 class FakeResponse:

@@ -5,17 +5,20 @@ services:
       dockerfile: docker/Dockerfile.cpu
     command: ["api"]
     env_file: [.env]
-    ports: ["8000:8000"]
+    restart: unless-stopped
+    ports: ["127.0.0.1:${DAS_HTTP_PORT:-8000}:8000"]
+    environment:
+      DAS_DATA_ROOT: /data
     volumes:
       - type: bind
-        source: ${DAS_DATA_ROOT}
+        source: ${DAS_HOST_DATA_ROOT}
         target: /data
         read_only: true
       - type: volume
         source: app-data
         target: /app-data
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz')"]
+      test: ["CMD", "python", "-c", "import json, urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/healthz'))['status'] == 'ok'"]
       interval: 15s
       timeout: 5s
       retries: 5

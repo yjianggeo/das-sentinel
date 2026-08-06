@@ -117,6 +117,10 @@ def validate_sqlite_runtime(
     return parsed
 
 
+def validate_selected_sqlite_runtime() -> tuple[int, int, int]:
+    return validate_sqlite_runtime(_sqlite_driver().sqlite_version)
+
+
 def check_database_startup(
     engine: Engine,
     *,
@@ -150,6 +154,7 @@ def check_database_startup(
 
 
 def upgrade_database(database_url: str) -> None:
+    validate_selected_sqlite_runtime()
     validate_local_sqlite_url(database_url)
     repository_root = Path(__file__).resolve().parents[4]
     configuration = Config(str(repository_root / "alembic.ini"))

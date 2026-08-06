@@ -85,5 +85,48 @@ def test_api_has_healthcheck_and_runs_non_root(compose_cpu: dict) -> None:
 
 def test_env_example_covers_required_variables() -> None:
     text = (ROOT / ".env.example").read_text("utf-8")
-    for name in ("DAS_DATA_ROOT", "DAS_SESSION_SECRET", "DAS_WORKER_TOKEN"):
+    for name in ("DAS_HOST_DATA_ROOT", "DAS_SESSION_SECRET", "DAS_WORKER_TOKEN"):
         assert name in text
+
+
+def test_host_data_root_is_only_a_bind_source(compose_cpu: dict) -> None:
+    for service in ("api", "worker"):
+        raw = next(
+            v
+            for v in compose_cpu["services"][service]["volumes"]
+            if v["target"] == "/data"
+        )
+        assert raw["source"] == "${DAS_HOST_DATA_ROOT}"
+        assert compose_cpu["services"][service]["environment"]["DAS_DATA_ROOT"] == "/data"
+
+
+def test_services_restart_and_api_binds_loopback(compose_cpu: dict) -> None:
+    assert compose_cpu["services"]["api"]["ports"] == [
+        "127.0.0.1:${DAS_HTTP_PORT:-8000}:8000"
+    ]
+    assert compose_cpu["services"]["api"]["restart"] == "unless-stopped"
+    assert compose_cpu["services"]["worker"]["restart"] == "unless-stopped"
+
+
+def test_gpu_worker_uses_the_nas_runtime_defaults(compose_gpu: dict) -> None:
+    worker = compose_gpu["services"]["worker"]
+    raw = next(volume for volume in worker["volumes"] if volume["target"] == "/data")
+    assert worker["restart"] == "unless-stopped"
+    assert worker["environment"]["DAS_DATA_ROOT"] == "/data"
+    assert raw["source"] == "${DAS_HOST_DATA_ROOT}"
+
+
+def test_cpu_image_pins_verified_static_sqlite() -> None:
+    dockerfile = (ROOT / "docker" / "Dockerfile.cpu").read_text("utf-8")
+    builder = (ROOT / "docker" / "build-pysqlite3-wheel.sh").read_text("utf-8")
+    assert "sqlite-amalgamation-3530300.zip" in builder
+    assert (
+        "646421e12aac110282ef8cc68f1a62d4bb15fc7b8f09da0b53e29ee690500431"
+        in builder
+    )
+    assert (
+        "fbc69bfdc0cb43a5badd5403b126d5151371b5037e0397ba9802bb440c5b0021"
+        in builder
+    )
+    assert "build_static bdist_wheel" in builder
+    assert "SELECT sqlite_version()" in dockerfile

@@ -1,5 +1,16 @@
 # DAS Sentinel 运维手册
 
+## First boot and NAS security
+
+1. Copy .env.example to .env, generate both secrets, and set DAS_HOST_DATA_ROOT.
+2. Give the container user read-only access to raw DAS data and read/write access only to the app-data volume.
+3. Start API: docker compose -f compose.yaml -f compose.cpu.yaml up -d api.
+4. Verify /healthz, then initialize admin with docker compose ... exec api das-sentinel admin init.
+5. Start worker and configure the NAS HTTPS reverse proxy to 127.0.0.1:DAS_HTTP_PORT.
+6. Rotate secrets by stopping the stack, editing .env, and restarting; existing sessions are invalidated.
+
+`/data` is excluded from writes and database placement. Place SQLite databases and all application artifacts only in the `/app-data` volume.
+
 ## 数据布局
 
 | 路径 | 内容 | 读写性 |

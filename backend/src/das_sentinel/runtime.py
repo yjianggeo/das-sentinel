@@ -2,6 +2,7 @@ from pathlib import Path
 from tempfile import NamedTemporaryFile
 
 from das_sentinel.config import Settings
+from das_sentinel.persistence.db import validate_selected_sqlite_runtime
 
 
 class RuntimeProbeError(RuntimeError):
@@ -28,3 +29,17 @@ def probe_storage(settings: Settings) -> None:
             probe.flush()
     except OSError as error:
         raise RuntimeProbeError("required storage is unavailable") from error
+
+
+def preflight_from_environment() -> Settings:
+    settings = Settings()  # type: ignore[call-arg]
+    validate_selected_sqlite_runtime()
+    return settings
+
+
+def main() -> None:
+    preflight_from_environment()
+
+
+if __name__ == "__main__":
+    main()

@@ -5,8 +5,9 @@ set -eu
 
 case "${1:-api}" in
   api)
+    python -m das_sentinel.runtime
     alembic upgrade head
-    exec uvicorn das_sentinel.api.app:app --host 0.0.0.0 --port 8000
+    exec uvicorn das_sentinel.api.app:create_runtime_app --factory --host 0.0.0.0 --port 8000
     ;;
   worker)
     exec python -m das_sentinel.worker

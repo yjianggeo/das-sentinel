@@ -5,14 +5,16 @@ services:
       dockerfile: docker/Dockerfile.cpu
     command: ["worker"]
     env_file: [.env]
+    restart: unless-stopped
     environment:
       DAS_API_URL: http://api:8000
+      DAS_DATA_ROOT: /data
     depends_on:
       api:
         condition: service_healthy
     volumes:
       - type: bind
-        source: ${DAS_DATA_ROOT}
+        source: ${DAS_HOST_DATA_ROOT}
         target: /data
         read_only: true
       - type: volume

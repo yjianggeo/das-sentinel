@@ -8,7 +8,16 @@ RUN npm ci
 COPY frontend/ ./
 RUN npm run build
 
-# ---- Stage 2: Python runtime ----
+# ---- Stage 2: build the pinned SQLite driver ----
+FROM python:3.12-slim-bookworm AS sqlite-wheel
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential curl unzip \
+    && rm -rf /var/lib/apt/lists/*
+COPY docker/build-pysqlite3-wheel.sh /usr/local/bin/build-pysqlite3-wheel
+RUN chmod +x /usr/local/bin/build-pysqlite3-wheel \
+    && /usr/local/bin/build-pysqlite3-wheel /build/wheels
+
+# ---- Stage 3: Python runtime ----
 FROM python:3.12-slim-bookworm AS runtime
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -18,7 +27,11 @@ WORKDIR /app
 COPY pyproject.toml ./
 COPY backend/ backend/
 COPY alembic.ini ./
-RUN pip install .
+COPY --from=sqlite-wheel /build/wheels/ /tmp/wheels/
+RUN pip install /tmp/wheels/*.whl \
+    && pip install . \
+    && python -c "import pysqlite3.dbapi2 as db; con=db.connect(':memory:'); assert con.execute('SELECT sqlite_version()').fetchone()[0] == '3.53.3'" \
+    && rm -rf /tmp/wheels
 
 COPY --from=web /build/dist /app/frontend/dist
 COPY docker/entrypoint-api.sh /entrypoint.sh
