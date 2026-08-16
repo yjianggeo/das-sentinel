@@ -1,4 +1,4 @@
-import { screen } from "@testing-library/react";
+import { act, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
@@ -105,6 +105,53 @@ it("clears the session once when a dashboard request returns 401", async () => {
 
   expect(await screen.findByRole("button", { name: "登录" })).toBeVisible();
   expect(dashboardRequests).toBe(1);
+});
+
+it("ignores a stale dashboard 401 after logging into a new session", async () => {
+  let dashboardRequests = 0;
+  let releaseOldDashboard: (() => void) | undefined;
+  server.use(
+    http.get("/api/v1/session", () =>
+      HttpResponse.json({ admin_id: 1, csrf_token: "token-current" }),
+    ),
+    http.post("/api/v1/session", () =>
+      new HttpResponse(null, {
+        status: 204,
+        headers: { "x-csrf-token": "token-new" },
+      }),
+    ),
+    http.delete("/api/v1/session", () => new HttpResponse(null, { status: 204 })),
+    http.get("/api/v1/dashboard", () => {
+      dashboardRequests += 1;
+      if (dashboardRequests === 1) {
+        return new Promise<Response>((resolve) => {
+          releaseOldDashboard = () =>
+            resolve(HttpResponse.json({ detail: "Unauthorized" }, { status: 401 }));
+        });
+      }
+      return HttpResponse.json({
+        job_counts: {},
+        today_event_count: 0,
+        machine_label_counts: {},
+      });
+    }),
+  );
+  renderApp("/");
+
+  await waitFor(() => expect(releaseOldDashboard).toBeTypeOf("function"));
+  await userEvent.click(await screen.findByRole("button", { name: "退出登录" }));
+  await userEvent.type(await screen.findByLabelText("管理员密码"), "correct horse");
+  await userEvent.click(screen.getByRole("button", { name: "登录" }));
+  expect(
+    await screen.findByRole("heading", { name: "运行总览" }),
+  ).toBeVisible();
+
+  await act(async () => releaseOldDashboard?.());
+
+  expect(
+    await screen.findByRole("heading", { name: "运行总览" }),
+  ).toBeVisible();
+  expect(screen.queryByRole("button", { name: "登录" })).not.toBeInTheDocument();
 });
 
 it("clears the session after a successful logout", async () => {

@@ -10,6 +10,7 @@ export class ApiError extends Error {
 
 let csrfToken = "";
 let unauthorizedHandler: (() => void) | null = null;
+let unauthorizedGeneration = 0;
 
 export function setCsrfToken(token: string): void {
   csrfToken = token;
@@ -17,6 +18,7 @@ export function setCsrfToken(token: string): void {
 
 export function setUnauthorizedHandler(handler: (() => void) | null): void {
   unauthorizedHandler = handler;
+  unauthorizedGeneration += 1;
 }
 
 async function request<T>(
@@ -26,6 +28,7 @@ async function request<T>(
   params?: Record<string, string>,
   signal?: AbortSignal,
 ): Promise<T> {
+  const requestUnauthorizedGeneration = unauthorizedGeneration;
   const url = new URL(path, window.location.origin);
   if (params) {
     for (const [key, value] of Object.entries(params)) {
@@ -50,21 +53,29 @@ async function request<T>(
     setCsrfToken(response.headers.get("x-csrf-token") ?? csrfToken);
     return undefined as T;
   }
-  if (!response.ok) throw await apiErrorFromResponse(response);
+  if (!response.ok) {
+    throw await apiErrorFromResponse(response, requestUnauthorizedGeneration);
+  }
   return (await response.json()) as T;
 }
 
 async function requestBlob(path: string, signal?: AbortSignal): Promise<Blob> {
+  const requestUnauthorizedGeneration = unauthorizedGeneration;
   const response = await fetch(new URL(path, window.location.origin), {
     method: "GET",
     credentials: "same-origin",
     signal,
   });
-  if (!response.ok) throw await apiErrorFromResponse(response);
+  if (!response.ok) {
+    throw await apiErrorFromResponse(response, requestUnauthorizedGeneration);
+  }
   return response.blob();
 }
 
-async function apiErrorFromResponse(response: Response): Promise<ApiError> {
+async function apiErrorFromResponse(
+  response: Response,
+  requestUnauthorizedGeneration: number,
+): Promise<ApiError> {
   let detail = response.statusText;
   try {
     const payload = (await response.json()) as { detail?: string };
@@ -72,7 +83,12 @@ async function apiErrorFromResponse(response: Response): Promise<ApiError> {
   } catch {
     // keep statusText
   }
-  if (response.status === 401) unauthorizedHandler?.();
+  if (
+    response.status === 401
+    && requestUnauthorizedGeneration === unauthorizedGeneration
+  ) {
+    unauthorizedHandler?.();
+  }
   return new ApiError(response.status, detail);
 }
 
