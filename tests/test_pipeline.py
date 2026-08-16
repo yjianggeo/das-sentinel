@@ -197,6 +197,118 @@ def _no_candidates(*args):
     return []
 
 
+_DETECTOR_PREPROCESSING_GOLDEN = [
+    (
+        "stalta",
+        "float32",
+        (350, 6),
+        "27f77b2e47c0ae57254aea6956dc2a11e4222266ad0fd7d6131dc050a2831091",
+        0,
+        350,
+        "cpu",
+        "bool",
+        (6,),
+        "11635df4532364e5fa01ac9540563d9a833f881994f4d2f3ae2a2e9c87680163",
+        (True, False, False, False, False, True),
+    ),
+    (
+        "energy",
+        "float32",
+        (200, 6),
+        "680c60f6ec80428a2e269b1096df604447137b342ee20e414b8f1e5388466bbd",
+        150,
+        200,
+        "cpu",
+        "bool",
+        (6,),
+        "11635df4532364e5fa01ac9540563d9a833f881994f4d2f3ae2a2e9c87680163",
+        (True, False, False, False, False, True),
+    ),
+    (
+        "coherence",
+        "float32",
+        (200, 6),
+        "680c60f6ec80428a2e269b1096df604447137b342ee20e414b8f1e5388466bbd",
+        150,
+        200,
+        "cpu",
+        "bool",
+        (6,),
+        "11635df4532364e5fa01ac9540563d9a833f881994f4d2f3ae2a2e9c87680163",
+        (True, False, False, False, False, True),
+    ),
+    (
+        "trajectory",
+        "float32",
+        (200, 6),
+        "680c60f6ec80428a2e269b1096df604447137b342ee20e414b8f1e5388466bbd",
+        150,
+        200,
+        "cpu",
+        "bool",
+        (6,),
+        "11635df4532364e5fa01ac9540563d9a833f881994f4d2f3ae2a2e9c87680163",
+        (True, False, False, False, False, True),
+    ),
+]
+
+
+def _detector_block_identity(detector, block):
+    data = np.asarray(block.data)
+    bad_channel_mask = np.asarray(block.bad_channel_mask)
+    assert data.flags.c_contiguous
+    assert bad_channel_mask.flags.c_contiguous
+    return (
+        detector,
+        str(data.dtype),
+        tuple(data.shape),
+        hashlib.sha256(data.tobytes()).hexdigest(),
+        block.sample_offset,
+        data.shape[0],
+        block.backend_name,
+        str(bad_channel_mask.dtype),
+        tuple(bad_channel_mask.shape),
+        hashlib.sha256(bad_channel_mask.tobytes()).hexdigest(),
+        tuple(bad_channel_mask.tolist()),
+    )
+
+
+def _assert_detector_preprocessing_golden(
+    source_path, monkeypatch, *, tamper_detector_input=False
+):
+    from das_sentinel import pipeline
+
+    captured = []
+
+    def capture(detector, implementation):
+        def recorded(block, *args):
+            if tamper_detector_input:
+                block = replace(block, data=np.zeros_like(block.data))
+            captured.append(_detector_block_identity(detector, block))
+            return implementation(block, *args)
+
+        return recorded
+
+    monkeypatch.setattr(pipeline, "detect_stalta", capture("stalta", _fixed_stalta))
+    monkeypatch.setattr(pipeline, "detect_energy", capture("energy", _fixed_energy))
+    monkeypatch.setattr(
+        pipeline, "detect_coherence", capture("coherence", _no_candidates)
+    )
+    monkeypatch.setattr(
+        pipeline, "detect_trajectories", capture("trajectory", _no_candidates)
+    )
+    block = ZdHdf5Reader().read_block(source_path, 0, 350)
+    pipeline._detect_block(
+        block,
+        _profile(),
+        select_backend("cpu"),
+        {name: 0.0 for name in pipeline._TIMING_NAMES},
+        logical_start=150,
+    )
+
+    assert captured == _DETECTOR_PREPROCESSING_GOLDEN
+
+
 def _empty_artifact_manifest(data, event, features, out_dir):
     del data, features
     (Path(out_dir) / event.event_id).mkdir(parents=True)
@@ -437,6 +549,7 @@ def test_pipeline_preprocessing_golden_preserves_review_identity(tmp_path, monke
 
     source_path = tmp_path / "golden-boundary.h5"
     _write_boundary_file(source_path)
+    _assert_detector_preprocessing_golden(source_path, monkeypatch)
     captured: dict[str, str | None] = {}
 
     def capture_artifacts(data, event, features, out_dir):
@@ -513,6 +626,18 @@ def test_pipeline_preprocessing_golden_preserves_review_identity(tmp_path, monke
         "filtered_sha256": "eef5c31d1e0a124511189229ab80d3cffc1e69d38195e7d8badcff4e247211d2",
         "model_output": None,
     }
+
+
+def test_pipeline_preprocessing_golden_rejects_tampered_detector_blocks(
+    tmp_path, monkeypatch
+):
+    source_path = tmp_path / "golden-boundary.h5"
+    _write_boundary_file(source_path)
+
+    with pytest.raises(AssertionError):
+        _assert_detector_preprocessing_golden(
+            source_path, monkeypatch, tamper_detector_input=True
+        )
 
 
 def test_pipeline_default_block_and_lta_detect_real_stalta_event(tmp_path, monkeypatch):
