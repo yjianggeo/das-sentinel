@@ -739,7 +739,7 @@ it("uses the server page boundary for the next offset when a page contains a dup
       offsets.push(offset);
       if (offset === "0") return HttpResponse.json(makeSummaries(100));
       if (offset === "100") {
-        return HttpResponse.json([...makeSummaries(99, 100), makeSummaries(1, 99)[0]]);
+        return HttpResponse.json([...makeSummaries(99, 100), makeSummaries(1, 100)[0]]);
       }
       if (offset === "200") return HttpResponse.json(makeSummaries(2, 200));
       return HttpResponse.json([]);

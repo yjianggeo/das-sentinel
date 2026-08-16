@@ -170,9 +170,14 @@ export default function EventsPage() {
         setCollection((current) => {
           if (current.kind !== "ready") return current;
           const seen = new Set(current.items.map((event) => event.id));
+          const newItems = page.filter((event) => {
+            if (seen.has(event.id)) return false;
+            seen.add(event.id);
+            return true;
+          });
           return {
             kind: "ready",
-            items: [...current.items, ...page.filter((event) => !seen.has(event.id))],
+            items: [...current.items, ...newItems],
             hasMore: page.length === PAGE_SIZE,
             loadingMore: false,
           };
