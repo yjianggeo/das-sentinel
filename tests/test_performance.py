@@ -4,6 +4,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from importlib.util import module_from_spec, spec_from_file_location
 from pathlib import Path
 
 import h5py
@@ -14,6 +15,15 @@ from das_sentinel.domain import Candidate
 from das_sentinel.pipeline import FileAnalysis, analyze_file
 from das_sentinel.readers.zd_hdf5 import ZdHdf5Reader
 from das_sentinel.signal.backend import select_backend
+
+_BENCHMARK_SPEC = spec_from_file_location(
+    "benchmark_baseline",
+    Path(__file__).resolve().parents[1] / "scripts" / "benchmark_baseline.py",
+)
+assert _BENCHMARK_SPEC is not None
+assert _BENCHMARK_SPEC.loader is not None
+benchmark_baseline = module_from_spec(_BENCHMARK_SPEC)
+_BENCHMARK_SPEC.loader.exec_module(benchmark_baseline)
 
 
 @dataclass(frozen=True)
@@ -208,3 +218,233 @@ def test_baseline_file_stays_under_memory_budget(tmp_path, monkeypatch):
             f"baseline peak RSS: {result.peak_rss_bytes / 1024**3:.3f} GiB; "
             f"wall time: {result.wall_time_seconds:.3f}s"
         )
+
+
+def test_benchmark_summary_enforces_mean_memory_and_repeat_identity_parity():
+    runs = [
+        {
+            "wall_seconds": 55.0,
+            "peak_rss_bytes": 900_000_000,
+            "event_ids": ["event-a"],
+            "event_labels": ["traffic"],
+        },
+        {
+            "wall_seconds": 57.0,
+            "peak_rss_bytes": 950_000_000,
+            "event_ids": ["event-a"],
+            "event_labels": ["traffic"],
+        },
+    ]
+
+    assert benchmark_baseline.summarize_runs(runs) == {
+        "mean_wall_seconds": 56.0,
+        "max_peak_rss_bytes": 950_000_000,
+        "parity": True,
+    }
+
+
+@pytest.mark.parametrize(
+    "second_run",
+    [
+        {"event_ids": ["event-b"], "event_labels": ["traffic"]},
+        {"event_ids": ["event-a"], "event_labels": ["earthquake"]},
+    ],
+)
+def test_benchmark_summary_rejects_changed_event_identity_or_label(second_run):
+    runs = [
+        {
+            "wall_seconds": 1.0,
+            "peak_rss_bytes": 1,
+            "event_ids": ["event-a"],
+            "event_labels": ["traffic"],
+        },
+        {"wall_seconds": 1.0, "peak_rss_bytes": 1, **second_run},
+    ]
+
+    assert benchmark_baseline.summarize_runs(runs)["parity"] is False
+
+
+@pytest.mark.parametrize(
+    ("summary", "message"),
+    [
+        (
+            {
+                "mean_wall_seconds": 1.0,
+                "max_peak_rss_bytes": 1,
+                "parity": False,
+            },
+            "parity",
+        ),
+        (
+            {
+                "mean_wall_seconds": 1.0,
+                "max_peak_rss_bytes": 4 * 1024**3,
+                "parity": True,
+            },
+            "below 4 GB",
+        ),
+        (
+            {
+                "mean_wall_seconds": 60.0,
+                "max_peak_rss_bytes": 1,
+                "parity": True,
+            },
+            "below 60 seconds",
+        ),
+    ],
+)
+def test_benchmark_gate_rejects_each_inclusive_limit(summary, message):
+    with pytest.raises(benchmark_baseline.PerformanceGateError, match=message):
+        benchmark_baseline.enforce_gate(summary)
+
+
+def test_benchmark_report_keeps_acceptance_evidence_and_appends_auditable_gate(
+    tmp_path,
+):
+    report_path = tmp_path / "acceptance-report.md"
+    report_path.write_text(
+        "# Existing acceptance evidence\n\n## 性能基准\n\n"
+        "Legacy benchmark is pending.\n\n"
+        "## Accuracy boundary\n\nNo labelled samples.\n",
+        encoding="utf-8",
+    )
+    runs = [
+        {
+            "wall_seconds": 55.0,
+            "peak_rss_bytes": 900_000_000,
+            "event_ids": ["event-a"],
+            "event_labels": ["traffic"],
+            "requested_backend": "cpu",
+            "actual_backend": "cpu",
+            "fallback_reason": None,
+            "event_count": 1,
+            "timings_ms": {"detect": 123.4},
+        },
+        {
+            "wall_seconds": 57.0,
+            "peak_rss_bytes": 950_000_000,
+            "event_ids": ["event-a"],
+            "event_labels": ["traffic"],
+            "requested_backend": "cpu",
+            "actual_backend": "cpu",
+            "fallback_reason": None,
+            "event_count": 1,
+            "timings_ms": {"detect": 120.0},
+        },
+    ]
+
+    performance_section = benchmark_baseline.render_report(
+        runs,
+        source=tmp_path / "baseline.h5",
+        device="cpu",
+    )
+    benchmark_baseline.write_report(report_path, performance_section)
+
+    written = report_path.read_text(encoding="utf-8")
+    assert "# Existing acceptance evidence" in written
+    assert "## Accuracy boundary" in written
+    assert "Legacy benchmark is pending." not in written
+    assert "## Performance benchmark" in written
+    assert written.index("## Performance benchmark") < written.index(
+        "## Accuracy boundary"
+    )
+    assert "1000 ch x 1000 Hz x 60 s" in written
+    assert '"mean_wall_seconds": 56.0' in written
+    assert '"max_peak_rss_bytes": 950000000' in written
+    assert '"parity": true' in written
+    assert "- Event IDs: ['event-a']" in written
+
+    replacement_section = performance_section.replace(
+        '"mean_wall_seconds": 56.0',
+        '"mean_wall_seconds": 58.0',
+    )
+    benchmark_baseline.write_report(report_path, replacement_section)
+
+    updated = report_path.read_text(encoding="utf-8")
+    assert updated.count("<!-- DAS_SENTINEL_PERFORMANCE_BENCHMARK:START -->") == 1
+    assert updated.index("## Performance benchmark") < updated.index(
+        "## Accuracy boundary"
+    )
+    assert '"mean_wall_seconds": 58.0' in updated
+    assert '"mean_wall_seconds": 56.0' not in updated
+
+
+def _benchmark_run(event_id="event-a", label="traffic"):
+    return {
+        "wall_seconds": 1.0,
+        "peak_rss_bytes": 1,
+        "event_ids": [event_id],
+        "event_labels": [label],
+        "requested_backend": "cpu",
+        "actual_backend": "cpu",
+        "fallback_reason": None,
+        "event_count": 1,
+        "timings_ms": {"detect": 1.0},
+    }
+
+
+def test_benchmark_main_enforces_exactly_two_runs(tmp_path, monkeypatch):
+    source = tmp_path / "baseline.h5"
+    source.touch()
+    calls = []
+
+    def run_once(path, device, artifact_root):
+        calls.append((path, device, artifact_root))
+        return _benchmark_run()
+
+    monkeypatch.setattr(benchmark_baseline, "run_once", run_once)
+    monkeypatch.setattr(
+        benchmark_baseline.sys,
+        "argv",
+        [
+            "benchmark_baseline.py",
+            "--device",
+            "cpu",
+            "--file",
+            str(source),
+            "--work-dir",
+            str(tmp_path / "work"),
+            "--out",
+            str(tmp_path / "acceptance-report.md"),
+            "--enforce",
+        ],
+    )
+
+    benchmark_baseline.main()
+
+    assert len(calls) == benchmark_baseline.REPEAT_RUNS == 2
+
+
+def test_benchmark_main_exits_nonzero_when_enforced_gate_fails(tmp_path, monkeypatch):
+    source = tmp_path / "baseline.h5"
+    source.touch()
+    run_count = 0
+
+    def mismatched_run(*args):
+        nonlocal run_count
+        del args
+        run_count += 1
+        return _benchmark_run(event_id=f"event-{run_count}")
+
+    monkeypatch.setattr(
+        benchmark_baseline,
+        "run_once",
+        mismatched_run,
+    )
+    monkeypatch.setattr(
+        benchmark_baseline.sys,
+        "argv",
+        [
+            "benchmark_baseline.py",
+            "--file",
+            str(source),
+            "--work-dir",
+            str(tmp_path / "work"),
+            "--enforce",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as exc_info:
+        benchmark_baseline.main()
+
+    assert exc_info.value.code == 1

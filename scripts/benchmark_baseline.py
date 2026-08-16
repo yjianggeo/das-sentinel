@@ -38,6 +38,36 @@ N_CHANNELS = 1000
 SAMPLE_RATE_HZ = 1000.0
 DURATION_S = 60.0
 REPEAT_RUNS = 2
+_PERFORMANCE_SECTION_START = "<!-- DAS_SENTINEL_PERFORMANCE_BENCHMARK:START -->"
+_PERFORMANCE_SECTION_END = "<!-- DAS_SENTINEL_PERFORMANCE_BENCHMARK:END -->"
+
+
+class PerformanceGateError(RuntimeError):
+    """Raised when the fixed benchmark does not meet an acceptance budget."""
+
+
+def summarize_runs(runs: list[dict]) -> dict:
+    """Summarize repeat-run timing, memory, and output identity evidence."""
+    identities = {
+        (tuple(run["event_ids"]), tuple(run["event_labels"])) for run in runs
+    }
+    return {
+        "mean_wall_seconds": round(
+            sum(run["wall_seconds"] for run in runs) / len(runs), 2
+        ),
+        "max_peak_rss_bytes": max(run["peak_rss_bytes"] for run in runs),
+        "parity": len(identities) == 1,
+    }
+
+
+def enforce_gate(summary: dict) -> None:
+    """Reject inclusive performance-limit breaches and repeat-output changes."""
+    if not summary["parity"]:
+        raise PerformanceGateError("repeat-run output parity failed")
+    if summary["max_peak_rss_bytes"] >= 4 * 1024**3:
+        raise PerformanceGateError("peak RSS must remain below 4 GB")
+    if summary["mean_wall_seconds"] >= 60.0:
+        raise PerformanceGateError("mean wall time must remain below 60 seconds")
 
 
 def generate_baseline_file(path: Path) -> None:
@@ -157,6 +187,7 @@ def run_once(path: Path, device: str, artifact_root: Path) -> dict:
         "actual_backend": result.actual_backend,
         "fallback_reason": result.backend_fallback_reason,
         "event_count": len(result.events),
+        "event_ids": [event.event_id for event in result.events],
         "event_labels": [event.label.value for event in result.events],
         "timings_ms": {k: round(v, 1) for k, v in sorted(result.timings_ms.items())},
     }
@@ -173,8 +204,10 @@ def _versions() -> dict[str, str]:
 
 
 def render_report(runs: list[dict], source: Path, device: str) -> str:
+    summary = summarize_runs(runs)
     lines = [
-        "# DAS Sentinel Baseline Benchmark",
+        _PERFORMANCE_SECTION_START,
+        "## Performance benchmark",
         "",
         f"- Date (UTC): {datetime.now(UTC).isoformat(timespec='seconds')}",
         f"- Source file: `{source}` ({N_CHANNELS} ch x {SAMPLE_RATE_HZ:.0f} Hz x {DURATION_S:.0f} s)",
@@ -192,6 +225,7 @@ def render_report(runs: list[dict], source: Path, device: str) -> str:
             f"- Wall time: {run['wall_seconds']} s",
             f"- Peak RSS: {run['peak_rss_bytes'] / 1e6:.1f} MB",
             f"- Backend: {run['actual_backend']} (fallback: {run['fallback_reason'] or 'none'})",
+            f"- Event IDs: {run['event_ids']}",
             f"- Events: {run['event_count']} {run['event_labels']}",
             "",
             "| Stage | ms |",
@@ -199,20 +233,43 @@ def render_report(runs: list[dict], source: Path, device: str) -> str:
         ]
         lines += [f"| {stage} | {elapsed} |" for stage, elapsed in run["timings_ms"].items()]
         lines.append("")
-    labels = [tuple(run["event_labels"]) for run in runs]
-    parity = "PASS" if len(set(labels)) <= 1 else "FAIL"
-    mean_wall = sum(run["wall_seconds"] for run in runs) / len(runs)
     lines += [
-        "## Parity",
+        "## Gate summary",
         "",
-        f"- Repeat-run label parity: {parity} ({len(runs)} runs)",
-        f"- Mean wall time: {mean_wall:.2f} s",
+        "```json",
+        json.dumps(summary, indent=2),
+        "```",
         "",
-        "Accuracy claims for urban/submarine deployments are intentionally absent:",
-        "no local labelled samples exist for those cable types.",
-        "",
+        _PERFORMANCE_SECTION_END,
     ]
     return "\n".join(lines)
+
+
+def write_report(out: Path, performance_section: str) -> None:
+    """Append or replace only the benchmark section of an acceptance report."""
+    existing = out.read_text(encoding="utf-8") if out.exists() else ""
+    if (
+        _PERFORMANCE_SECTION_START in existing
+        and _PERFORMANCE_SECTION_END in existing
+    ):
+        before, _, remainder = existing.partition(_PERFORMANCE_SECTION_START)
+        _, _, after = remainder.partition(_PERFORMANCE_SECTION_END)
+        out.write_text(
+            before.rstrip() + "\n\n" + performance_section + after,
+            encoding="utf-8",
+        )
+        return
+    legacy_heading = "\n## 性能基准\n"
+    legacy_start = existing.find(legacy_heading)
+    if legacy_start != -1:
+        next_heading = existing.find("\n## ", legacy_start + len(legacy_heading))
+        after = "" if next_heading == -1 else existing[next_heading:]
+        updated = existing[:legacy_start].rstrip() + "\n\n" + performance_section + after
+    elif existing:
+        updated = existing.rstrip() + "\n\n" + performance_section + "\n"
+    else:
+        updated = performance_section + "\n"
+    out.write_text(updated, encoding="utf-8")
 
 
 def main() -> None:
@@ -220,6 +277,11 @@ def main() -> None:
     parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
     parser.add_argument("--file", type=Path, default=None, help="reuse an existing baseline file")
     parser.add_argument("--out", type=Path, default=None, help="write a Markdown report here")
+    parser.add_argument(
+        "--enforce",
+        action="store_true",
+        help="exit nonzero unless parity, RSS, and mean wall-time gates pass",
+    )
     parser.add_argument(
         "--work-dir",
         type=Path,
@@ -236,16 +298,23 @@ def main() -> None:
 
     artifact_root = args.work_dir / "artifacts"
     runs = [run_once(source, args.device, artifact_root) for _ in range(REPEAT_RUNS)]
+    summary = summarize_runs(runs)
     report = render_report(runs, source, args.device)
     print(report)
     if args.out is not None:
         args.out.parent.mkdir(parents=True, exist_ok=True)
-        args.out.write_text(report, encoding="utf-8")
+        write_report(args.out, report)
         print(f"report written to {args.out}")
     (args.work_dir / "benchmark-result.json").write_text(
-        json.dumps({"device": args.device, "runs": runs}, indent=2),
+        json.dumps({"device": args.device, "runs": runs, "summary": summary}, indent=2),
         encoding="utf-8",
     )
+    if args.enforce:
+        try:
+            enforce_gate(summary)
+        except PerformanceGateError as error:
+            print(f"performance gate failed: {error}", file=sys.stderr)
+            raise SystemExit(1) from error
 
 
 if __name__ == "__main__":

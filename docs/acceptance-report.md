@@ -45,12 +45,72 @@
 - 注意：`jjk__3400m_4m_2_...` 批次命名中 `2` 可能为抽取因子，间距推断存在歧义，
   标定该批次前需人工核对几何（见 `docs/site-calibration.md`）。
 
-## 性能基准
+<!-- DAS_SENTINEL_PERFORMANCE_BENCHMARK:START -->
+## Performance benchmark
 
-`scripts/benchmark_baseline.py` 已交付并通过小文件冒烟（64 通道 × 2 s × 2 次重复
-运行，标签一致性 PASS，峰值 RSS 采样正常）。`1000 × 1000 Hz × 60 s` 全量基线在
-本机网络盘环境下超出单次执行窗口，未产出；验收指标（4 CPU、RSS < 4 GB、均值
-< 60 s）需在指定验收机上执行该脚本后补录本报告。
+- Date (UTC): 2026-08-16T02:17:30+00:00
+- Source file: `benchmark-data\baseline-1000ch-1000hz-60s.h5` (1000 ch x 1000 Hz x 60 s)
+- Requested device: `cpu`
+
+## Versions
+
+- python: 3.12.13
+- platform: Windows-10-10.0.19045-SP0
+- das-sentinel: 0.1.0
+- numpy: 2.5.1
+- scipy: 1.18.0
+- h5py: 3.16.0
+- scikit-learn: 1.9.0
+
+## Runs
+
+### Run 1
+
+- Wall time: 51.82 s
+- Peak RSS: 1186.4 MB
+- Backend: cpu (fallback: none)
+- Event IDs: []
+- Events: 0 []
+
+| Stage | ms |
+| --- | ---: |
+| classify | 0.0 |
+| detect | 28029.8 |
+| fuse | 0.0 |
+| preprocess | 20248.8 |
+| read | 3363.5 |
+| render | 0.0 |
+| total | 51798.2 |
+
+### Run 2
+
+- Wall time: 51.06 s
+- Peak RSS: 1187.8 MB
+- Backend: cpu (fallback: none)
+- Event IDs: []
+- Events: 0 []
+
+| Stage | ms |
+| --- | ---: |
+| classify | 0.0 |
+| detect | 28047.2 |
+| fuse | 0.0 |
+| preprocess | 20145.3 |
+| read | 2690.2 |
+| render | 0.0 |
+| total | 51047.4 |
+
+## Gate summary
+
+```json
+{
+  "mean_wall_seconds": 51.44,
+  "max_peak_rss_bytes": 1187782656,
+  "parity": true
+}
+```
+
+<!-- DAS_SENTINEL_PERFORMANCE_BENCHMARK:END -->
 
 ## 准确率声明边界
 
