@@ -100,11 +100,16 @@ export default function ArtifactViewer({
 
   useEffect(() => {
     if (!fullscreen) return;
-    const handleEscape = (event: globalThis.KeyboardEvent) => {
+    const handleDialogKeyDown = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Tab") {
+        event.preventDefault();
+        closeButtonRef.current?.focus();
+        return;
+      }
       if (event.key === "Escape") closeFullscreen();
     };
-    document.addEventListener("keydown", handleEscape);
-    return () => document.removeEventListener("keydown", handleEscape);
+    document.addEventListener("keydown", handleDialogKeyDown);
+    return () => document.removeEventListener("keydown", handleDialogKeyDown);
   }, [closeFullscreen, fullscreen]);
 
   if (!active) {

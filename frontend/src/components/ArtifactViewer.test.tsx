@@ -143,7 +143,12 @@ it("focuses the fullscreen close control and restores its trigger on Escape", as
   const trigger = await screen.findByRole("button", { name: "全屏查看" });
 
   await userEvent.click(trigger);
-  expect(screen.getByRole("button", { name: "关闭全屏" })).toHaveFocus();
+  const close = screen.getByRole("button", { name: "关闭全屏" });
+  expect(close).toHaveFocus();
+  await userEvent.tab();
+  expect(close).toHaveFocus();
+  await userEvent.tab({ shift: true });
+  expect(close).toHaveFocus();
   await userEvent.keyboard("{Escape}");
 
   expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
