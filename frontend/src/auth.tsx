@@ -7,7 +7,12 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { api, setCsrfToken, type SessionInfo } from "./api";
+import {
+  api,
+  setCsrfToken,
+  setUnauthorizedHandler,
+  type SessionInfo,
+} from "./api";
 
 interface AuthState {
   authenticated: boolean;
@@ -21,6 +26,18 @@ const AuthContext = createContext<AuthState | null>(null);
 export function AuthProvider({ children }: { children: ReactNode }) {
   const [authenticated, setAuthenticated] = useState(false);
   const [loading, setLoading] = useState(true);
+  const [logoutError, setLogoutError] = useState("");
+
+  const clearSession = useCallback(() => {
+    setCsrfToken("");
+    setAuthenticated(false);
+    setLogoutError("");
+  }, []);
+
+  useEffect(() => {
+    setUnauthorizedHandler(clearSession);
+    return () => setUnauthorizedHandler(null);
+  }, [clearSession]);
 
   useEffect(() => {
     let cancelled = false;
@@ -52,17 +69,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const logout = useCallback(async () => {
     try {
       await api.delete<void>("/api/v1/session");
-    } finally {
-      setCsrfToken("");
-      setAuthenticated(false);
+      clearSession();
+    } catch {
+      setLogoutError("退出失败");
     }
-  }, []);
+  }, [clearSession]);
 
   const value = useMemo(
     () => ({ authenticated, loading, login, logout }),
     [authenticated, loading, login, logout],
   );
-  return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;
+  return (
+    <AuthContext.Provider value={value}>
+      {logoutError && <p className="error" role="alert">{logoutError}</p>}
+      {children}
+    </AuthContext.Provider>
+  );
 }
 
 export function useAuth(): AuthState {

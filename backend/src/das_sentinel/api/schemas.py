@@ -45,6 +45,12 @@ class SessionResponse(StrictSchema):
     csrf_token: str
 
 
+class DashboardResponse(StrictSchema):
+    job_counts: dict[str, int]
+    today_event_count: int
+    machine_label_counts: dict[str, int]
+
+
 class ProfileCreate(ProcessingProfile):
     model_config = ConfigDict(frozen=True, extra="forbid")
 

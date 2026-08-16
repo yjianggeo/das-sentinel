@@ -19,6 +19,7 @@ from starlette.staticfiles import StaticFiles
 from das_sentinel.api.routes import health_router
 from das_sentinel.api.routes.artifacts import router as artifacts_router
 from das_sentinel.api.routes.auth import router as auth_router
+from das_sentinel.api.routes.dashboard import router as dashboard_router
 from das_sentinel.api.routes.events import router as events_router
 from das_sentinel.api.routes.internal import router as internal_router
 from das_sentinel.api.routes.jobs import router as jobs_router
@@ -83,6 +84,7 @@ def create_app(settings: Settings) -> FastAPI:
         https_only=settings.secure_cookies,
     )
     app.include_router(auth_router, prefix="/api/v1")
+    app.include_router(dashboard_router, prefix="/api/v1")
     app.include_router(sites_router, prefix="/api/v1")
     app.include_router(jobs_router, prefix="/api/v1")
     app.include_router(events_router, prefix="/api/v1")

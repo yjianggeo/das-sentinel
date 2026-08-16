@@ -9,9 +9,14 @@ export class ApiError extends Error {
 }
 
 let csrfToken = "";
+let unauthorizedHandler: (() => void) | null = null;
 
 export function setCsrfToken(token: string): void {
   csrfToken = token;
+}
+
+export function setUnauthorizedHandler(handler: (() => void) | null): void {
+  unauthorizedHandler = handler;
 }
 
 async function request<T>(
@@ -45,17 +50,20 @@ async function request<T>(
     setCsrfToken(response.headers.get("x-csrf-token") ?? csrfToken);
     return undefined as T;
   }
-  if (!response.ok) {
-    let detail = response.statusText;
-    try {
-      const payload = (await response.json()) as { detail?: string };
-      detail = payload.detail ?? detail;
-    } catch {
-      // keep statusText
-    }
-    throw new ApiError(response.status, detail);
-  }
+  if (!response.ok) throw await apiErrorFromResponse(response);
   return (await response.json()) as T;
+}
+
+async function apiErrorFromResponse(response: Response): Promise<ApiError> {
+  let detail = response.statusText;
+  try {
+    const payload = (await response.json()) as { detail?: string };
+    detail = payload.detail ?? detail;
+  } catch {
+    // keep statusText
+  }
+  if (response.status === 401) unauthorizedHandler?.();
+  return new ApiError(response.status, detail);
 }
 
 export const api = {
@@ -69,6 +77,12 @@ export const api = {
 export interface SessionInfo {
   admin_id: number;
   csrf_token: string;
+}
+
+export interface Dashboard {
+  job_counts: Record<string, number>;
+  today_event_count: number;
+  machine_label_counts: Record<string, number>;
 }
 
 export interface ProfileInfo {
