@@ -111,10 +111,9 @@ export default function ArtifactViewer({
     return <p className="loading">此事件没有图件。</p>;
   }
   const meta = KIND_META[active.kind] ?? { name: active.kind, alt: active.kind };
-  const tabId = `artifact-tab-${active.kind}`;
-  const panelId = `artifact-panel-${active.kind}`;
 
   const selectIndex = (index: number) => {
+    if (images[index].kind === active.kind) return;
     setLoadState({ kind: "loading" });
     setActiveKind(images[index].kind);
   };
@@ -179,34 +178,41 @@ export default function ArtifactViewer({
           下载
         </a>
       </div>
-      <div
-        id={panelId}
-        role="tabpanel"
-        aria-labelledby={tabId}
-        className="artifact-panel"
-      >
-        {loadState.kind === "loading" && (
-          <p className="loading">正在加载图件…</p>
-        )}
-        {loadState.kind === "error" && (
-          <div className="artifact-error">
-            <p className="error" role="alert">{loadState.message}</p>
-            <button type="button" className="subtle" onClick={retry}>
-              重试图件
-            </button>
-          </div>
-        )}
-        {loadState.kind === "ready" && (
-          <button
-            type="button"
-            className="artifact-image-button"
-            onClick={openFullscreen}
-            aria-label="全屏查看"
+      {images.map((item) => {
+        const isActive = item.kind === active.kind;
+        return (
+          <div
+            key={item.kind}
+            id={`artifact-panel-${item.kind}`}
+            role="tabpanel"
+            aria-labelledby={`artifact-tab-${item.kind}`}
+            className="artifact-panel"
+            hidden={!isActive}
           >
-            <img src={loadState.url} alt={meta.alt} onError={showDecodeError} />
-          </button>
-        )}
-      </div>
+            {isActive && loadState.kind === "loading" && (
+              <p className="loading">正在加载图件…</p>
+            )}
+            {isActive && loadState.kind === "error" && (
+              <div className="artifact-error">
+                <p className="error" role="alert">{loadState.message}</p>
+                <button type="button" className="subtle" onClick={retry}>
+                  重试图件
+                </button>
+              </div>
+            )}
+            {isActive && loadState.kind === "ready" && (
+              <button
+                type="button"
+                className="artifact-image-button"
+                onClick={openFullscreen}
+                aria-label="全屏查看"
+              >
+                <img src={loadState.url} alt={meta.alt} onError={showDecodeError} />
+              </button>
+            )}
+          </div>
+        );
+      })}
       {fullscreen && loadState.kind === "ready" && (
         <div className="artifact-fullscreen" onClick={closeFullscreen}>
           <div

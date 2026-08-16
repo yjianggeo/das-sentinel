@@ -80,6 +80,47 @@ it("supports wrapped arrow, Home, and End navigation with a linked tabpanel", as
   expect(psd).toHaveFocus();
 });
 
+it("keeps a loaded image visible when selecting the already active tab", async () => {
+  const requests = new Map<string, number>();
+  server.use(
+    http.get("/api/v1/artifacts/:artifactId", ({ params }) => {
+      const artifactId = String(params.artifactId);
+      requests.set(artifactId, (requests.get(artifactId) ?? 0) + 1);
+      return new HttpResponse(new Blob(["png"], { type: "image/png" }));
+    }),
+  );
+  render(<ArtifactViewer artifacts={ARTIFACTS} />);
+  const waterfall = screen.getAllByRole("tab")[0];
+  const psd = screen.getByRole("tab", { name: "PSD" });
+
+  const waterfallImage = await screen.findByRole("img");
+  await userEvent.click(waterfall);
+  waterfall.focus();
+  await userEvent.keyboard("{Home}");
+  expect(waterfallImage).toBeVisible();
+  expect(requests.get("art-1")).toBe(1);
+
+  await userEvent.click(psd);
+  const psdImage = await screen.findByRole("img");
+  await userEvent.click(psd);
+  psd.focus();
+  await userEvent.keyboard("{End}");
+  expect(psdImage).toBeVisible();
+  expect(requests.get("art-2")).toBe(1);
+});
+
+it("renders a bidirectionally linked panel for every artifact tab", () => {
+  render(<ArtifactViewer artifacts={ARTIFACTS} />);
+
+  for (const tab of screen.getAllByRole("tab")) {
+    const panelId = tab.getAttribute("aria-controls");
+    const panel = panelId ? document.getElementById(panelId) : null;
+    expect(panel).not.toBeNull();
+    expect(panel).toHaveAttribute("role", "tabpanel");
+    expect(panel).toHaveAttribute("aria-labelledby", tab.id);
+  }
+});
+
 it("shows and retries an image decoding failure", async () => {
   let requests = 0;
   server.use(
