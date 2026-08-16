@@ -17,41 +17,121 @@ const LABEL_NAMES: Record<string, string> = {
   unknown: "待定",
 };
 
+const PAGE_SIZE = 100;
+
+export interface EventFilters {
+  machineLabel: "" | EventSummary["machine_label"];
+  reviewed: "" | "true" | "false";
+}
+
+type CollectionState =
+  | { kind: "loading" }
+  | { kind: "error"; message: string }
+  | {
+      kind: "ready";
+      items: EventSummary[];
+      hasMore: boolean;
+      loadingMore: boolean;
+    };
+
+function isAbortError(cause: unknown): boolean {
+  return cause instanceof DOMException && cause.name === "AbortError";
+}
+
 export default function EventsPage() {
-  const [events, setEvents] = useState<EventSummary[] | null>(null);
+  const [filters, setFilters] = useState<EventFilters>({
+    machineLabel: "",
+    reviewed: "",
+  });
+  const [collection, setCollection] = useState<CollectionState>({ kind: "loading" });
+  const [reloadVersion, setReloadVersion] = useState(0);
+  const [moreError, setMoreError] = useState("");
   const [selected, setSelected] = useState<EventSummary | null>(null);
   const [detail, setDetail] = useState<EventDetail | null>(null);
   const [similar, setSimilar] = useState<EventSummary[]>([]);
-  const [error, setError] = useState("");
+  const [detailError, setDetailError] = useState("");
   const requestSequence = useRef(0);
-  const activeController = useRef<AbortController | null>(null);
+  const collectionSequence = useRef(0);
+  const activeDetailController = useRef<AbortController | null>(null);
+  const activeCollectionController = useRef<AbortController | null>(null);
+  const selectedRef = useRef<EventSummary | null>(null);
+  const nextOffset = useRef(0);
 
   useEffect(() => {
-    api
-      .get<EventSummary[]>("/api/v1/events", { limit: "100" })
-      .then(setEvents)
-      .catch(() => setError("无法加载事件"));
+    selectedRef.current = selected;
+  }, [selected]);
+
+  const clearSelected = useCallback(() => {
+    requestSequence.current += 1;
+    activeDetailController.current?.abort();
+    setSelected(null);
+    setDetail(null);
+    setSimilar([]);
+    setDetailError("");
   }, []);
 
-  useEffect(() => () => activeController.current?.abort(), []);
+  useEffect(() => {
+    activeCollectionController.current?.abort();
+    const controller = new AbortController();
+    activeCollectionController.current = controller;
+    const sequence = ++collectionSequence.current;
+    const params: Record<string, string> = {
+      limit: String(PAGE_SIZE),
+      offset: "0",
+    };
+    if (filters.machineLabel) params.machine_label = filters.machineLabel;
+    if (filters.reviewed) params.reviewed = filters.reviewed;
+    nextOffset.current = 0;
+    setCollection({ kind: "loading" });
+    setMoreError("");
+    api
+      .get<EventSummary[]>("/api/v1/events", params, controller.signal)
+      .then((items) => {
+        if (sequence !== collectionSequence.current) return;
+        setCollection({
+          kind: "ready",
+          items,
+          hasMore: items.length === PAGE_SIZE,
+          loadingMore: false,
+        });
+        nextOffset.current = items.length;
+        const currentSelected = selectedRef.current;
+        if (currentSelected && !items.some((event) => event.id === currentSelected.id)) {
+          clearSelected();
+        }
+      })
+      .catch((cause: unknown) => {
+        if (isAbortError(cause) || sequence !== collectionSequence.current) return;
+        setCollection({ kind: "error", message: "无法加载事件" });
+      });
+    return () => controller.abort();
+  }, [clearSelected, filters.machineLabel, filters.reviewed, reloadVersion]);
+
+  useEffect(
+    () => () => {
+      activeDetailController.current?.abort();
+      activeCollectionController.current?.abort();
+    },
+    [],
+  );
 
   const openEvent = useCallback((event: EventSummary) => {
     const sequence = ++requestSequence.current;
-    activeController.current?.abort();
+    activeDetailController.current?.abort();
     const controller = new AbortController();
-    activeController.current = controller;
+    activeDetailController.current = controller;
     setSelected(event);
     setDetail(null);
     setSimilar([]);
-    setError("");
+    setDetailError("");
     api
       .get<EventDetail>(`/api/v1/events/${event.id}`, undefined, controller.signal)
       .then((value) => {
         if (sequence === requestSequence.current) setDetail(value);
       })
       .catch((cause: unknown) => {
-        if (cause instanceof DOMException && cause.name === "AbortError") return;
-        if (sequence === requestSequence.current) setError("无法加载事件详情");
+        if (isAbortError(cause)) return;
+        if (sequence === requestSequence.current) setDetailError("无法加载事件详情");
       });
     api
       .get<EventSummary[]>(
@@ -63,41 +143,89 @@ export default function EventsPage() {
         if (sequence === requestSequence.current) setSimilar(value);
       })
       .catch((cause: unknown) => {
-        if (cause instanceof DOMException && cause.name === "AbortError") return;
+        if (isAbortError(cause)) return;
         if (sequence === requestSequence.current) setSimilar([]);
       });
   }, []);
 
-  const reloadEvents = useCallback(() => {
+  const loadMore = useCallback(() => {
+    if (collection.kind !== "ready" || !collection.hasMore || collection.loadingMore) return;
+    activeCollectionController.current?.abort();
+    const controller = new AbortController();
+    activeCollectionController.current = controller;
+    const sequence = collectionSequence.current;
+    const params: Record<string, string> = {
+      limit: String(PAGE_SIZE),
+      offset: String(nextOffset.current),
+    };
+    if (filters.machineLabel) params.machine_label = filters.machineLabel;
+    if (filters.reviewed) params.reviewed = filters.reviewed;
+    setCollection({ ...collection, loadingMore: true });
+    setMoreError("");
     api
-      .get<EventSummary[]>("/api/v1/events", { limit: "100" })
-      .then(setEvents)
-      .catch(() => undefined);
-    if (selected) {
-      const sequence = requestSequence.current;
-      api
-        .get<EventDetail>(`/api/v1/events/${selected.id}`)
-        .then((value) => {
-          if (sequence === requestSequence.current) setDetail(value);
-        })
-        .catch(() => undefined);
-    }
-  }, [selected]);
+      .get<EventSummary[]>("/api/v1/events", params, controller.signal)
+      .then((page) => {
+        if (sequence !== collectionSequence.current) return;
+        nextOffset.current += page.length;
+        setCollection((current) => {
+          if (current.kind !== "ready") return current;
+          const seen = new Set(current.items.map((event) => event.id));
+          return {
+            kind: "ready",
+            items: [...current.items, ...page.filter((event) => !seen.has(event.id))],
+            hasMore: page.length === PAGE_SIZE,
+            loadingMore: false,
+          };
+        });
+      })
+      .catch((cause: unknown) => {
+        if (isAbortError(cause) || sequence !== collectionSequence.current) return;
+        setCollection((current) =>
+          current.kind === "ready" ? { ...current, loadingMore: false } : current,
+        );
+        setMoreError("无法加载更多事件");
+      });
+  }, [collection, filters.machineLabel, filters.reviewed]);
 
-  if (events === null) {
-    return <p className="loading">正在加载…</p>;
+  const reloadEvents = useCallback(() => {
+    setReloadVersion((current) => current + 1);
+    if (selectedRef.current) openEvent(selectedRef.current);
+  }, [openEvent]);
+
+  if (collection.kind === "error") {
+    return (
+      <div>
+        <p className="error" role="alert">{collection.message}</p>
+        <button type="button" className="subtle" onClick={reloadEvents}>重试</button>
+      </div>
+    );
   }
+
   return (
     <section className="events-layout">
-      {error && (
-        <p className="error" role="alert">
-          {error}
-        </p>
-      )}
-      <EventQueue events={events} selectedId={selected?.id ?? null} onSelect={openEvent} />
+      <div>
+        {moreError && <p className="error" role="alert">{moreError}</p>}
+        {collection.kind === "loading" && <p className="loading">正在加载…</p>}
+        <EventQueue
+          events={collection.kind === "ready" ? collection.items : []}
+          selectedId={selected?.id ?? null}
+          onSelect={openEvent}
+          machineLabel={filters.machineLabel}
+          reviewed={filters.reviewed}
+          onMachineLabelChange={(machineLabel) =>
+            setFilters((current) => ({ ...current, machineLabel }))
+          }
+          onReviewedChange={(reviewed) => setFilters((current) => ({ ...current, reviewed }))}
+          hasMore={collection.kind === "ready" && collection.hasMore}
+          loadingMore={collection.kind === "ready" && collection.loadingMore}
+          onLoadMore={loadMore}
+          showEmpty={collection.kind === "ready"}
+        />
+      </div>
       <div className="event-detail">
+        {detailError && <p className="error" role="alert">{detailError}</p>}
         {selected === null && <p className="loading">从左侧队列选择一个事件。</p>}
-        {selected !== null && detail === null && (
+        {selected !== null && detail === null && !detailError && (
           <p className="loading">正在加载详情…</p>
         )}
         {selected !== null && detail !== null && selected.id === detail.id && (
@@ -111,8 +239,7 @@ export default function EventsPage() {
                 </span>
                 　人工复核：
                 {detail.latest_review
-                  ? LABEL_NAMES[detail.latest_review.label] ??
-                    detail.latest_review.label
+                  ? LABEL_NAMES[detail.latest_review.label] ?? detail.latest_review.label
                   : "未复核"}
               </p>
             </header>

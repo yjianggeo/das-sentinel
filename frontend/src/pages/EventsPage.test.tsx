@@ -595,3 +595,221 @@ for (const staleOutcome of ["success", "failure"] as const) {
     expect(firstBodies).toHaveLength(1);
   });
 }
+
+function makeSummaries(count: number, start = 0) {
+  return Array.from({ length: count }, (_, index) => ({
+    ...SUMMARY,
+    id: `page-event-${start + index}`,
+    event_uid: `page-uid-${start + index}`,
+    occurred_at: `2026-07-27T10:${String((start + index) % 60).padStart(2, "0")}:00Z`,
+  }));
+}
+
+it("sends server filters and appends the next bounded page", async () => {
+  const queries: URL[] = [];
+  server.use(
+    http.get("/api/v1/events", ({ request }) => {
+      const url = new URL(request.url);
+      queries.push(url);
+      return HttpResponse.json(
+        url.searchParams.get("offset") === "100"
+          ? [...makeSummaries(2, 100), makeSummaries(1, 99)[0]]
+          : makeSummaries(100),
+      );
+    }),
+  );
+  renderApp("/events");
+
+  await userEvent.selectOptions(await screen.findByLabelText("机器标签"), "traffic");
+  await userEvent.selectOptions(screen.getByLabelText("复核状态"), "false");
+  await userEvent.click(await screen.findByRole("button", { name: "加载更多" }));
+
+  expect(
+    queries.some(
+      (url) =>
+        url.searchParams.get("limit") === "100" &&
+        url.searchParams.get("offset") === "0" &&
+        url.searchParams.get("machine_label") === "traffic" &&
+        url.searchParams.get("reviewed") === "false",
+    ),
+  ).toBe(true);
+  expect(queries.at(-1)?.searchParams.get("offset")).toBe("100");
+  expect(screen.getAllByRole("button", { name: /^事件 / })).toHaveLength(102);
+});
+
+it("replaces initial loading with a retryable error", async () => {
+  let attempts = 0;
+  server.use(
+    http.get("/api/v1/events", () => {
+      attempts += 1;
+      if (attempts === 1) {
+        return HttpResponse.json({ detail: "failed" }, { status: 500 });
+      }
+      return HttpResponse.json([SUMMARY]);
+    }),
+  );
+  renderApp("/events");
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("无法加载事件");
+  expect(screen.queryByText("正在加载…")).not.toBeInTheDocument();
+  await userEvent.click(screen.getByRole("button", { name: "重试" }));
+  expect(await screen.findByText("2026-07-26 10:42:16")).toBeVisible();
+});
+
+it("shows an explicit empty collection state", async () => {
+  server.use(http.get("/api/v1/events", () => HttpResponse.json([])));
+  renderApp("/events");
+
+  expect(await screen.findByText("暂无事件")).toBeVisible();
+});
+
+it("keeps loaded events visible when loading more fails", async () => {
+  server.use(
+    http.get("/api/v1/events", ({ request }) => {
+      const offset = new URL(request.url).searchParams.get("offset");
+      if (offset === "100") {
+        return HttpResponse.json({ detail: "failed" }, { status: 500 });
+      }
+      return HttpResponse.json(makeSummaries(100));
+    }),
+  );
+  renderApp("/events");
+
+  await userEvent.click(await screen.findByRole("button", { name: "加载更多" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("无法加载更多事件");
+  expect(screen.getAllByRole("button", { name: /^事件 / })).toHaveLength(100);
+});
+
+it("discards a superseded filter response and clears a filtered-out selection", async () => {
+  const staleFilter = deferredResponse(1);
+  const staleDetail = deferredResponse(2);
+  server.use(
+    http.get("/api/v1/events", async ({ request }) => {
+      const label = new URL(request.url).searchParams.get("machine_label");
+      if (label === "traffic") {
+        staleFilter.markStarted();
+        await staleFilter.promise;
+        staleFilter.markDelivered();
+        return HttpResponse.json([STALE_SIMILAR]);
+      }
+      if (label === "blast") return HttpResponse.json([SUMMARY_TWO]);
+      return HttpResponse.json([SUMMARY]);
+    }),
+    http.get("/api/v1/events/event-1", async () => {
+      staleDetail.markStarted();
+      await staleDetail.promise;
+      staleDetail.markDelivered();
+      return HttpResponse.json(DETAIL);
+    }),
+    http.get("/api/v1/events/event-1/similar", async () => {
+      staleDetail.markStarted();
+      await staleDetail.promise;
+      staleDetail.markDelivered();
+      return HttpResponse.json([STALE_SIMILAR]);
+    }),
+  );
+  renderApp("/events");
+
+  await userEvent.click(await screen.findByRole("button", { name: "事件 event-1" }));
+  await staleDetail.started;
+  const filter = screen.getByLabelText("机器标签");
+  await userEvent.selectOptions(filter, "traffic");
+  await staleFilter.started;
+  await userEvent.selectOptions(filter, "blast");
+
+  expect(await screen.findByRole("button", { name: "事件 event-2" })).toBeVisible();
+  expect(screen.queryByRole("button", { name: "事件 event-1" })).not.toBeInTheDocument();
+  await act(async () => {
+    staleFilter.resolve();
+    staleDetail.resolve();
+    await staleFilter.delivered;
+    await staleDetail.delivered;
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+
+  expect(screen.queryByRole("button", { name: "事件 event-stale-similar" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("heading", { name: "2026-07-26 10:42:16" })).not.toBeInTheDocument();
+});
+
+it("uses the server page boundary for the next offset when a page contains a duplicate", async () => {
+  const offsets: string[] = [];
+  server.use(
+    http.get("/api/v1/events", ({ request }) => {
+      const offset = new URL(request.url).searchParams.get("offset") ?? "0";
+      offsets.push(offset);
+      if (offset === "0") return HttpResponse.json(makeSummaries(100));
+      if (offset === "100") {
+        return HttpResponse.json([...makeSummaries(99, 100), makeSummaries(1, 99)[0]]);
+      }
+      if (offset === "200") return HttpResponse.json(makeSummaries(2, 200));
+      return HttpResponse.json([]);
+    }),
+  );
+  renderApp("/events");
+
+  await userEvent.click(await screen.findByRole("button", { name: "加载更多" }));
+  await userEvent.click(await screen.findByRole("button", { name: "加载更多" }));
+
+  expect(offsets).toEqual(["0", "100", "200"]);
+  expect(screen.getAllByRole("button", { name: /^事件 / })).toHaveLength(201);
+});
+
+it("refreshes the selected detail and similar events after a review", async () => {
+  let detailRequests = 0;
+  let similarRequests = 0;
+  server.use(
+    http.get("/api/v1/events", () => HttpResponse.json([SUMMARY])),
+    http.get("/api/v1/events/event-1", () => {
+      detailRequests += 1;
+      return HttpResponse.json(DETAIL);
+    }),
+    http.get("/api/v1/events/event-1/similar", () => {
+      similarRequests += 1;
+      return HttpResponse.json([]);
+    }),
+    http.post("/api/v1/events/event-1/reviews", () =>
+      HttpResponse.json(
+        { id: 13, label: "earthquake", note: null, created_at: "2026-07-26T11:00:00Z" },
+        { status: 201 },
+      ),
+    ),
+  );
+  renderApp("/events");
+
+  await userEvent.click(await screen.findByRole("button", { name: "事件 event-1" }));
+  await userEvent.selectOptions(await screen.findByLabelText("人工标签"), "earthquake");
+  await userEvent.click(screen.getByRole("button", { name: "保存复核" }));
+  await screen.findByText("已保存");
+
+  await waitFor(() => {
+    expect(detailRequests).toBe(2);
+    expect(similarRequests).toBe(2);
+  });
+});
+
+it("aborts the latest load-more request when the page unmounts", async () => {
+  const loadMore = deferredResponse(1);
+  let loadMoreSignal: AbortSignal | undefined;
+  server.use(
+    http.get("/api/v1/events", async ({ request }) => {
+      if (new URL(request.url).searchParams.get("offset") !== "100") {
+        return HttpResponse.json(makeSummaries(100));
+      }
+      loadMoreSignal = request.signal;
+      loadMore.markStarted();
+      await loadMore.promise;
+      loadMore.markDelivered();
+      return HttpResponse.json([]);
+    }),
+  );
+  const app = renderApp("/events");
+
+  await userEvent.click(await screen.findByRole("button", { name: "加载更多" }));
+  await loadMore.started;
+  await act(async () => {
+    app.unmount();
+    expect(loadMoreSignal?.aborted).toBe(true);
+    loadMore.resolve();
+    await loadMore.delivered;
+  });
+});
