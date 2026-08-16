@@ -2,7 +2,8 @@ import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
-import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, expect, it, vi } from "vitest";
+import * as apiModule from "../api";
 import { renderApp } from "../test/render";
 
 const server = setupServer();
@@ -10,6 +11,27 @@ const server = setupServer();
 beforeAll(() => server.listen());
 beforeEach(() => server.resetHandlers());
 afterAll(() => server.close());
+afterEach(() => vi.restoreAllMocks());
+
+it("does not arm global 401 handling while the session is unauthenticated", async () => {
+  const unauthorizedHandlerSpy = vi.spyOn(apiModule, "setUnauthorizedHandler");
+  server.use(
+    http.get("/api/v1/session", () => new HttpResponse(null, { status: 401 })),
+    http.post("/api/v1/session", () => new HttpResponse(null, { status: 401 })),
+  );
+  renderApp("/login");
+
+  const submit = await screen.findByRole("button");
+  const password = submit.closest("form")?.querySelector("input");
+  if (!(password instanceof HTMLInputElement)) {
+    throw new Error("login password input is missing");
+  }
+  await userEvent.type(password, "wrong");
+  await userEvent.click(submit);
+
+  await screen.findByRole("alert");
+  expect(unauthorizedHandlerSpy).not.toHaveBeenCalledWith(expect.any(Function));
+});
 
 it("logs in and redirects to the dashboard", async () => {
   let authenticated = false;

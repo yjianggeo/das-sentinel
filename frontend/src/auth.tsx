@@ -35,9 +35,18 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    setUnauthorizedHandler(clearSession);
+    if (!authenticated) {
+      setUnauthorizedHandler(null);
+      return () => setUnauthorizedHandler(null);
+    }
+
+    const handleUnauthorized = () => {
+      setUnauthorizedHandler(null);
+      clearSession();
+    };
+    setUnauthorizedHandler(handleUnauthorized);
     return () => setUnauthorizedHandler(null);
-  }, [clearSession]);
+  }, [authenticated, clearSession]);
 
   useEffect(() => {
     let cancelled = false;
