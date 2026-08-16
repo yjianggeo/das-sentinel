@@ -3,16 +3,26 @@ import userEvent from "@testing-library/user-event";
 import { transferableAbortController } from "node:util";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
-import { afterAll, beforeAll, beforeEach } from "vitest";
+import { afterAll, beforeAll, beforeEach, vi } from "vitest";
 import ReviewForm from "../components/ReviewForm";
 import { renderApp } from "../test/render";
 
 const server = setupServer();
 const domAbortController = globalThis.AbortController;
 const nativeAbortController = transferableAbortController().constructor as typeof AbortController;
+const originalCreateObjectUrl = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
+const originalRevokeObjectUrl = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
 
 beforeAll(() => {
   globalThis.AbortController = nativeAbortController;
+  Object.defineProperty(URL, "createObjectURL", {
+    configurable: true,
+    value: vi.fn(() => "blob:event-artifact"),
+  });
+  Object.defineProperty(URL, "revokeObjectURL", {
+    configurable: true,
+    value: vi.fn(),
+  });
   server.listen();
 });
 beforeEach(() => {
@@ -21,11 +31,24 @@ beforeEach(() => {
     http.get("/api/v1/session", () =>
       HttpResponse.json({ admin_id: 1, csrf_token: "token-1" }),
     ),
+    http.get("/api/v1/artifacts/:artifactId", () =>
+      new HttpResponse(new Blob(["png"], { type: "image/png" })),
+    ),
   );
 });
 afterAll(() => {
   server.close();
   globalThis.AbortController = domAbortController;
+  if (originalCreateObjectUrl) {
+    Object.defineProperty(URL, "createObjectURL", originalCreateObjectUrl);
+  } else {
+    Reflect.deleteProperty(URL, "createObjectURL");
+  }
+  if (originalRevokeObjectUrl) {
+    Object.defineProperty(URL, "revokeObjectURL", originalRevokeObjectUrl);
+  } else {
+    Reflect.deleteProperty(URL, "revokeObjectURL");
+  }
 });
 
 const SUMMARY = {
@@ -197,6 +220,41 @@ it("switches artifact tabs", async () => {
   await userEvent.click(await screen.findByRole("tab", { name: "PSD" }));
 
   expect(await screen.findByAltText("事件功率谱")).toBeVisible();
+});
+
+it("returns to login when an artifact request becomes unauthorized", async () => {
+  useEventHandlers();
+  server.use(
+    http.get("/api/v1/artifacts/art-1", () =>
+      HttpResponse.json({ detail: "Unauthorized" }, { status: 401 }),
+    ),
+  );
+  renderApp("/events");
+
+  await userEvent.click(await screen.findByText("2026-07-26 10:42:16"));
+
+  expect(await screen.findByRole("button", { name: "登录" })).toBeVisible();
+});
+
+it("keeps event detail visible when artifact integrity fails", async () => {
+  useEventHandlers();
+  server.use(
+    http.get("/api/v1/artifacts/art-1", () =>
+      HttpResponse.json(
+        { detail: "Artifact integrity check failed" },
+        { status: 409 },
+      ),
+    ),
+  );
+  renderApp("/events");
+
+  await userEvent.click(await screen.findByText("2026-07-26 10:42:16"));
+
+  expect(
+    await screen.findByText("图件完整性校验失败，请联系管理员"),
+  ).toBeVisible();
+  expect(screen.getByRole("button", { name: "重试图件" })).toBeVisible();
+  expect(screen.getByText("规则判断")).toBeVisible();
 });
 
 it("submits a human review and keeps the machine label", async () => {

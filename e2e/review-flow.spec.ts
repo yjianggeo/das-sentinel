@@ -18,8 +18,18 @@ test("admin logs in, reviews the seeded event, and saves the human label", async
   await page.goto("/events");
   await page.locator(".queue-item").first().click();
 
-  await page.getByRole("tab").first().click();
+  const firstTab = page.getByRole("tab").first();
+  const secondTab = page.getByRole("tab").nth(1);
+  await firstTab.focus();
+  await firstTab.press("ArrowRight");
+  await expect(secondTab).toHaveAttribute("aria-selected", "true");
   await expect(page.locator(".artifact-viewer img")).toBeVisible();
+  const fullscreenTrigger = page.getByRole("button", { name: "全屏查看" });
+  await fullscreenTrigger.click();
+  await expect(page.getByRole("button", { name: "关闭全屏" })).toBeFocused();
+  await page.keyboard.press("Escape");
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+  await expect(fullscreenTrigger).toBeFocused();
   await page.locator(".review-form select").selectOption("earthquake");
   await page.locator(".review-form textarea").fill("e2e synthetic event");
   await page.locator('.review-form button[type="submit"]').click();
@@ -27,6 +37,23 @@ test("admin logs in, reviews the seeded event, and saves the human label", async
 
   await page.goto("/models");
   await expect(page.locator("h1")).toBeVisible();
+});
+
+test("artifact integrity failure stays visible and retryable", async ({ page }) => {
+  await login(page);
+  await page.route("**/api/v1/artifacts/*", (route) =>
+    route.fulfill({
+      status: 409,
+      contentType: "application/json",
+      body: JSON.stringify({ detail: "Artifact integrity check failed" }),
+    }),
+  );
+  await page.goto("/events");
+  await page.locator(".queue-item").first().click();
+
+  await expect(page.getByText("图件完整性校验失败，请联系管理员")).toBeVisible();
+  await expect(page.getByRole("button", { name: "重试图件" })).toBeVisible();
+  await expect(page.getByText("规则判断")).toBeVisible();
 });
 
 test("late detail response cannot replace the latest selection", async ({ page }) => {

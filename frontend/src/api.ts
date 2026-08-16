@@ -54,6 +54,16 @@ async function request<T>(
   return (await response.json()) as T;
 }
 
+async function requestBlob(path: string, signal?: AbortSignal): Promise<Blob> {
+  const response = await fetch(new URL(path, window.location.origin), {
+    method: "GET",
+    credentials: "same-origin",
+    signal,
+  });
+  if (!response.ok) throw await apiErrorFromResponse(response);
+  return response.blob();
+}
+
 async function apiErrorFromResponse(response: Response): Promise<ApiError> {
   let detail = response.statusText;
   try {
@@ -69,6 +79,7 @@ async function apiErrorFromResponse(response: Response): Promise<ApiError> {
 export const api = {
   get: <T>(path: string, params?: Record<string, string>, signal?: AbortSignal) =>
     request<T>("GET", path, undefined, params, signal),
+  getBlob: (path: string, signal?: AbortSignal) => requestBlob(path, signal),
   post: <T>(path: string, body?: unknown) => request<T>("POST", path, body),
   patch: <T>(path: string, body: unknown) => request<T>("PATCH", path, body),
   delete: <T>(path: string) => request<T>("DELETE", path),

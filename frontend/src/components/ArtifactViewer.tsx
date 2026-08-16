@@ -1,5 +1,12 @@
-import { useEffect, useState } from "react";
-import type { EventArtifact } from "../api";
+import {
+  useCallback,
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type MouseEvent,
+} from "react";
+import { api, ApiError, type EventArtifact } from "../api";
 
 const KIND_META: Record<string, { name: string; alt: string }> = {
   waterfall_raw: { name: "瀑布图", alt: "事件瀑布图" },
@@ -10,6 +17,15 @@ const KIND_META: Record<string, { name: string; alt: string }> = {
 };
 
 const IMAGE_KINDS = Object.keys(KIND_META);
+
+type ArtifactLoadState =
+  | { kind: "loading" }
+  | { kind: "ready"; url: string }
+  | { kind: "error"; message: string };
+
+function isAbortError(cause: unknown): boolean {
+  return cause instanceof Error && cause.name === "AbortError";
+}
 
 export function artifactUrl(id: string): string {
   return `/api/v1/artifacts/${id}`;
@@ -25,6 +41,13 @@ export default function ArtifactViewer({
     images[0]?.kind ?? "waterfall_raw",
   );
   const [fullscreen, setFullscreen] = useState(false);
+  const [loadState, setLoadState] = useState<ArtifactLoadState>({
+    kind: "loading",
+  });
+  const [retryNumber, setRetryNumber] = useState(0);
+  const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
+  const fullscreenTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     if (images.length > 0 && !images.some((item) => item.kind === activeKind)) {
@@ -33,45 +56,176 @@ export default function ArtifactViewer({
   }, [artifacts, activeKind, images]);
 
   const active = images.find((item) => item.kind === activeKind) ?? images[0];
+  const activeId = active?.id;
+
+  useEffect(() => {
+    if (!activeId) return;
+    const controller = new AbortController();
+    let current = true;
+    let objectUrl: string | null = null;
+    setLoadState({ kind: "loading" });
+    api
+      .getBlob(artifactUrl(activeId), controller.signal)
+      .then((blob) => {
+        if (!current) return;
+        objectUrl = URL.createObjectURL(blob);
+        setLoadState({ kind: "ready", url: objectUrl });
+      })
+      .catch((cause: unknown) => {
+        if (!current || isAbortError(cause)) return;
+        if (cause instanceof ApiError && cause.status === 401) return;
+        setLoadState({
+          kind: "error",
+          message:
+            cause instanceof ApiError && cause.status === 409
+              ? "图件完整性校验失败，请联系管理员"
+              : "图件加载失败",
+        });
+      });
+    return () => {
+      current = false;
+      controller.abort();
+      if (objectUrl !== null) URL.revokeObjectURL(objectUrl);
+    };
+  }, [activeId, retryNumber]);
+
+  useEffect(() => {
+    if (fullscreen) closeButtonRef.current?.focus();
+  }, [fullscreen]);
+
+  const closeFullscreen = useCallback(() => {
+    setFullscreen(false);
+    fullscreenTriggerRef.current?.focus();
+  }, []);
+
+  useEffect(() => {
+    if (!fullscreen) return;
+    const handleEscape = (event: globalThis.KeyboardEvent) => {
+      if (event.key === "Escape") closeFullscreen();
+    };
+    document.addEventListener("keydown", handleEscape);
+    return () => document.removeEventListener("keydown", handleEscape);
+  }, [closeFullscreen, fullscreen]);
+
   if (!active) {
     return <p className="loading">此事件没有图件。</p>;
   }
   const meta = KIND_META[active.kind] ?? { name: active.kind, alt: active.kind };
+  const tabId = `artifact-tab-${active.kind}`;
+  const panelId = `artifact-panel-${active.kind}`;
+
+  const selectIndex = (index: number) => {
+    setLoadState({ kind: "loading" });
+    setActiveKind(images[index].kind);
+  };
+
+  const handleTabKeyDown = (
+    event: KeyboardEvent<HTMLButtonElement>,
+    index: number,
+  ) => {
+    let nextIndex: number | null = null;
+    if (event.key === "ArrowRight") nextIndex = (index + 1) % images.length;
+    if (event.key === "ArrowLeft") {
+      nextIndex = (index - 1 + images.length) % images.length;
+    }
+    if (event.key === "Home") nextIndex = 0;
+    if (event.key === "End") nextIndex = images.length - 1;
+    if (nextIndex === null) return;
+    event.preventDefault();
+    selectIndex(nextIndex);
+    tabRefs.current[nextIndex]?.focus();
+  };
+
+  const openFullscreen = (event: MouseEvent<HTMLButtonElement>) => {
+    fullscreenTriggerRef.current = event.currentTarget;
+    setFullscreen(true);
+  };
+
+  const showDecodeError = () => {
+    setLoadState({ kind: "error", message: "图件加载失败" });
+    if (fullscreen) closeFullscreen();
+  };
+
+  const retry = () => {
+    setLoadState({ kind: "loading" });
+    setRetryNumber((current) => current + 1);
+  };
+
   return (
     <div className="artifact-viewer">
-      <div className="artifact-tabs" role="tablist" aria-label="图件类型">
-        {images.map((item) => (
-          <button
-            key={item.kind}
-            type="button"
-            role="tab"
-            aria-selected={item.kind === active.kind}
-            className={item.kind === active.kind ? "tab active" : "tab"}
-            onClick={() => setActiveKind(item.kind)}
-          >
-            {KIND_META[item.kind]?.name ?? item.kind}
-          </button>
-        ))}
+      <div className="artifact-tabs">
+        <div className="artifact-tablist" role="tablist" aria-label="图件类型">
+          {images.map((item, index) => (
+            <button
+              key={item.kind}
+              ref={(element) => {
+                tabRefs.current[index] = element;
+              }}
+              id={`artifact-tab-${item.kind}`}
+              type="button"
+              role="tab"
+              aria-controls={`artifact-panel-${item.kind}`}
+              aria-selected={item.kind === active.kind}
+              tabIndex={item.kind === active.kind ? 0 : -1}
+              className={item.kind === active.kind ? "tab active" : "tab"}
+              onClick={() => selectIndex(index)}
+              onKeyDown={(event) => handleTabKeyDown(event, index)}
+            >
+              {KIND_META[item.kind]?.name ?? item.kind}
+            </button>
+          ))}
+        </div>
         <a className="tab download" href={artifactUrl(active.id)} download>
           下载
         </a>
       </div>
-      <button
-        type="button"
-        className="artifact-image-button"
-        onClick={() => setFullscreen(true)}
-        aria-label="全屏查看"
+      <div
+        id={panelId}
+        role="tabpanel"
+        aria-labelledby={tabId}
+        className="artifact-panel"
       >
-        <img src={artifactUrl(active.id)} alt={meta.alt} />
-      </button>
-      {fullscreen && (
-        <div
-          className="artifact-fullscreen"
-          role="dialog"
-          aria-label={`全屏${meta.name}`}
-          onClick={() => setFullscreen(false)}
-        >
-          <img src={artifactUrl(active.id)} alt={meta.alt} />
+        {loadState.kind === "loading" && (
+          <p className="loading">正在加载图件…</p>
+        )}
+        {loadState.kind === "error" && (
+          <div className="artifact-error">
+            <p className="error" role="alert">{loadState.message}</p>
+            <button type="button" className="subtle" onClick={retry}>
+              重试图件
+            </button>
+          </div>
+        )}
+        {loadState.kind === "ready" && (
+          <button
+            type="button"
+            className="artifact-image-button"
+            onClick={openFullscreen}
+            aria-label="全屏查看"
+          >
+            <img src={loadState.url} alt={meta.alt} onError={showDecodeError} />
+          </button>
+        )}
+      </div>
+      {fullscreen && loadState.kind === "ready" && (
+        <div className="artifact-fullscreen" onClick={closeFullscreen}>
+          <div
+            className="artifact-fullscreen-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-label={`全屏${meta.name}`}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <button
+              ref={closeButtonRef}
+              type="button"
+              className="artifact-fullscreen-close"
+              onClick={closeFullscreen}
+            >
+              关闭全屏
+            </button>
+            <img src={loadState.url} alt={meta.alt} onError={showDecodeError} />
+          </div>
         </div>
       )}
     </div>
