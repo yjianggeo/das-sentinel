@@ -85,7 +85,7 @@ test("replaying one review request id appends one audit row", async ({ page }) =
     const session = await fetch("/api/v1/session").then((response) => response.json());
     const [event] = await fetch("/api/v1/events?limit=1").then((response) => response.json());
     const before = await fetch(`/api/v1/events/${event.id}`).then((response) => response.json());
-    const requestId = "33333333-3333-4333-8333-333333333333";
+    const requestId = crypto.randomUUID();
     const submit = () =>
       fetch(`/api/v1/events/${event.id}/reviews`, {
         method: "POST",
