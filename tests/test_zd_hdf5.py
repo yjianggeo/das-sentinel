@@ -151,6 +151,21 @@ def test_infers_channel_spacing_from_filename_when_attribute_missing(tmp_path):
     assert "channel spacing inferred from filename" in block.metadata.warnings
 
 
+def test_infers_channel_spacing_from_filename_on_held_stream(tmp_path):
+    path = tmp_path / "ZD_3400m_8m_4m_10000Hz_1000Hz_UTC8_202405191333.h5"
+    write_zd_h5(path)
+    _drop_spacing_attr(path)
+
+    with _open_anchored_source(tmp_path, path) as source:
+        reader = ZdHdf5Reader()
+
+        assert reader.probe(source.stream).supported
+        metadata = reader.read_metadata(source.stream)
+
+    np.testing.assert_allclose(metadata.channel_distance_m[:3], [8, 12, 16])
+    assert "channel spacing inferred from filename" in metadata.warnings
+
+
 def test_rejects_file_without_spacing_attribute_or_filename_hint(tmp_path):
     path = tmp_path / "plain-acquisition.h5"
     write_zd_h5(path)

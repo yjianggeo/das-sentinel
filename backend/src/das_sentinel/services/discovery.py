@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import math
 import os
@@ -394,6 +395,16 @@ class _SourceHandle:
             self._close(value)
 
 
+class _NamedBufferedReader(io.BufferedReader):
+    def __init__(self, raw: io.RawIOBase, source_name: Path) -> None:
+        self._source_name = source_name
+        super().__init__(raw)
+
+    @property
+    def name(self) -> Path:
+        return self._source_name
+
+
 @contextmanager
 def _open_anchored_source(
     root: Path,
@@ -446,7 +457,9 @@ def _open_anchored_source(
                 final_handle = opened
             if final_handle is None:
                 raise OSError("source path is missing a final component")
-            stream = streams.enter_context(_source_stream(final_handle))
+            stream = streams.enter_context(
+                _source_stream(final_handle, candidate)
+            )
             source = _AnchoredSource(candidate, stream)
             source.snapshot()
         except OSError as error:
@@ -470,7 +483,7 @@ def _absolute_path_chain(path: PurePath) -> tuple[PurePath, ...]:
 
 
 @contextmanager
-def _source_stream(handle: _SourceHandle) -> Iterator[BinaryIO]:
+def _source_stream(handle: _SourceHandle, source_name: Path) -> Iterator[BinaryIO]:
     if handle.value is None:
         raise OSError("source handle is already closed")
     if os.name == "nt":
@@ -482,9 +495,14 @@ def _source_stream(handle: _SourceHandle) -> Iterator[BinaryIO]:
     else:
         descriptor = os.dup(handle.value)
     try:
-        stream = os.fdopen(descriptor, "rb")
+        raw = io.FileIO(descriptor, "rb", closefd=True)
     except BaseException:
         os.close(descriptor)
+        raise
+    try:
+        stream = _NamedBufferedReader(raw, source_name)
+    except BaseException:
+        raw.close()
         raise
     try:
         yield stream
