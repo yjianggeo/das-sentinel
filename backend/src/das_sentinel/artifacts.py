@@ -336,7 +336,14 @@ def _png(figure: Any) -> bytes:
 
     buffer = io.BytesIO()
     try:
-        figure.savefig(buffer, format="png", dpi=120, metadata={"Software": "das-sentinel"})
+        figure.savefig(
+            buffer,
+            format="png",
+            dpi=120,
+            bbox_inches="tight",
+            pad_inches=0.2,
+            metadata={"Software": "das-sentinel"},
+        )
         return buffer.getvalue()
     finally:
         plt.close(figure)

@@ -330,7 +330,9 @@ table.data th {
 .artifact-fullscreen {
   position: fixed;
   inset: 0;
-  background: rgba(0, 0, 0, 0.9);
+  padding: 1rem;
+  overflow: auto;
+  background: rgba(0, 0, 0, 0.92);
   display: flex;
   align-items: center;
   justify-content: center;
@@ -338,19 +340,23 @@ table.data th {
 }
 
 .artifact-fullscreen-dialog {
-  position: relative;
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  max-width: 100%;
+  max-height: 100%;
 }
 
 .artifact-fullscreen-dialog img {
-  max-width: 96vw;
-  max-height: 96vh;
+  display: block;
+  max-width: 100%;
+  max-height: calc(100vh - 5rem);
+  object-fit: contain;
 }
 
 .artifact-fullscreen-close {
-  position: absolute;
-  top: 0.75rem;
-  right: 0.75rem;
-  z-index: 1;
+  position: static;
+  justify-self: end;
+  margin-bottom: 0.5rem;
   border: 1px solid #8c959f;
   border-radius: 6px;
   padding: 0.4rem 0.65rem;

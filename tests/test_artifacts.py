@@ -14,6 +14,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from PIL import Image
 from das_sentinel.domain import Candidate, EventRecord
 
 EVENT_ID = "123e4567-e89b-12d3-a456-426614174000"
@@ -108,6 +109,16 @@ def test_renders_complete_event_artifact_set_with_distinct_raw_and_filtered_inpu
     assert evidence["input_sha256"]["filtered"] == hashlib.sha256(data.filtered_data.tobytes()).hexdigest()
     assert evidence["input_sha256"]["raw"] != evidence["input_sha256"]["filtered"]
     assert "NaN" not in manifest.files["evidence"].path.read_text("utf-8")
+
+
+def test_png_artifacts_leave_a_clean_margin_around_plot_content(tmp_path):
+    from das_sentinel.artifacts import render_event_artifacts
+
+    manifest = render_event_artifacts(_artifact_data(), _event(), {}, tmp_path)
+    for kind in ("waterfall_raw", "waterfall_filtered", "waveform", "psd", "stft"):
+        pixels = np.asarray(Image.open(manifest.files[kind].path).convert("RGB"))
+        border = np.concatenate((pixels[0], pixels[-1], pixels[:, 0], pixels[:, -1]))
+        assert np.all(border >= 250), kind
 
 
 def test_artifacts_are_confined_to_uuid_event_directory_and_repeatable(tmp_path):

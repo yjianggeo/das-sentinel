@@ -37,6 +37,16 @@ test("admin logs in, reviews the seeded event, and saves the human label", async
   await expect(page.locator(".artifact-viewer img")).toBeVisible();
   const fullscreenTrigger = page.getByRole("button", { name: "全屏查看" });
   await fullscreenTrigger.click();
+  const dialog = page.getByRole("dialog");
+  const imageBox = await dialog.locator("img").boundingBox();
+  const closeBox = await page.getByRole("button", { name: "关闭全屏" }).boundingBox();
+  expect(imageBox).not.toBeNull();
+  expect(closeBox).not.toBeNull();
+  expect(closeBox!.y + closeBox!.height).toBeLessThanOrEqual(imageBox!.y);
+  expect(imageBox!.y).toBeGreaterThanOrEqual(0);
+  expect(imageBox!.y + imageBox!.height).toBeLessThanOrEqual(
+    page.viewportSize()!.height,
+  );
   await expect(page.getByRole("button", { name: "关闭全屏" })).toBeFocused();
   await page.keyboard.press("Escape");
   await expect(page.getByRole("dialog")).toHaveCount(0);
