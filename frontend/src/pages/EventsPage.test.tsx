@@ -4,6 +4,7 @@ import { transferableAbortController } from "node:util";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
 import { afterAll, beforeAll, beforeEach, vi } from "vitest";
+import type { EventSummary } from "../api";
 import ReviewForm from "../components/ReviewForm";
 import { renderApp } from "../test/render";
 
@@ -221,6 +222,35 @@ it("formats event UTC timestamps in the station timezone", async () => {
 
   expect(
     await screen.findByRole("heading", { name: "2026-07-26 18:42:16" }),
+  ).toBeVisible();
+});
+
+it("formats similar event UTC timestamps in the station timezone", () => {
+  const similarEvent: EventSummary = {
+    id: "similar-event-1",
+    event_uid: "similar-uid-1",
+    site_id: "site-1",
+    site_timezone: "Asia/Shanghai",
+    occurred_at: "2026-07-26T11:42:16Z",
+    start_sample: 100,
+    end_sample: 200,
+    channel_start: 10,
+    channel_stop: 40,
+    machine_label: "unknown",
+    latest_review: null,
+  };
+
+  render(
+    <ReviewForm
+      eventId="event-1"
+      similar={[similarEvent]}
+      onReviewed={() => undefined}
+      onSelectSimilar={() => undefined}
+    />,
+  );
+
+  expect(
+    screen.getByRole("button", { name: "2026-07-26 19:42:16" }),
   ).toBeVisible();
 });
 

@@ -1,5 +1,6 @@
 import { useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { api, ApiError, type EventSummary } from "../api";
+import { formatOccurredAt } from "./EventQueue";
 
 const LABELS = [
   { value: "earthquake", name: "地震" },
@@ -143,7 +144,7 @@ export default function ReviewForm({
                   className="link-button"
                   onClick={() => onSelectSimilar(item)}
                 >
-                  {item.occurred_at.replace("T", " ").replace(/(\.\d+)?Z$/, "")}
+                  {formatOccurredAt(item.occurred_at, item.site_timezone)}
                 </button>
               </li>
             ))}
