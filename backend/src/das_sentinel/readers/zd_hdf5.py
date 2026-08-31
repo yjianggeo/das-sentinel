@@ -1,5 +1,5 @@
 import re
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import BinaryIO
 
@@ -64,7 +64,7 @@ class ZdHdf5Reader:
             raw, data, times = self._required_datasets(handle)
             n_time, n_channel, _ = self._dimensions(data, times)
             del n_time
-            start_time = self._time_at(times, 0)
+            start_time = self._time_at(times, 0, path)
             spacing, inferred = self._spacing(raw, path)
             start_locus = int(self._required_attr(raw, self.ATTR_START_LOCUS))
             return self._metadata(
@@ -103,11 +103,11 @@ class ZdHdf5Reader:
             start_locus = int(self._required_attr(raw, self.ATTR_START_LOCUS))
             metadata = self._metadata(
                 path,
-                self._time_at(times, sample_start),
+                self._time_at(times, sample_start, path),
                 float(self._required_attr(raw, self.ATTR_SAMPLE_RATE)),
                 (start_locus + np.arange(channel_start, channel_stop)) * spacing,
                 self._required_attr(raw, self.ATTR_UNIT),
-                source_start_time=self._time_at(times, 0),
+                source_start_time=self._time_at(times, 0, path),
                 spacing_inferred=inferred,
             )
         return DasBlock(np.asarray(values, dtype=np.float32), metadata, sample_start)
@@ -140,8 +140,38 @@ class ZdHdf5Reader:
         return raw.attrs[name]
 
     @staticmethod
-    def _time_at(times: h5py.Dataset, index: int) -> datetime:
-        return datetime.fromtimestamp(int(times[index]) / 1_000_000, tz=UTC)
+    def _source_name(path: Path | BinaryIO) -> str:
+        name = path.name if isinstance(path, Path) else getattr(path, "name", "")
+        return Path(name).name if isinstance(name, (str, Path)) else ""
+
+    @classmethod
+    def _filename_utc_offset(
+        cls, path: Path | BinaryIO, raw_start: datetime
+    ) -> timedelta | None:
+        match = re.search(
+            r"_UTC(?P<offset>[+-]?\d{1,2})_(?P<stamp>\d{12}(?:\d{2})?)(?!\d)",
+            cls._source_name(path),
+            re.IGNORECASE,
+        )
+        if match is None:
+            return None
+        stamp = match.group("stamp")
+        format_string = "%Y%m%d%H%M%S" if len(stamp) == 14 else "%Y%m%d%H%M"
+        filename_clock = datetime.strptime(stamp, format_string)
+        raw_clock = raw_start.replace(tzinfo=None, microsecond=0)
+        if len(stamp) == 12:
+            raw_clock = raw_clock.replace(second=0)
+        if filename_clock != raw_clock:
+            return None
+        return timedelta(hours=int(match.group("offset")))
+
+    @classmethod
+    def _time_at(
+        cls, times: h5py.Dataset, index: int, path: Path | BinaryIO
+    ) -> datetime:
+        raw_start = datetime.fromtimestamp(int(times[0]) / 1_000_000, tz=UTC)
+        raw_time = datetime.fromtimestamp(int(times[index]) / 1_000_000, tz=UTC)
+        return raw_time - (cls._filename_utc_offset(path, raw_start) or timedelta())
 
     def _metadata(
         self,
@@ -179,14 +209,14 @@ class ZdHdf5Reader:
             )
         return hint, True
 
-    @staticmethod
-    def _spacing_from_filename(path: Path | BinaryIO) -> float | None:
+    @classmethod
+    def _spacing_from_filename(cls, path: Path | BinaryIO) -> float | None:
         """Infer channel spacing from ZD names like ``site__3400m_4m_2_...``.
 
         The interrogator naming convention embeds ``<gauge length>m_<spacing>m``;
         when several ``Xm`` tokens exist the spacing is the last one.
         """
-        name = path.name if isinstance(path, Path) else str(getattr(path, "name", ""))
+        name = cls._source_name(path)
         matches = re.findall(r"_(\d+(?:\.\d+)?)m(?=_)", name)
         if not matches:
             return None

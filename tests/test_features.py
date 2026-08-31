@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 import numpy as np
 import pytest
 from das_sentinel.classifiers.rules import score_rules
@@ -53,6 +55,22 @@ def test_short_or_zero_energy_events_return_finite_stable_features():
 
     assert tuple(features) == FEATURE_NAMES
     assert all(np.isfinite(value) for value in features.values() if isinstance(value, float))
+
+
+def test_time_of_day_uses_configured_station_timezone():
+    block = preprocessed_block(np.ones((10, 2), dtype=np.float32))
+    event = EventRecord("local-time", 1_000, 1_010, 1_005, 0, 2, ())
+
+    features = extract_features(
+        block,
+        event,
+        context={
+            "start_time_utc": datetime(2024, 5, 27, 7, 28, tzinfo=UTC),
+            "site_timezone": "Asia/Shanghai",
+        },
+    )
+
+    assert features["time_of_day_hours"] == pytest.approx(15 + 28 / 60)
 
 
 def test_opposite_phase_channels_preserve_welch_dominant_frequency():

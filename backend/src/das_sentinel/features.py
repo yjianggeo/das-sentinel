@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -152,6 +153,14 @@ def extract_features(
         values["cross_channel_correlation"] = float(np.mean(upper[np.isfinite(upper)])) if np.isfinite(upper).any() else 0.0
     values.update(_propagation(event))
     start_time = details.get("start_time_utc")
+    site_timezone = details.get("site_timezone")
     if isinstance(start_time, datetime):
-        values["time_of_day_hours"] = start_time.hour + start_time.minute / 60 + start_time.second / 3600
+        local_time = (
+            start_time.astimezone(ZoneInfo(site_timezone))
+            if isinstance(site_timezone, str)
+            else start_time
+        )
+        values["time_of_day_hours"] = (
+            local_time.hour + local_time.minute / 60 + local_time.second / 3600
+        )
     return {name: values[name] for name in FEATURE_NAMES}

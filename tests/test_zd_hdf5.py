@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 import h5py
 import numpy as np
 import pytest
@@ -23,6 +25,29 @@ def test_reads_metadata_and_slice(tmp_path):
     np.testing.assert_allclose(block.metadata.channel_distance_m, [12, 16, 20])
     assert block.sample_offset == 10
     assert block.metadata.start_time_utc.isoformat() == "2026-07-26T00:00:00.100000+00:00"
+
+
+def test_interprets_matching_utc8_filename_clock_as_station_local_time(tmp_path):
+    path = tmp_path / "ZD_3400m_8m_4m_5000Hz_1000Hz_UTC8_202607260000.h5"
+    write_zd_h5(path)
+
+    reader = ZdHdf5Reader()
+    metadata = reader.read_metadata(path)
+    block = reader.read_block(path, 10, 11)
+
+    assert metadata.start_time_utc == datetime(2026, 7, 25, 16, 0, tzinfo=UTC)
+    assert block.metadata.start_time_utc == datetime(
+        2026, 7, 25, 16, 0, 0, 100_000, tzinfo=UTC
+    )
+
+
+def test_does_not_apply_filename_offset_when_wall_clocks_disagree(tmp_path):
+    path = tmp_path / "ZD_3400m_8m_4m_5000Hz_1000Hz_UTC8_202607260100.h5"
+    write_zd_h5(path)
+
+    assert ZdHdf5Reader().read_metadata(path).start_time_utc == datetime(
+        2026, 7, 26, 0, 0, tzinfo=UTC
+    )
 
 
 def test_reads_repeatedly_from_one_held_binary_stream(tmp_path):

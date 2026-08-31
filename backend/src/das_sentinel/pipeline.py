@@ -288,6 +288,7 @@ def analyze_file(
                     "cable_type": run_context.cable_type,
                     "device_config": run_context.device_config,
                     "start_time_utc": event_start_utc,
+                    "site_timezone": run_context.site_timezone,
                 },
             )
             rule_result = score_rules(features, run_context.rule_profile)
