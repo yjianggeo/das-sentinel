@@ -127,7 +127,7 @@ def event_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         site_a = repositories.sites.add(
             name="site-a",
             data_path=str(settings.data_root),
-            timezone="UTC",
+            timezone="Asia/Shanghai",
             cable_type="urban",
         )
         site_b = repositories.sites.add(
@@ -291,6 +291,11 @@ def test_event_list_filters_and_stable_bounded_pagination(event_api):
         "event-2",
         "event-1",
     ]
+    assert {item["event_uid"]: item["site_timezone"] for item in all_events} == {
+        "event-1": "Asia/Shanghai",
+        "event-2": "Asia/Shanghai",
+        "event-3": "UTC",
+    }
     assert [item["event_uid"] for item in client.get(
         "/api/v1/events", params={"site_id": ids["site_a"]}
     ).json()] == ["event-2", "event-1"]
@@ -390,6 +395,7 @@ def test_event_detail_contains_audit_history_and_no_local_paths(event_api):
     assert response.status_code == 200
     detail = response.json()
     assert detail["site_id"] == ids["site_a"]
+    assert detail["site_timezone"] == "Asia/Shanghai"
     assert detail["run"]["requested_backend"] == "cuda"
     assert detail["run"]["actual_backend"] == "cpu"
     assert detail["run"]["source_file_id"] == ids["source_a"]

@@ -28,6 +28,7 @@ from das_sentinel.persistence.models import (
     Event,
     ProcessingRun,
     Review,
+    Site,
     SourceFile,
 )
 from das_sentinel.persistence.repositories import Repositories
@@ -94,11 +95,13 @@ def list_events(
         select(
             Event,
             SourceFile.site_id,
+            Site.timezone,
             func.coalesce(latest_machine_label, "unknown"),
             Review,
         )
         .join(ProcessingRun, ProcessingRun.id == Event.processing_run_id)
         .join(SourceFile, SourceFile.id == ProcessingRun.source_file_id)
+        .join(Site, Site.id == SourceFile.site_id)
         .outerjoin(Review, Review.id == latest_review_id)
     )
     if site_id is not None:
@@ -128,10 +131,11 @@ def list_events(
             _list_summary(
                 event,
                 row_site_id,
+                row_site_timezone,
                 cast(MachineLabelValue, label),
                 latest_review,
             )
-            for event, row_site_id, label, latest_review in rows
+            for event, row_site_id, row_site_timezone, label, latest_review in rows
         ]
 
 
@@ -159,6 +163,12 @@ def similar_events(
             raise HTTPException(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Event source not found",
+            )
+        site = session.get(Site, source.site_id)
+        if site is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Event site not found",
             )
         statement = (
             select(Event)
@@ -198,7 +208,14 @@ def similar_events(
             peer = session.get(Event, neighbour.event_id)
             if peer is None:
                 continue
-            neighbours.append(_summary(session, peer, site_id=source.site_id))
+            neighbours.append(
+                _summary(
+                    session,
+                    peer,
+                    site_id=source.site_id,
+                    site_timezone=site.timezone,
+                )
+            )
             if len(neighbours) >= limit:
                 break
         return neighbours
@@ -230,7 +247,7 @@ def get_event(
                 status_code=status.HTTP_404_NOT_FOUND,
                 detail="Event source not found",
             )
-        summary = _summary(session, event, site_id=source.site_id)
+        summary = _summary(session, event)
         return EventDetailResponse(
             **summary.model_dump(),
             features=json.loads(event.features_json),
@@ -366,8 +383,9 @@ def _summary(
     event: Event,
     *,
     site_id: str | None = None,
+    site_timezone: str | None = None,
 ) -> EventSummaryResponse:
-    if site_id is None:
+    if site_id is None or site_timezone is None:
         run = session.get(ProcessingRun, event.processing_run_id)
         source = None if run is None else session.get(SourceFile, run.source_file_id)
         if source is None:
@@ -376,11 +394,19 @@ def _summary(
                 detail="Event source not found",
             )
         site_id = source.site_id
+        site = session.get(Site, source.site_id)
+        if site is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Event site not found",
+            )
+        site_timezone = site.timezone
     latest = event.latest_review
     return EventSummaryResponse(
         id=event.id,
         event_uid=event.event_uid,
         site_id=site_id,
+        site_timezone=site_timezone,
         occurred_at=event.occurred_at,
         start_sample=event.start_sample,
         end_sample=event.end_sample,
@@ -394,6 +420,7 @@ def _summary(
 def _list_summary(
     event: Event,
     site_id: str,
+    site_timezone: str,
     machine_label: MachineLabelValue,
     latest_review: Review | None,
 ) -> EventSummaryResponse:
@@ -401,6 +428,7 @@ def _list_summary(
         id=event.id,
         event_uid=event.event_uid,
         site_id=site_id,
+        site_timezone=site_timezone,
         occurred_at=event.occurred_at,
         start_sample=event.start_sample,
         end_sample=event.end_sample,

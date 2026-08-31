@@ -55,6 +55,7 @@ const SUMMARY = {
   id: "event-1",
   event_uid: "uid-1",
   site_id: "site-1",
+  site_timezone: "Asia/Shanghai",
   occurred_at: "2026-07-26T10:42:16Z",
   start_sample: 100,
   end_sample: 200,
@@ -204,7 +205,7 @@ it("shows event queue artifacts and independent method evidence", async () => {
   useEventHandlers();
   renderApp("/events");
 
-  await userEvent.click(await screen.findByText("2026-07-26 10:42:16"));
+  await userEvent.click(await screen.findByText("2026-07-26 18:42:16"));
 
   expect(await screen.findByAltText("事件瀑布图")).toBeVisible();
   expect(screen.getByRole("tab", { name: "PSD" })).toBeVisible();
@@ -212,11 +213,22 @@ it("shows event queue artifacts and independent method evidence", async () => {
   expect(screen.getByText("规则判断")).toBeVisible();
 });
 
+it("formats event UTC timestamps in the station timezone", async () => {
+  useEventHandlers();
+  renderApp("/events");
+
+  await userEvent.click(await screen.findByText("2026-07-26 18:42:16"));
+
+  expect(
+    await screen.findByRole("heading", { name: "2026-07-26 18:42:16" }),
+  ).toBeVisible();
+});
+
 it("switches artifact tabs", async () => {
   useEventHandlers();
   renderApp("/events");
 
-  await userEvent.click(await screen.findByText("2026-07-26 10:42:16"));
+  await userEvent.click(await screen.findByText("2026-07-26 18:42:16"));
   await userEvent.click(await screen.findByRole("tab", { name: "PSD" }));
 
   expect(await screen.findByAltText("事件功率谱")).toBeVisible();
@@ -231,7 +243,7 @@ it("returns to login when an artifact request becomes unauthorized", async () =>
   );
   renderApp("/events");
 
-  await userEvent.click(await screen.findByText("2026-07-26 10:42:16"));
+  await userEvent.click(await screen.findByText("2026-07-26 18:42:16"));
 
   expect(await screen.findByRole("button", { name: "登录" })).toBeVisible();
 });
@@ -248,7 +260,7 @@ it("keeps event detail visible when artifact integrity fails", async () => {
   );
   renderApp("/events");
 
-  await userEvent.click(await screen.findByText("2026-07-26 10:42:16"));
+  await userEvent.click(await screen.findByText("2026-07-26 18:42:16"));
 
   expect(
     await screen.findByText("图件完整性校验失败，请联系管理员"),
@@ -273,7 +285,7 @@ it("submits a human review and keeps the machine label", async () => {
   );
   renderApp("/events");
 
-  await userEvent.click(await screen.findByText("2026-07-26 10:42:16"));
+  await userEvent.click(await screen.findByText("2026-07-26 18:42:16"));
   await userEvent.selectOptions(
     await screen.findByLabelText("人工标签"),
     "earthquake",
@@ -292,15 +304,15 @@ it("keeps the latest selected detail when responses finish in reverse order", as
   useTwoEventHandlers(first, second);
   renderApp("/events");
 
-  await userEvent.click(await screen.findByText("2026-07-26 10:42:16"));
+  await userEvent.click(await screen.findByText("2026-07-26 18:42:16"));
   await first.started;
-  await userEvent.click(await screen.findByText("2026-07-26 11:42:16"));
+  await userEvent.click(await screen.findByText("2026-07-26 19:42:16"));
   await second.started;
   second.resolve();
   await second.delivered;
 
   expect(
-    await screen.findByRole("heading", { name: "2026-07-26 11:42:16" }),
+    await screen.findByRole("heading", { name: "2026-07-26 19:42:16" }),
   ).toBeVisible();
   await act(async () => {
     first.resolve();
@@ -310,13 +322,13 @@ it("keeps the latest selected detail when responses finish in reverse order", as
 
   await waitFor(() => {
     expect(
-      screen.queryByRole("heading", { name: "2026-07-26 10:42:16" }),
+      screen.queryByRole("heading", { name: "2026-07-26 18:42:16" }),
     ).not.toBeInTheDocument();
     expect(
-      screen.getByRole("heading", { name: "2026-07-26 11:42:16" }),
+      screen.getByRole("heading", { name: "2026-07-26 19:42:16" }),
     ).toBeVisible();
     expect(
-      screen.queryByRole("button", { name: "2026-07-26 12:42:16" }),
+      screen.queryByRole("button", { name: "2026-07-26 20:42:16" }),
     ).not.toBeInTheDocument();
   });
 });
@@ -341,7 +353,7 @@ it("double click sends one review request with one UUID", async () => {
   );
   renderApp("/events");
 
-  await userEvent.click(await screen.findByText("2026-07-26 10:42:16"));
+  await userEvent.click(await screen.findByText("2026-07-26 18:42:16"));
   await userEvent.selectOptions(
     await screen.findByLabelText("人工标签"),
     "earthquake",
@@ -379,7 +391,7 @@ it("retries a failed review with the same UUID", async () => {
   );
   renderApp("/events");
 
-  await userEvent.click(await screen.findByText("2026-07-26 10:42:16"));
+  await userEvent.click(await screen.findByText("2026-07-26 18:42:16"));
   await userEvent.selectOptions(
     await screen.findByLabelText("人工标签"),
     "earthquake",
@@ -423,7 +435,7 @@ it("starts a new logical review after editing a failed submission", async () => 
   );
   renderApp("/events");
 
-  await userEvent.click(await screen.findByText("2026-07-26 10:42:16"));
+  await userEvent.click(await screen.findByText("2026-07-26 18:42:16"));
   await userEvent.selectOptions(
     await screen.findByLabelText("人工标签"),
     "earthquake",
@@ -596,7 +608,7 @@ for (const staleOutcome of ["success", "failure"] as const) {
     );
     renderApp("/events");
 
-    await userEvent.click(await screen.findByText("2026-07-26 10:42:16"));
+    await userEvent.click(await screen.findByText("2026-07-26 18:42:16"));
     await userEvent.selectOptions(
       await screen.findByLabelText("人工标签"),
       "earthquake",
@@ -604,9 +616,9 @@ for (const staleOutcome of ["success", "failure"] as const) {
     await userEvent.click(screen.getByRole("button", { name: "保存复核" }));
     await first.started;
 
-    await userEvent.click(screen.getByText("2026-07-26 11:42:16"));
+    await userEvent.click(screen.getByText("2026-07-26 19:42:16"));
     expect(
-      await screen.findByRole("heading", { name: "2026-07-26 11:42:16" }),
+      await screen.findByRole("heading", { name: "2026-07-26 19:42:16" }),
     ).toBeVisible();
     const currentLabel = screen.getByLabelText("人工标签");
     const currentNote = screen.getByLabelText("备注");
@@ -711,7 +723,7 @@ it("replaces initial loading with a retryable error", async () => {
   expect(await screen.findByRole("alert")).toHaveTextContent("无法加载事件");
   expect(screen.queryByText("正在加载…")).not.toBeInTheDocument();
   await userEvent.click(screen.getByRole("button", { name: "重试" }));
-  expect(await screen.findByText("2026-07-26 10:42:16")).toBeVisible();
+  expect(await screen.findByText("2026-07-26 18:42:16")).toBeVisible();
 });
 
 it("shows an explicit empty collection state", async () => {
@@ -786,7 +798,7 @@ it("discards a superseded filter response and clears a filtered-out selection", 
   });
 
   expect(screen.queryByRole("button", { name: "事件 event-stale-similar" })).not.toBeInTheDocument();
-  expect(screen.queryByRole("heading", { name: "2026-07-26 10:42:16" })).not.toBeInTheDocument();
+  expect(screen.queryByRole("heading", { name: "2026-07-26 18:42:16" })).not.toBeInTheDocument();
 });
 
 it("uses the server page boundary for the next offset when a page contains a duplicate", async () => {

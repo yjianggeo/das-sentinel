@@ -433,6 +433,7 @@ class EventSummaryResponse(StrictSchema):
     id: str
     event_uid: str
     site_id: str
+    site_timezone: str
     occurred_at: datetime
     start_sample: int
     end_sample: int

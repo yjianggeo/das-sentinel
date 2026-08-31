@@ -8,8 +8,19 @@ const LABEL_NAMES: Record<string, string> = {
   unknown: "待定",
 };
 
-export function formatOccurredAt(iso: string): string {
-  return iso.replace("T", " ").replace(/(\.\d+)?Z$/, "");
+export function formatOccurredAt(iso: string, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat("zh-CN", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(iso));
+  const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${value.year}-${value.month}-${value.day} ${value.hour}:${value.minute}:${value.second}`;
 }
 
 export default function EventQueue({
@@ -80,7 +91,7 @@ export default function EventQueue({
               aria-label={`事件 ${event.id}`}
             >
               <span className="queue-time">
-                {formatOccurredAt(event.occurred_at)}
+                {formatOccurredAt(event.occurred_at, event.site_timezone)}
               </span>
               <span className={`status-pill label-${event.machine_label}`}>
                 {LABEL_NAMES[event.machine_label]}

@@ -157,6 +157,7 @@ export interface EventSummary {
   id: string;
   event_uid: string;
   site_id: string;
+  site_timezone: string;
   occurred_at: string;
   start_sample: number;
   end_sample: number;

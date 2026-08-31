@@ -1,7 +1,18 @@
 import { expect, test, type Page } from "@playwright/test";
 
-function formatQueueTime(iso: string): string {
-  return iso.replace("T", " ").replace(/(\.\d+)?Z$/, "");
+function formatQueueTime(iso: string, timeZone: string): string {
+  const parts = new Intl.DateTimeFormat("zh-CN", {
+    timeZone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).formatToParts(new Date(iso));
+  const value = Object.fromEntries(parts.map((part) => [part.type, part.value]));
+  return `${value.year}-${value.month}-${value.day} ${value.hour}:${value.minute}:${value.second}`;
 }
 
 async function login(page: Page): Promise<void> {
@@ -61,21 +72,21 @@ test("late detail response cannot replace the latest selection", async ({ page }
   await page.goto("/events");
   const events = (await page.evaluate(async () =>
     fetch("/api/v1/events?limit=100").then((response) => response.json()),
-  )) as Array<{ id: string; occurred_at: string }>;
+  )) as Array<{ id: string; occurred_at: string; site_timezone: string }>;
   expect(events.length).toBeGreaterThanOrEqual(2);
   const [first, second] = events;
   await page.route(`**/api/v1/events/${first.id}`, async (route) => {
     await new Promise((resolve) => setTimeout(resolve, 500));
     await route.continue();
   });
-  await page.getByText(formatQueueTime(first.occurred_at), { exact: true }).click();
-  await page.getByText(formatQueueTime(second.occurred_at), { exact: true }).click();
+  await page.getByText(formatQueueTime(first.occurred_at, first.site_timezone), { exact: true }).click();
+  await page.getByText(formatQueueTime(second.occurred_at, second.site_timezone), { exact: true }).click();
   await expect(
-    page.getByRole("heading", { name: formatQueueTime(second.occurred_at) }),
+    page.getByRole("heading", { name: formatQueueTime(second.occurred_at, second.site_timezone) }),
   ).toBeVisible();
   await page.waitForTimeout(700);
   await expect(
-    page.getByRole("heading", { name: formatQueueTime(second.occurred_at) }),
+    page.getByRole("heading", { name: formatQueueTime(second.occurred_at, second.site_timezone) }),
   ).toBeVisible();
 });
 
