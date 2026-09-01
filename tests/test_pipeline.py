@@ -526,6 +526,9 @@ def test_pipeline_merges_cross_block_event_and_preserves_artifact_inputs(
     assert artifact_data.model_version == "rules-only"
     assert artifact_data.backend_name == "cpu"
     assert artifact_data.site_timezone == "Asia/Shanghai"
+    assert artifact_data.waterfall_filter.detector == "stalta"
+    assert artifact_data.waterfall_filter.low_hz == 0.5
+    assert artifact_data.waterfall_filter.high_hz == 4.0
     assert artifact_data.profile["rule_profile"] == {
         "traffic_velocity_mps": (3.0, 45.0)
     }

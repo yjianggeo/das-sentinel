@@ -61,6 +61,7 @@ def _event() -> EventRecord:
 
 def _artifact_data():
     from das_sentinel.artifacts import EventArtifactData
+    from das_sentinel.waterfalls import WaterfallFilter
 
     time = np.arange(160, dtype=np.float32) / 100.0
     raw = np.column_stack([np.sin(2 * np.pi * 8 * time + channel) for channel in range(6)]).astype(np.float32)
@@ -81,7 +82,45 @@ def _artifact_data():
         backend_name="cpu",
         rule_output={"label": "traffic", "score": 0.9},
         model_output={"label": "traffic", "score": float("nan")},
+        waterfall_filter=WaterfallFilter("energy", 0.5, 80.0),
     )
+
+
+def test_filtered_waterfall_title_names_detector_and_exact_band():
+    """Dropping filter provenance or rounding its literal frequencies must fail."""
+    from das_sentinel.artifacts import (
+        WaterfallPlotContext,
+        filtered_waterfall_title,
+        render_waterfall_png,
+    )
+    from das_sentinel.waterfalls import WaterfallFilter
+
+    context = WaterfallPlotContext(
+        sample_rate_hz=1000.0,
+        site_timezone="Asia/Shanghai",
+        profile_version="7",
+        pipeline_version="v1",
+        model_version="rules-only",
+        filter=WaterfallFilter("stalta", 2.5, 40.25),
+    )
+
+    assert filtered_waterfall_title(context) == (
+        "Filtered waterfall | Band-pass 2.5–40.25 Hz | "
+        "primary detector=STA/LTA | profile=7 pipeline=v1 model=rules-only | "
+        "1000 Hz | input unit"
+    )
+    assert render_waterfall_png(
+        np.ones((2, 2), dtype=np.float32),
+        np.array(
+            [
+                datetime(2026, 7, 26, 12, 0, tzinfo=UTC),
+                datetime(2026, 7, 26, 12, 0, 1, tzinfo=UTC),
+            ]
+        ),
+        np.array([8.0, 12.0]),
+        context,
+        filtered=True,
+    ).startswith(b"\x89PNG\r\n\x1a\n")
 
 
 def test_renders_complete_event_artifact_set_with_distinct_raw_and_filtered_inputs(tmp_path):

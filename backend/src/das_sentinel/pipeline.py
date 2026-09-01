@@ -44,6 +44,12 @@ from das_sentinel.signal.preprocess import (
     prepare_signal,
     preprocess_block,
 )
+from das_sentinel.waterfalls import (
+    WaterfallFilter,
+    detector_band,
+    preprocess_for_waterfall,
+    resolve_waterfall_filter,
+)
 
 _TIMING_NAMES = ("read", "preprocess", "detect", "fuse", "classify", "render")
 
@@ -262,10 +268,13 @@ def analyze_file(
             )
             timings["read"] += _elapsed_ms(read_started)
 
-            primary_detector = _primary_detector(event)
+            waterfall_filter = resolve_waterfall_filter(event.evidence, profile)
             preprocess_started = time.perf_counter()
-            filtered_block = _preprocess_for_detector(
-                raw_block, profile, backend, primary_detector
+            filtered_block = _preprocess_for_band(
+                raw_block,
+                profile,
+                backend,
+                (waterfall_filter.low_hz, waterfall_filter.high_hz),
             )
             filtered_data = np.asarray(
                 backend.asnumpy(filtered_block.data), dtype=np.float32
@@ -356,6 +365,7 @@ def analyze_file(
                 model_version=run_context.model_version or "rules-only",
                 backend_name=backend.name,
                 rule_output=_rule_output(rule_result, run_context),
+                waterfall_filter=waterfall_filter,
                 model_output=model_output,
             )
             _ensure_source_unchanged(source, source_fingerprint)
@@ -425,7 +435,7 @@ def _detect_block(
         timings["preprocess"] += _elapsed_ms(preprocess_started)
         bands: dict[tuple[float, float], list[str]] = {}
         for detector in detectors:
-            bands.setdefault(_detector_band(profile, detector), []).append(detector)
+            bands.setdefault(detector_band(profile, detector), []).append(detector)
         for band, band_detectors in bands.items():
             preprocess_started = time.perf_counter()
             prepared_block = filter_prepared_signal(
@@ -495,55 +505,18 @@ def _run_detector(
     raise ValueError(f"unknown detector: {detector}")
 
 
-def _detector_band(
-    profile: ProcessingProfile, detector: str
-) -> tuple[float, float]:
-    if detector == "stalta":
-        return profile.stalta_freq_low_hz, profile.stalta_freq_high_hz
-    if detector == "energy":
-        return (
-            min(low for low, _ in profile.energy_bands_hz),
-            max(high for _, high in profile.energy_bands_hz),
-        )
-    if detector == "coherence":
-        return profile.coherence_freq_low_hz, profile.coherence_freq_high_hz
-    if detector == "trajectory":
-        return profile.trajectory_freq_low_hz, profile.trajectory_freq_high_hz
-    raise ValueError(f"unknown detector frequency bank: {detector}")
-
-
 def _preprocess_for_band(
     block: DasBlock,
     profile: ProcessingProfile,
     backend: ArrayBackend,
     band: tuple[float, float],
 ) -> PreprocessedBlock:
-    band_profile = profile.model_copy(
-        update={
-            "stalta_freq_low_hz": band[0],
-            "stalta_freq_high_hz": band[1],
-        }
+    return preprocess_for_waterfall(
+        block,
+        profile,
+        backend,
+        WaterfallFilter("stalta", band[0], band[1]),
     )
-    return preprocess_block(block, band_profile, backend)
-
-
-def _preprocess_for_detector(
-    block: DasBlock,
-    profile: ProcessingProfile,
-    backend: ArrayBackend,
-    detector: str,
-) -> PreprocessedBlock:
-    return _preprocess_for_band(
-        block, profile, backend, _detector_band(profile, detector)
-    )
-
-
-def _primary_detector(event: EventRecord) -> str:
-    evidence = min(
-        event.evidence,
-        key=lambda item: (-item.score, item.peak_sample, item.detector),
-    )
-    return evidence.detector.split(":", 1)[0]
 
 
 def _event_window(

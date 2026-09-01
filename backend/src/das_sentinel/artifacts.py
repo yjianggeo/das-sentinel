@@ -27,6 +27,7 @@ from matplotlib import pyplot as plt
 from scipy.signal import stft, welch
 
 from das_sentinel.domain import EventRecord
+from das_sentinel.waterfalls import WaterfallFilter, detector_display_name
 
 
 @dataclass(frozen=True)
@@ -45,6 +46,7 @@ class EventArtifactData:
     model_version: str
     backend_name: str
     rule_output: Mapping[str, Any]
+    waterfall_filter: WaterfallFilter
     model_output: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
@@ -75,6 +77,16 @@ class EventArtifactData:
         object.__setattr__(self, "channel_distance_m", distance)
         object.__setattr__(self, "bad_channel_mask", mask)
         object.__setattr__(self, "start_time_utc", self.start_time_utc.astimezone(UTC))
+
+
+@dataclass(frozen=True)
+class WaterfallPlotContext:
+    sample_rate_hz: float
+    site_timezone: str
+    profile_version: str
+    pipeline_version: str
+    model_version: str
+    filter: WaterfallFilter
 
 
 @dataclass(frozen=True)
@@ -155,9 +167,17 @@ def render_event_artifacts(
     dates = _sample_dates(data, time_slice)
     distances = data.channel_distance_m[channels]
     waveform = _representative_beam(filtered)
+    waterfall_context = WaterfallPlotContext(
+        sample_rate_hz=data.sample_rate_hz,
+        site_timezone=data.site_timezone,
+        profile_version=data.profile_version,
+        pipeline_version=data.pipeline_version,
+        model_version=data.model_version,
+        filter=data.waterfall_filter,
+    )
     files = {
-        "waterfall_raw": store.write(event.event_id, "waterfall_raw", _waterfall_png(raw, dates, distances, data, "Raw waterfall"), "image/png"),
-        "waterfall_filtered": store.write(event.event_id, "waterfall_filtered", _waterfall_png(filtered, dates, distances, data, "Filtered waterfall"), "image/png"),
+        "waterfall_raw": store.write(event.event_id, "waterfall_raw", render_waterfall_png(raw, dates, distances, waterfall_context, filtered=False), "image/png"),
+        "waterfall_filtered": store.write(event.event_id, "waterfall_filtered", render_waterfall_png(filtered, dates, distances, waterfall_context, filtered=True), "image/png"),
         "waveform": store.write(event.event_id, "waveform", _waveform_png(waveform, dates, data, event, time_slice), "image/png"),
         "psd": store.write(event.event_id, "psd", _psd_png(waveform, data, features), "image/png"),
         "stft": store.write(event.event_id, "stft", _stft_png(waveform, data), "image/png"),
@@ -349,14 +369,45 @@ def _png(figure: Any) -> bytes:
         plt.close(figure)
 
 
-def _waterfall_png(values: np.ndarray, dates: np.ndarray, distances: np.ndarray, data: EventArtifactData, title: str) -> bytes:
+def _frequency(value: float) -> str:
+    if not np.isfinite(value):
+        raise ValueError("waterfall frequencies must be finite")
+    return f"{value:g}"
+
+
+def filtered_waterfall_title(context: WaterfallPlotContext) -> str:
+    return (
+        "Filtered waterfall | "
+        f"Band-pass {_frequency(context.filter.low_hz)}–{_frequency(context.filter.high_hz)} Hz | "
+        f"primary detector={detector_display_name(context.filter.detector)} | "
+        f"profile={context.profile_version} pipeline={context.pipeline_version} "
+        f"model={context.model_version} | {_frequency(context.sample_rate_hz)} Hz | input unit"
+    )
+
+
+def render_waterfall_png(
+    values: np.ndarray,
+    dates: np.ndarray,
+    distances: np.ndarray,
+    context: WaterfallPlotContext,
+    *,
+    filtered: bool,
+    distance_note: str | None = None,
+) -> bytes:
     figure, axis = plt.subplots(figsize=(9, 4))
     low, high = _robust_limits(values)
     image = _waterfall_mesh(axis, values, mdates.date2num(dates), distances, low, high)
     figure.colorbar(image, ax=axis, label="Amplitude")
     axis.set_ylabel("Distance (m)")
-    axis.set_title(f"{title} | {_versions(data)} | {data.sample_rate_hz:g} Hz | input unit")
-    _time_axes(axis, dates, data.site_timezone, data.sample_rate_hz)
+    title = (
+        filtered_waterfall_title(context)
+        if filtered
+        else "Raw waterfall | "
+        f"profile={context.profile_version} pipeline={context.pipeline_version} "
+        f"model={context.model_version} | {_frequency(context.sample_rate_hz)} Hz | input unit"
+    )
+    axis.set_title(title if distance_note is None else f"{title} | {distance_note}")
+    _time_axes(axis, dates, context.site_timezone, context.sample_rate_hz)
     return _png(figure)
 
 
