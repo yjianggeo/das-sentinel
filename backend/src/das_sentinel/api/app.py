@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import Any
 
 from fastapi import FastAPI
 from fastapi.concurrency import run_in_threadpool
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
@@ -26,6 +29,9 @@ from das_sentinel.api.routes.jobs import router as jobs_router
 from das_sentinel.api.routes.models import router as models_router
 from das_sentinel.api.routes.scans import router as scans_router
 from das_sentinel.api.routes.sites import router as sites_router
+from das_sentinel.api.routes.waterfall_previews import (
+    router as waterfall_previews_router,
+)
 from das_sentinel.config import Settings
 from das_sentinel.persistence import (
     AsyncWriteCoordinator,
@@ -33,8 +39,10 @@ from das_sentinel.persistence import (
     create_local_engine,
     session_factory,
 )
+from das_sentinel.readers.zd_hdf5 import ZdHdf5Reader
 from das_sentinel.runtime import probe_storage
 from das_sentinel.services.jobs import JobService
+from das_sentinel.services.waterfall_previews import WaterfallPreviewService
 
 
 class ApiSessionSecurityMiddleware(BaseHTTPMiddleware):
@@ -70,11 +78,16 @@ def create_app(settings: Settings) -> FastAPI:
             engine.dispose()
 
     app = FastAPI(title="DAS Sentinel", version="0.1.0", lifespan=lifespan)
+    app.add_exception_handler(RequestValidationError, _validation_error_response)
     app.state.settings = settings
     app.state.engine = engine
     app.state.session_factory = session_factory(engine)
     app.state.write_coordinator = AsyncWriteCoordinator()
     app.state.auth_limiter = asyncio.Semaphore(1)
+    app.state.waterfall_preview_service = WaterfallPreviewService(
+        settings.data_root,
+        ZdHdf5Reader(),
+    )
     app.add_middleware(ApiSessionSecurityMiddleware)
     app.add_middleware(
         SessionMiddleware,
@@ -88,6 +101,7 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(sites_router, prefix="/api/v1")
     app.include_router(jobs_router, prefix="/api/v1")
     app.include_router(events_router, prefix="/api/v1")
+    app.include_router(waterfall_previews_router, prefix="/api/v1")
     app.include_router(artifacts_router, prefix="/api/v1")
     app.include_router(models_router, prefix="/api/v1")
     app.include_router(scans_router, prefix="/api/v1")
@@ -100,6 +114,31 @@ def create_app(settings: Settings) -> FastAPI:
 
 def create_runtime_app() -> FastAPI:
     return create_app(Settings())  # type: ignore[call-arg]
+
+
+async def _validation_error_response(
+    request: Request,
+    error: RequestValidationError,
+) -> JSONResponse:
+    del request
+    return JSONResponse(
+        {"detail": _json_safe(error.errors())},
+        status_code=422,
+    )
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    if isinstance(value, BaseException):
+        return str(value)
+    if isinstance(value, dict):
+        return {key: _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [_json_safe(item) for item in value]
+    return value
 
 
 def _web_dist() -> Path:

@@ -25,6 +25,41 @@ class StrictSchema(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class WaterfallOptionsResponse(StrictSchema):
+    automatic_distance_start_m: FiniteFloat
+    automatic_distance_stop_m: FiniteFloat
+    available_distance_start_m: FiniteFloat
+    available_distance_stop_m: FiniteFloat
+    primary_detector: str
+    primary_detector_display: str
+    filter_low_hz: FiniteFloat = Field(ge=0)
+    filter_high_hz: FiniteFloat = Field(gt=0)
+    distance_unit: Literal["m"] = "m"
+
+
+class WaterfallPreviewRequest(StrictSchema):
+    distance_start_m: FiniteFloat
+    distance_stop_m: FiniteFloat
+
+    @model_validator(mode="after")
+    def validate_order(self) -> WaterfallPreviewRequest:
+        if self.distance_stop_m <= self.distance_start_m:
+            raise ValueError("distance_stop_m must exceed distance_start_m")
+        return self
+
+
+class WaterfallPreviewResponse(StrictSchema):
+    distance_start_m: FiniteFloat
+    distance_stop_m: FiniteFloat
+    channel_count: StrictInt = Field(ge=1)
+    primary_detector: str
+    primary_detector_display: str
+    filter_low_hz: FiniteFloat = Field(ge=0)
+    filter_high_hz: FiniteFloat = Field(gt=0)
+    raw_png_base64: str = Field(min_length=8, max_length=16 * 1024 * 1024)
+    filtered_png_base64: str = Field(min_length=8, max_length=16 * 1024 * 1024)
+
+
 WorkerId = Annotated[
     str,
     StringConstraints(strip_whitespace=True, min_length=1, max_length=200),
