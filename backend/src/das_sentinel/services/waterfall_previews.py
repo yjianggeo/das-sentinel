@@ -29,6 +29,9 @@ from das_sentinel.waterfalls import (
     usable_channel_indices,
 )
 
+_MAX_PREVIEW_SAMPLES = 10_000
+_MAX_PREVIEW_CHANNELS = 256
+
 
 class WaterfallPreviewConflict(RuntimeError):
     pass
@@ -104,6 +107,10 @@ class WaterfallPreviewService:
             read_slice = channel_slice_for_distance(
                 metadata.channel_distance_m, start_m, stop_m
             )
+            self._validate_read_bounds(binding.event, read_slice)
+        except ValueError as error:
+            raise WaterfallPreviewRangeError("requested range is not previewable") from error
+        try:
             block = self.reader.read_block(
                 binding.source_path,
                 binding.event.start_sample,
@@ -124,6 +131,8 @@ class WaterfallPreviewService:
             )
         except ValueError as error:
             raise WaterfallPreviewRangeError("requested range is not previewable") from error
+        except OSError as error:
+            raise WaterfallPreviewConflict("waterfall preview source is unavailable") from error
         dates = np.array(
             [
                 block.metadata.start_time_utc
@@ -257,7 +266,17 @@ class WaterfallPreviewService:
         stop = max(candidate.channel_stop for candidate in candidates)
         if start < 0 or stop <= start or stop > len(distances):
             raise WaterfallPreviewConflict("event channel bounds are unavailable")
-        return float(distances[start]), float(distances[stop - 1])
+        selected = np.asarray(distances[start:stop], dtype=float)
+        if selected.size == 0 or not np.isfinite(selected).all():
+            raise WaterfallPreviewConflict("event channel bounds are unavailable")
+        return float(np.min(selected)), float(np.max(selected))
+
+    @staticmethod
+    def _validate_read_bounds(event: Event, channels: slice) -> None:
+        if event.end_sample - event.start_sample > _MAX_PREVIEW_SAMPLES:
+            raise WaterfallPreviewRangeError("event window exceeds preview limit")
+        if channels.stop - channels.start > _MAX_PREVIEW_CHANNELS:
+            raise WaterfallPreviewRangeError("channel range exceeds preview limit")
 
     @staticmethod
     def _validate_range(

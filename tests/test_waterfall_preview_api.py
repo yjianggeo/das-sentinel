@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import json
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -17,7 +20,7 @@ from das_sentinel.persistence import (
     session_factory,
     upgrade_database,
 )
-from das_sentinel.persistence.models import SourceFile
+from das_sentinel.persistence.models import Base, Event, SourceFile
 from das_sentinel.services.discovery import fingerprint
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
@@ -176,6 +179,28 @@ def test_waterfall_options_use_historical_run_profile_and_metadata(waterfall_api
     assert client.get("/api/v1/events/missing/waterfall-options").status_code == 404
 
 
+def test_waterfall_options_use_candidate_distance_extrema_for_nonmonotonic_metadata(
+    waterfall_api, monkeypatch: pytest.MonkeyPatch
+):
+    client, _, _, _, ids, _ = waterfall_api
+    reader = client.app.state.waterfall_preview_service.reader
+    original_metadata = reader.read_metadata
+
+    def nonmonotonic_metadata(path):
+        metadata = original_metadata(path)
+        return replace(
+            metadata,
+            channel_distance_m=np.array([8.0, 20.0, 12.0, 16.0, 24.0]),
+        )
+
+    monkeypatch.setattr(reader, "read_metadata", nonmonotonic_metadata)
+    response = client.get(f"/api/v1/events/{ids['event']}/waterfall-options")
+
+    assert response.status_code == 200
+    assert response.json()["automatic_distance_start_m"] == 12.0
+    assert response.json()["automatic_distance_stop_m"] == 20.0
+
+
 @pytest.mark.parametrize("kind", ["missing", "outside_root", "mismatch"])
 def test_waterfall_options_reject_conflicted_source_without_disclosing_path(
     waterfall_api, tmp_path: Path, kind: str
@@ -220,9 +245,10 @@ def test_waterfall_preview_returns_two_pngs_after_one_read_without_writes(waterf
     service.reader = counting_reader
     with sessions() as session:
         before_rows = {
-            table.__tablename__: session.scalar(select(func.count()).select_from(table))
-            for table in (SourceFile,)
+            table.name: session.scalar(select(func.count()).select_from(table))
+            for table in Base.metadata.sorted_tables
         }
+    before_data_root = _tree_snapshot(settings.data_root)
     before_artifacts = sorted(
         path.relative_to(settings.app_data_dir).as_posix()
         for path in settings.app_data_dir.rglob("*")
@@ -242,9 +268,10 @@ def test_waterfall_preview_returns_two_pngs_after_one_read_without_writes(waterf
     assert counting_reader.read_block_calls == 1
     with sessions() as session:
         assert before_rows == {
-            table.__tablename__: session.scalar(select(func.count()).select_from(table))
-            for table in (SourceFile,)
+            table.name: session.scalar(select(func.count()).select_from(table))
+            for table in Base.metadata.sorted_tables
         }
+    assert before_data_root == _tree_snapshot(settings.data_root)
     assert before_artifacts == sorted(
         path.relative_to(settings.app_data_dir).as_posix()
         for path in settings.app_data_dir.rglob("*")
@@ -334,3 +361,102 @@ def test_waterfall_preview_rechecks_fingerprint_after_render(
 
     assert response.status_code == 409
     assert str(source_path) not in response.text
+
+
+@pytest.mark.parametrize("error", [FileNotFoundError("source disappeared"), OSError("read failed")])
+def test_waterfall_preview_controls_read_block_io_errors(
+    waterfall_api, monkeypatch: pytest.MonkeyPatch, error: OSError
+):
+    client, _, _, csrf_token, ids, source_path = waterfall_api
+    reader = client.app.state.waterfall_preview_service.reader
+
+    def fail_read_block(path, start, stop, channels):
+        raise error
+
+    monkeypatch.setattr(reader, "read_block", fail_read_block)
+    response = client.post(
+        f"/api/v1/events/{ids['event']}/waterfall-preview",
+        json={"distance_start_m": 12.0, "distance_stop_m": 20.0},
+        headers={"X-CSRF-Token": csrf_token},
+    )
+
+    assert response.status_code == 409
+    assert str(source_path) not in response.text
+
+
+def test_waterfall_preview_rejects_oversized_window_before_read(waterfall_api):
+    client, _, sessions, csrf_token, ids, _ = waterfall_api
+    reader = client.app.state.waterfall_preview_service.reader
+    calls = 0
+    with sessions.begin() as session:
+        event = session.get(Event, ids["event"])
+        assert event is not None
+        event.end_sample = event.start_sample + 10_001
+
+    def count_read_block(path, start, stop, channels):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("oversized preview must not read source data")
+
+    reader.read_block = count_read_block
+    response = client.post(
+        f"/api/v1/events/{ids['event']}/waterfall-preview",
+        json={"distance_start_m": 12.0, "distance_stop_m": 20.0},
+        headers={"X-CSRF-Token": csrf_token},
+    )
+
+    assert response.status_code == 422
+    assert calls == 0
+
+
+def test_waterfall_preview_rejects_oversized_channel_read_before_read(
+    waterfall_api, monkeypatch: pytest.MonkeyPatch
+):
+    client, _, sessions, csrf_token, ids, _ = waterfall_api
+    reader = client.app.state.waterfall_preview_service.reader
+    original_metadata = reader.read_metadata
+    calls = 0
+    with sessions.begin() as session:
+        event = session.get(Event, ids["event"])
+        assert event is not None
+        evidence = event.evidence[0]
+        evidence.payload_json = json.dumps(
+            {
+                "start_sample": 20,
+                "end_sample": 40,
+                "peak_sample": 30,
+                "channel_start": 0,
+                "channel_stop": 257,
+            }
+        )
+
+    def wide_metadata(path):
+        metadata = original_metadata(path)
+        return replace(metadata, channel_distance_m=np.arange(257, dtype=float))
+
+    def count_read_block(path, start, stop, channels):
+        nonlocal calls
+        calls += 1
+        raise AssertionError("oversized preview must not read source data")
+
+    monkeypatch.setattr(reader, "read_metadata", wide_metadata)
+    monkeypatch.setattr(reader, "read_block", count_read_block)
+    response = client.post(
+        f"/api/v1/events/{ids['event']}/waterfall-preview",
+        json={"distance_start_m": 0.0, "distance_stop_m": 256.0},
+        headers={"X-CSRF-Token": csrf_token},
+    )
+
+    assert response.status_code == 422
+    assert calls == 0
+
+
+def _tree_snapshot(root: Path) -> dict[str, tuple[int, str]]:
+    return {
+        path.relative_to(root).as_posix(): (
+            path.stat().st_size,
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+        for path in root.rglob("*")
+        if path.is_file()
+    }
