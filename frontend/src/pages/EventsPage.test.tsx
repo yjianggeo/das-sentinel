@@ -35,6 +35,19 @@ beforeEach(() => {
     http.get("/api/v1/artifacts/:artifactId", () =>
       new HttpResponse(new Blob(["png"], { type: "image/png" })),
     ),
+    http.get("/api/v1/events/:eventId/waterfall-options", () =>
+      HttpResponse.json({
+        automatic_distance_start_m: 12,
+        automatic_distance_stop_m: 20,
+        available_distance_start_m: 8,
+        available_distance_stop_m: 24,
+        primary_detector: "stalta",
+        primary_detector_display: "STA/LTA",
+        filter_low_hz: 3.5,
+        filter_high_hz: 27.25,
+        distance_unit: "m",
+      }),
+    ),
   );
 });
 afterAll(() => {
@@ -222,6 +235,24 @@ it("formats event UTC timestamps in the station timezone", async () => {
 
   expect(
     await screen.findByRole("heading", { name: "2026-07-26 18:42:16" }),
+  ).toBeVisible();
+});
+
+it("uses the event station timezone instead of the host timezone for detail headings", async () => {
+  // Catches formatOccurredAt(detail.occurred_at) dropping the explicit station timezone.
+  const pacificSummary = { ...SUMMARY, site_timezone: "America/Los_Angeles" };
+  const pacificDetail = { ...DETAIL, ...pacificSummary };
+  server.use(
+    http.get("/api/v1/events", () => HttpResponse.json([pacificSummary])),
+    http.get("/api/v1/events/event-1", () => HttpResponse.json(pacificDetail)),
+    http.get("/api/v1/events/event-1/similar", () => HttpResponse.json([])),
+  );
+  renderApp("/events");
+
+  await userEvent.click(await screen.findByText("2026-07-26 03:42:16"));
+
+  expect(
+    await screen.findByRole("heading", { name: "2026-07-26 03:42:16" }),
   ).toBeVisible();
 });
 

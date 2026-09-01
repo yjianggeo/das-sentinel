@@ -287,6 +287,39 @@ table.data th {
   gap: 0.25rem;
 }
 
+.waterfall-range-controls {
+  display: grid;
+  gap: 0.35rem;
+  margin-bottom: 0.75rem;
+}
+
+.waterfall-range-controls p {
+  margin: 0;
+}
+
+.waterfall-range-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: end;
+  gap: 0.5rem;
+}
+
+.waterfall-range-row label {
+  display: grid;
+  gap: 0.2rem;
+}
+
+.waterfall-range-row input {
+  width: min(10rem, 100%);
+}
+
+@media (max-width: 600px) {
+  .waterfall-range-row {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+
 .artifact-tablist {
   display: flex;
   flex-wrap: wrap;

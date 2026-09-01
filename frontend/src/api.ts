@@ -49,6 +49,7 @@ async function request<T>(
     body: body === undefined ? undefined : JSON.stringify(body),
     signal,
   });
+  signal?.throwIfAborted();
   if (response.status === 204) {
     setCsrfToken(response.headers.get("x-csrf-token") ?? csrfToken);
     return undefined as T;
@@ -96,7 +97,8 @@ export const api = {
   get: <T>(path: string, params?: Record<string, string>, signal?: AbortSignal) =>
     request<T>("GET", path, undefined, params, signal),
   getBlob: (path: string, signal?: AbortSignal) => requestBlob(path, signal),
-  post: <T>(path: string, body?: unknown) => request<T>("POST", path, body),
+  post: <T>(path: string, body?: unknown, signal?: AbortSignal) =>
+    request<T>("POST", path, body, undefined, signal),
   patch: <T>(path: string, body: unknown) => request<T>("PATCH", path, body),
   delete: <T>(path: string) => request<T>("DELETE", path),
 };
@@ -187,6 +189,30 @@ export interface EventArtifact {
   id: string;
   kind: string;
   media_type: string;
+}
+
+export interface WaterfallOptions {
+  automatic_distance_start_m: number;
+  automatic_distance_stop_m: number;
+  available_distance_start_m: number;
+  available_distance_stop_m: number;
+  primary_detector: string;
+  primary_detector_display: string;
+  filter_low_hz: number;
+  filter_high_hz: number;
+  distance_unit: "m";
+}
+
+export interface WaterfallPreview {
+  distance_start_m: number;
+  distance_stop_m: number;
+  channel_count: number;
+  primary_detector: string;
+  primary_detector_display: string;
+  filter_low_hz: number;
+  filter_high_hz: number;
+  raw_png_base64: string;
+  filtered_png_base64: string;
 }
 
 export interface EventRun {

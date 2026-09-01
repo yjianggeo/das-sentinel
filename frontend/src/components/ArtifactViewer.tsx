@@ -7,6 +7,8 @@ import {
   type MouseEvent,
 } from "react";
 import { api, ApiError, type EventArtifact } from "../api";
+import WaterfallRangeControls from "./WaterfallRangeControls";
+import { useWaterfallPreview } from "./useWaterfallPreview";
 
 const KIND_META: Record<string, { name: string; alt: string }> = {
   waterfall_raw: { name: "瀑布图", alt: "事件瀑布图" },
@@ -19,8 +21,8 @@ const KIND_META: Record<string, { name: string; alt: string }> = {
 const IMAGE_KINDS = Object.keys(KIND_META);
 
 type ArtifactLoadState =
-  | { kind: "loading" }
-  | { kind: "ready"; url: string }
+  | { kind: "loading"; eventId?: string }
+  | { kind: "ready"; url: string; eventId: string }
   | { kind: "error"; message: string };
 
 function isAbortError(cause: unknown): boolean {
@@ -32,8 +34,10 @@ export function artifactUrl(id: string): string {
 }
 
 export default function ArtifactViewer({
+  eventId,
   artifacts,
 }: {
+  eventId: string;
   artifacts: EventArtifact[];
 }) {
   const images = artifacts.filter((item) => IMAGE_KINDS.includes(item.kind));
@@ -48,6 +52,8 @@ export default function ArtifactViewer({
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const fullscreenTriggerRef = useRef<HTMLButtonElement | null>(null);
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const displayedEventIdRef = useRef(eventId);
+  const { options, optionsError, preview, busy, error, generate, reset } = useWaterfallPreview(eventId);
 
   useEffect(() => {
     if (images.length > 0 && !images.some((item) => item.kind === activeKind)) {
@@ -57,6 +63,13 @@ export default function ArtifactViewer({
 
   const active = images.find((item) => item.kind === activeKind) ?? images[0];
   const activeId = active?.id;
+
+  useEffect(() => {
+    if (displayedEventIdRef.current !== eventId) {
+      displayedEventIdRef.current = eventId;
+      setLoadState({ kind: "loading", eventId });
+    }
+  }, [eventId]);
 
   useEffect(() => {
     if (!activeId) return;
@@ -69,7 +82,7 @@ export default function ArtifactViewer({
       .then((blob) => {
         if (!current) return;
         objectUrl = URL.createObjectURL(blob);
-        setLoadState({ kind: "ready", url: objectUrl });
+        setLoadState({ kind: "ready", url: objectUrl, eventId });
       })
       .catch((cause: unknown) => {
         if (!current || isAbortError(cause)) return;
@@ -116,6 +129,18 @@ export default function ArtifactViewer({
     return <p className="loading">此事件没有图件。</p>;
   }
   const meta = KIND_META[active.kind] ?? { name: active.kind, alt: active.kind };
+  const previewUrl =
+    active.kind === "waterfall_raw"
+      ? preview?.waterfall_raw
+      : active.kind === "waterfall_filtered"
+        ? preview?.waterfall_filtered
+        : undefined;
+  const imageUrl = previewUrl
+    ?? (loadState.kind === "ready" && loadState.eventId === eventId
+      ? loadState.url
+      : loadState.kind === "loading" && loadState.eventId === eventId
+        ? artifactUrl(active.id)
+        : undefined);
 
   const selectIndex = (index: number) => {
     if (images[index].kind === active.kind) return;
@@ -157,6 +182,14 @@ export default function ArtifactViewer({
 
   return (
     <div className="artifact-viewer">
+      <WaterfallRangeControls
+        options={options}
+        optionsError={optionsError}
+        busy={busy}
+        error={error}
+        onGenerate={generate}
+        onReset={reset}
+      />
       <div className="artifact-tabs">
         <div className="artifact-tablist" role="tablist" aria-label="图件类型">
           {images.map((item, index) => (
@@ -179,7 +212,7 @@ export default function ArtifactViewer({
             </button>
           ))}
         </div>
-        <a className="tab download" href={artifactUrl(active.id)} download>
+        <a className="tab download" href={previewUrl ?? artifactUrl(active.id)} download>
           下载
         </a>
       </div>
@@ -194,10 +227,10 @@ export default function ArtifactViewer({
             className="artifact-panel"
             hidden={!isActive}
           >
-            {isActive && loadState.kind === "loading" && (
+            {isActive && !previewUrl && loadState.kind === "loading" && (
               <p className="loading">正在加载图件…</p>
             )}
-            {isActive && loadState.kind === "error" && (
+            {isActive && !previewUrl && loadState.kind === "error" && (
               <div className="artifact-error">
                 <p className="error" role="alert">{loadState.message}</p>
                 <button type="button" className="subtle" onClick={retry}>
@@ -205,20 +238,20 @@ export default function ArtifactViewer({
                 </button>
               </div>
             )}
-            {isActive && loadState.kind === "ready" && (
+            {isActive && imageUrl && (
               <button
                 type="button"
                 className="artifact-image-button"
                 onClick={openFullscreen}
                 aria-label="全屏查看"
               >
-                <img src={loadState.url} alt={meta.alt} onError={showDecodeError} />
+                <img src={imageUrl} alt={meta.alt} onError={showDecodeError} />
               </button>
             )}
           </div>
         );
       })}
-      {fullscreen && loadState.kind === "ready" && (
+      {fullscreen && imageUrl && (
         <div className="artifact-fullscreen" onClick={closeFullscreen}>
           <div
             className="artifact-fullscreen-dialog"
@@ -235,7 +268,7 @@ export default function ArtifactViewer({
             >
               关闭全屏
             </button>
-            <img src={loadState.url} alt={meta.alt} onError={showDecodeError} />
+            <img src={imageUrl} alt={meta.alt} onError={showDecodeError} />
           </div>
         </div>
       )}

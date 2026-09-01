@@ -60,6 +60,29 @@ test("admin logs in, reviews the seeded event, and saves the human label", async
   await expect(page.locator("h1")).toBeVisible();
 });
 
+test("seeded event previews both waterfall distance ranges", async ({ page }) => {
+  // Catches a missing accessible range form or a preview that replaces only one waterfall.
+  await login(page);
+  await page.goto("/events");
+  await page.locator(".queue-item").first().click();
+
+  await expect(page.getByText("可用 8–24 m")).toBeVisible();
+  await expect(page.getByLabel("起始距离（m）")).toHaveValue("12");
+  await expect(page.getByLabel("结束距离（m）")).toHaveValue("20");
+  await expect(page.getByText("滤波瀑布图（3.5–27.25 Hz）")).toBeVisible();
+  await expect(page.getByText("主检测器：STA/LTA")).toBeVisible();
+
+  await page.getByLabel("起始距离（m）").fill("10");
+  await page.getByLabel("结束距离（m）").fill("22");
+  await page.getByRole("button", { name: "生成临时预览" }).click();
+  await expect(page.locator(".artifact-viewer img").first()).toHaveAttribute(
+    "src",
+    /^blob:/,
+  );
+  await page.getByRole("tab", { name: "滤波瀑布图" }).click();
+  await expect(page.getByAltText("事件滤波瀑布图")).toHaveAttribute("src", /^blob:/);
+});
+
 test("artifact integrity failure stays visible and retryable", async ({ page }) => {
   await login(page);
   await page.route("**/api/v1/artifacts/*", (route) =>

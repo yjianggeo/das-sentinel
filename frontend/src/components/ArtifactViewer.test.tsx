@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { transferableAbortController } from "node:util";
 import { http, HttpResponse } from "msw";
@@ -11,6 +11,38 @@ const ARTIFACTS: EventArtifact[] = [
   { id: "art-1", kind: "waterfall_raw", media_type: "image/png" },
   { id: "art-2", kind: "psd", media_type: "image/png" },
 ];
+
+const PREVIEW_ARTIFACTS: EventArtifact[] = [
+  { id: "art-1", kind: "waterfall_raw", media_type: "image/png" },
+  { id: "art-6", kind: "waterfall_filtered", media_type: "image/png" },
+  { id: "art-3", kind: "waveform", media_type: "image/png" },
+  { id: "art-2", kind: "psd", media_type: "image/png" },
+  { id: "art-5", kind: "stft", media_type: "image/png" },
+];
+
+const OPTIONS = {
+  automatic_distance_start_m: 12,
+  automatic_distance_stop_m: 20,
+  available_distance_start_m: 8,
+  available_distance_stop_m: 24,
+  primary_detector: "stalta",
+  primary_detector_display: "STA/LTA",
+  filter_low_hz: 3.5,
+  filter_high_hz: 27.25,
+  distance_unit: "m",
+};
+
+const PREVIEW = {
+  distance_start_m: 12,
+  distance_stop_m: 20,
+  channel_count: 8,
+  primary_detector: "stalta",
+  primary_detector_display: "STA/LTA",
+  filter_low_hz: 3.5,
+  filter_high_hz: 27.25,
+  raw_png_base64: "cG5nLXJhdy0x",
+  filtered_png_base64: "cG5nLWZpbHRlcmVkLTE=",
+};
 
 const server = setupServer();
 const domAbortController = globalThis.AbortController;
@@ -39,6 +71,9 @@ beforeEach(() => {
   vi.mocked(URL.revokeObjectURL).mockClear();
   server.resetHandlers();
   server.use(
+    http.get("/api/v1/events/:eventId/waterfall-options", () =>
+      HttpResponse.json(OPTIONS),
+    ),
     http.get("/api/v1/artifacts/:artifactId", () =>
       new HttpResponse(new Blob(["png"], { type: "image/png" })),
     ),
@@ -61,7 +96,7 @@ afterAll(() => {
 });
 
 it("supports wrapped arrow, Home, and End navigation with a linked tabpanel", async () => {
-  render(<ArtifactViewer artifacts={ARTIFACTS} />);
+  render(<ArtifactViewer eventId="event-1" artifacts={ARTIFACTS} />);
   const waterfall = screen.getByRole("tab", { name: "瀑布图" });
   const psd = screen.getByRole("tab", { name: "PSD" });
 
@@ -89,7 +124,7 @@ it("keeps a loaded image visible when selecting the already active tab", async (
       return new HttpResponse(new Blob(["png"], { type: "image/png" }));
     }),
   );
-  render(<ArtifactViewer artifacts={ARTIFACTS} />);
+  render(<ArtifactViewer eventId="event-1" artifacts={ARTIFACTS} />);
   const waterfall = screen.getAllByRole("tab")[0];
   const psd = screen.getByRole("tab", { name: "PSD" });
 
@@ -110,7 +145,7 @@ it("keeps a loaded image visible when selecting the already active tab", async (
 });
 
 it("renders a bidirectionally linked panel for every artifact tab", () => {
-  render(<ArtifactViewer artifacts={ARTIFACTS} />);
+  render(<ArtifactViewer eventId="event-1" artifacts={ARTIFACTS} />);
 
   for (const tab of screen.getAllByRole("tab")) {
     const panelId = tab.getAttribute("aria-controls");
@@ -129,7 +164,7 @@ it("shows and retries an image decoding failure", async () => {
       return new HttpResponse(new Blob(["png"], { type: "image/png" }));
     }),
   );
-  render(<ArtifactViewer artifacts={ARTIFACTS} />);
+  render(<ArtifactViewer eventId="event-1" artifacts={ARTIFACTS} />);
 
   fireEvent.error(await screen.findByAltText("事件瀑布图"));
   expect(screen.getByRole("alert")).toHaveTextContent("图件加载失败");
@@ -139,7 +174,7 @@ it("shows and retries an image decoding failure", async () => {
 });
 
 it("focuses the fullscreen close control and restores its trigger on Escape", async () => {
-  render(<ArtifactViewer artifacts={ARTIFACTS} />);
+  render(<ArtifactViewer eventId="event-1" artifacts={ARTIFACTS} />);
   const trigger = await screen.findByRole("button", { name: "全屏查看" });
 
   await userEvent.click(trigger);
@@ -156,7 +191,7 @@ it("focuses the fullscreen close control and restores its trigger on Escape", as
 });
 
 it("does not close the fullscreen dialog when its content is clicked", async () => {
-  render(<ArtifactViewer artifacts={ARTIFACTS} />);
+  render(<ArtifactViewer eventId="event-1" artifacts={ARTIFACTS} />);
   await userEvent.click(await screen.findByRole("button", { name: "全屏查看" }));
 
   await userEvent.click(screen.getByRole("dialog"));
@@ -165,7 +200,7 @@ it("does not close the fullscreen dialog when its content is clicked", async () 
 });
 
 it("revokes replaced and unmounted object URLs", async () => {
-  const view = render(<ArtifactViewer artifacts={ARTIFACTS} />);
+  const view = render(<ArtifactViewer eventId="event-1" artifacts={ARTIFACTS} />);
   expect(await screen.findByAltText("事件瀑布图")).toHaveAttribute(
     "src",
     "blob:artifact-1",
@@ -180,4 +215,202 @@ it("revokes replaced and unmounted object URLs", async () => {
 
   view.unmount();
   expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:artifact-2");
+});
+
+it("renders the available range, defaults, actual filter band, and detector", async () => {
+  // Catches omission of the accessible distance controls and server-provided filter metadata.
+  render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
+
+  expect(await screen.findByText("可用 8–24 m")).toBeVisible();
+  expect(screen.getByLabelText("起始距离（m）")).toHaveValue(12);
+  expect(screen.getByLabelText("结束距离（m）")).toHaveValue(20);
+  expect(screen.getByText("滤波瀑布图（3.5–27.25 Hz）")).toBeVisible();
+  expect(screen.getByText("主检测器：STA/LTA")).toBeVisible();
+});
+
+it("rejects an invalid distance range without posting", async () => {
+  // Catches client-side validation being bypassed before the preview POST.
+  let postCount = 0;
+  server.use(
+    http.post("/api/v1/events/event-1/waterfall-preview", () => {
+      postCount += 1;
+      return HttpResponse.json(PREVIEW);
+    }),
+  );
+  render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
+
+  await screen.findByText("可用 8–24 m");
+  await userEvent.clear(screen.getByLabelText("结束距离（m）"));
+  await userEvent.type(screen.getByLabelText("结束距离（m）"), "10");
+  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+
+  expect(screen.getByRole("alert")).toHaveTextContent("起始距离必须小于结束距离");
+  expect(postCount).toBe(0);
+});
+
+it("uses one preview response for both waterfall tabs while permanent artifacts keep API links", async () => {
+  // Catches separate raw/filtered requests and accidental replacement of waveform, PSD, or STFT.
+  server.use(
+    http.post("/api/v1/events/event-1/waterfall-preview", () =>
+      HttpResponse.json(PREVIEW),
+    ),
+  );
+  render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
+
+  await screen.findByText("可用 8–24 m");
+  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+
+  await waitFor(() => {
+    expect(screen.getByRole("img", { name: "事件瀑布图" })).toHaveAttribute(
+      "src",
+      expect.stringMatching(/^blob:/),
+    );
+  });
+  const rawDownload = screen.getByRole("link", { name: "下载" });
+  expect(rawDownload).toHaveAttribute("href", expect.stringMatching(/^blob:/));
+
+  await userEvent.click(screen.getByRole("tab", { name: "滤波瀑布图" }));
+  expect(screen.getByRole("img", { name: "事件滤波瀑布图" })).toHaveAttribute(
+    "src",
+    expect.stringMatching(/^blob:/),
+  );
+  expect(screen.getByRole("link", { name: "下载" })).toHaveAttribute(
+    "href",
+    expect.stringMatching(/^blob:/),
+  );
+
+  await userEvent.click(screen.getByRole("tab", { name: "波形" }));
+  expect(screen.getByRole("link", { name: "下载" })).toHaveAttribute(
+    "href",
+    "/api/v1/artifacts/art-3",
+  );
+  await userEvent.click(screen.getByRole("tab", { name: "PSD" }));
+  expect(screen.getByRole("link", { name: "下载" })).toHaveAttribute(
+    "href",
+    "/api/v1/artifacts/art-2",
+  );
+  await userEvent.click(screen.getByRole("tab", { name: "STFT" }));
+  expect(screen.getByRole("link", { name: "下载" })).toHaveAttribute(
+    "href",
+    "/api/v1/artifacts/art-5",
+  );
+});
+
+it("reset restores permanent waterfall URLs and revokes both preview URLs", async () => {
+  // Catches previews surviving reset and leaked object URLs.
+  server.use(
+    http.post("/api/v1/events/event-1/waterfall-preview", () =>
+      HttpResponse.json(PREVIEW),
+  ),
+  );
+  render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
+
+  await screen.findByText("可用 8–24 m");
+  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+  const rawUrl = await waitFor(() => {
+    const url = screen.getByRole("img", { name: "事件瀑布图" }).getAttribute("src");
+    expect(url).toMatch(/^blob:/);
+    return url!;
+  });
+  await userEvent.click(screen.getByRole("tab", { name: "滤波瀑布图" }));
+  const filteredUrl = screen.getByRole("img", { name: "事件滤波瀑布图" }).getAttribute("src");
+  expect(filteredUrl).toMatch(/^blob:/);
+
+  await userEvent.click(screen.getByRole("button", { name: "重置临时预览" }));
+
+  expect(screen.getByRole("link", { name: "下载" })).toHaveAttribute(
+    "href",
+    "/api/v1/artifacts/art-6",
+  );
+  expect(URL.revokeObjectURL).toHaveBeenCalledWith(rawUrl);
+  expect(URL.revokeObjectURL).toHaveBeenCalledWith(filteredUrl);
+});
+
+it("revokes the first preview pair before displaying a second pair", async () => {
+  // Catches object URL accumulation across repeated preview generation.
+  let requestNumber = 0;
+  server.use(
+    http.post("/api/v1/events/event-1/waterfall-preview", () => {
+      requestNumber += 1;
+      return HttpResponse.json({
+        ...PREVIEW,
+        raw_png_base64: `cG5nLXJhdy0${requestNumber}`,
+        filtered_png_base64: `cG5nLWZpbHRlcmVkL${requestNumber}`,
+      });
+    }),
+  );
+  render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
+
+  await screen.findByText("可用 8–24 m");
+  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+  const firstRaw = await waitFor(() => {
+    const url = screen.getByRole("img", { name: "事件瀑布图" }).getAttribute("src");
+    expect(url).toMatch(/^blob:/);
+    return url!;
+  });
+  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+
+  await waitFor(() => expect(URL.revokeObjectURL).toHaveBeenCalledWith(firstRaw));
+  expect(URL.revokeObjectURL).toHaveBeenCalledTimes(2);
+});
+
+it.each([409, 422, 500])("preserves the current preview after a %s response", async (status) => {
+  // Catches failed requests clearing a valid preview image.
+  let requestNumber = 0;
+  server.use(
+    http.post("/api/v1/events/event-1/waterfall-preview", () => {
+      requestNumber += 1;
+      return requestNumber === 1
+        ? HttpResponse.json(PREVIEW)
+        : HttpResponse.json({ detail: "failed" }, { status });
+    }),
+  );
+  render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
+
+  await screen.findByText("可用 8–24 m");
+  const generate = screen.getByRole("button", { name: "生成临时预览" });
+  await userEvent.click(generate);
+  const firstUrl = await waitFor(() => {
+    const url = screen.getByRole("img", { name: "事件瀑布图" }).getAttribute("src");
+    expect(url).toMatch(/^blob:/);
+    return url!;
+  });
+  await userEvent.clear(screen.getByLabelText("结束距离（m）"));
+  await userEvent.type(screen.getByLabelText("结束距离（m）"), "21");
+  await userEvent.click(generate);
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("无法生成临时预览");
+  expect(screen.getByRole("img", { name: "事件瀑布图" })).toHaveAttribute("src", firstUrl);
+});
+
+it("aborts superseded preview requests and ignores late results while revoking URLs on unmount", async () => {
+  // Catches stale event responses and missing request/object URL cleanup.
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let postSignal: AbortSignal | undefined;
+  server.use(
+    http.post("/api/v1/events/event-1/waterfall-preview", async ({ request }) => {
+      postSignal = request.signal;
+      await blocked;
+      return HttpResponse.json(PREVIEW);
+    }),
+  );
+  const view = render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
+  await screen.findByText("可用 8–24 m");
+  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+  await waitFor(() => expect(postSignal).toBeDefined());
+
+  view.rerender(<ArtifactViewer eventId="event-2" artifacts={PREVIEW_ARTIFACTS} />);
+  expect(postSignal?.aborted).toBe(true);
+  await act(async () => {
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  expect(screen.queryByRole("img", { name: "事件瀑布图" })).not.toHaveAttribute(
+    "src",
+    expect.stringMatching(/^blob:/),
+  );
+  view.unmount();
 });

@@ -35,3 +35,14 @@ it("ignores a stale artifact 401 after the unauthorized handler changes", async 
   expect(oldHandler).not.toHaveBeenCalled();
   expect(newHandler).not.toHaveBeenCalled();
 });
+
+it("forwards AbortSignal for JSON POST requests", async () => {
+  vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(Response.json({}))))
+  const controller = new AbortController();
+  const pending = api.post("/api/v1/events/e1/waterfall-preview", {
+    distance_start_m: 12,
+    distance_stop_m: 20,
+  }, controller.signal);
+  controller.abort();
+  await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+});

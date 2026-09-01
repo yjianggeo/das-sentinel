@@ -236,7 +236,7 @@ export default function EventsPage() {
         {selected !== null && detail !== null && selected.id === detail.id && (
           <>
             <header className="event-detail-header">
-              <h2>{formatOccurredAt(detail.occurred_at)}</h2>
+              <h2>{formatOccurredAt(detail.occurred_at, detail.site_timezone)}</h2>
               <p>
                 机器标签：
                 <span className={`status-pill label-${detail.machine_label}`}>
@@ -250,7 +250,7 @@ export default function EventsPage() {
             </header>
             <div className="event-detail-body">
               <div className="event-artifacts">
-                <ArtifactViewer artifacts={detail.artifacts} />
+                <ArtifactViewer eventId={detail.id} artifacts={detail.artifacts} />
               </div>
               <EvidencePanel event={detail} />
             </div>
