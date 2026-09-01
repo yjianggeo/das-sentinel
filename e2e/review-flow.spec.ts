@@ -66,10 +66,10 @@ test("seeded event previews both waterfall distance ranges", async ({ page }) =>
   await page.goto("/events");
   await page.locator(".queue-item").first().click();
 
-  await expect(page.getByText("可用 8–24 m")).toBeVisible();
-  await expect(page.getByLabel("起始距离（m）")).toHaveValue("12");
-  await expect(page.getByLabel("结束距离（m）")).toHaveValue("20");
-  await expect(page.getByText("滤波瀑布图（3.5–27.25 Hz）")).toBeVisible();
+  await expect(page.getByText("可用 8–36 m")).toBeVisible();
+  await expect(page.getByLabel("起始距离（m）")).toHaveValue("8");
+  await expect(page.getByLabel("结束距离（m）")).toHaveValue("36");
+  await expect(page.getByText("滤波瀑布图（2–40 Hz）")).toBeVisible();
   await expect(page.getByText("主检测器：STA/LTA")).toBeVisible();
 
   await page.getByLabel("起始距离（m）").fill("10");

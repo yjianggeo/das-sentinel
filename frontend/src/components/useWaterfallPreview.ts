@@ -89,8 +89,9 @@ export function useWaterfallPreview(eventId: string): {
 
     return () => {
       controller.abort();
-      if (controllerRef.current === controller) controllerRef.current = null;
-      if (sequence === sequenceRef.current) sequenceRef.current += 1;
+      controllerRef.current?.abort();
+      controllerRef.current = null;
+      sequenceRef.current += 1;
       replacePreview(null);
     };
   }, [eventId, replacePreview]);

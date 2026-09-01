@@ -414,3 +414,32 @@ it("aborts superseded preview requests and ignores late results while revoking U
   );
   view.unmount();
 });
+
+it("aborts a pending preview on direct unmount without creating late object URLs", async () => {
+  // Catches cleanup that aborts only the old options request after generate replaces its controller.
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  let postSignal: AbortSignal | undefined;
+  server.use(
+    http.post("/api/v1/events/event-1/waterfall-preview", async ({ request }) => {
+      postSignal = request.signal;
+      await blocked;
+      return HttpResponse.json(PREVIEW);
+    }),
+  );
+  const view = render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
+  await screen.findByText("可用 8–24 m");
+  const createdBeforePreview = vi.mocked(URL.createObjectURL).mock.calls.length;
+  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+  await waitFor(() => expect(postSignal).toBeDefined());
+
+  view.unmount();
+  expect(postSignal?.aborted).toBe(true);
+  await act(async () => {
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  expect(URL.createObjectURL).toHaveBeenCalledTimes(createdBeforePreview);
+});
