@@ -112,10 +112,18 @@ def main() -> None:
             timezone="UTC",
             cable_type="downhole",
         )
+        profile = ProcessingProfile(
+            device="cpu",
+            stalta_freq_low_hz=2.0,
+            stalta_freq_high_hz=40.0,
+            coherence_threshold=0.5,
+            energy_ratio_threshold=101.0,
+            trajectory_threshold=0.8,
+        )
         repositories.profiles.add(
             site_id=site.id,
             version=1,
-            payload=ProcessingProfile(device="cpu").model_dump(mode="json"),
+            payload=profile.model_dump(mode="json"),
             is_current=True,
         )
         site_id = site.id

@@ -64,6 +64,20 @@ test("seeded event previews both waterfall distance ranges", async ({ page }) =>
   // Catches a missing accessible range form or a preview that replaces only one waterfall.
   await login(page);
   await page.goto("/events");
+  const options = await page.evaluate(async () => {
+    const [event] = (await fetch("/api/v1/events?limit=1").then((response) => response.json())) as Array<{
+      id: string;
+    }>;
+    return fetch(`/api/v1/events/${event.id}/waterfall-options`).then((response) => response.json());
+  });
+  expect(options).toMatchObject({
+    automatic_distance_start_m: 8,
+    automatic_distance_stop_m: 36,
+    primary_detector: "stalta",
+    primary_detector_display: "STA/LTA",
+    filter_low_hz: 2,
+    filter_high_hz: 40,
+  });
   await page.locator(".queue-item").first().click();
 
   await expect(page.getByText("可用 8–36 m")).toBeVisible();

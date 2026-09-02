@@ -885,36 +885,70 @@ it("uses the server page boundary for the next offset when a page contains a dup
   expect(screen.getAllByRole("button", { name: /^事件 / })).toHaveLength(201);
 });
 
-it("refreshes the selected detail and similar events after a review", async () => {
+it("keeps the saved review status visible while immediately refreshing the selected event", async () => {
+  // Catches reloadEvents reopening the current event with detail cleared, which unmounts
+  // ReviewForm before its successful save state can be rendered.
   let detailRequests = 0;
   let similarRequests = 0;
+  let reviewed = false;
+  const refreshDetail = deferredResponse(1);
+  const refreshSimilar = deferredResponse(1);
+  const review = {
+    id: 13,
+    label: "earthquake",
+    note: null,
+    created_at: "2026-07-26T11:00:00Z",
+  };
   server.use(
-    http.get("/api/v1/events", () => HttpResponse.json([SUMMARY])),
-    http.get("/api/v1/events/event-1", () => {
+    http.get("/api/v1/events", () =>
+      HttpResponse.json([{ ...SUMMARY, latest_review: reviewed ? review : null }]),
+    ),
+    http.get("/api/v1/events/event-1", async () => {
       detailRequests += 1;
-      return HttpResponse.json(DETAIL);
+      if (detailRequests === 2) {
+        refreshDetail.markStarted();
+        await refreshDetail.promise;
+        refreshDetail.markDelivered();
+      }
+      return HttpResponse.json({
+        ...DETAIL,
+        latest_review: reviewed ? review : null,
+        review_history: reviewed ? [review] : [],
+      });
     }),
-    http.get("/api/v1/events/event-1/similar", () => {
+    http.get("/api/v1/events/event-1/similar", async () => {
       similarRequests += 1;
+      if (similarRequests === 2) {
+        refreshSimilar.markStarted();
+        await refreshSimilar.promise;
+        refreshSimilar.markDelivered();
+      }
       return HttpResponse.json([]);
     }),
-    http.post("/api/v1/events/event-1/reviews", () =>
-      HttpResponse.json(
-        { id: 13, label: "earthquake", note: null, created_at: "2026-07-26T11:00:00Z" },
-        { status: 201 },
-      ),
-    ),
+    http.post("/api/v1/events/event-1/reviews", () => {
+      reviewed = true;
+      return HttpResponse.json(review, { status: 201 });
+    }),
   );
   renderApp("/events");
 
   await userEvent.click(await screen.findByRole("button", { name: "事件 event-1" }));
   await userEvent.selectOptions(await screen.findByLabelText("人工标签"), "earthquake");
   await userEvent.click(screen.getByRole("button", { name: "保存复核" }));
-  await screen.findByText("已保存");
+  await Promise.all([refreshDetail.started, refreshSimilar.started]);
+  expect(await screen.findByRole("status")).toHaveTextContent("已保存");
+
+  await act(async () => {
+    refreshDetail.resolve();
+    refreshSimilar.resolve();
+    await Promise.all([refreshDetail.delivered, refreshSimilar.delivered]);
+  });
 
   await waitFor(() => {
     expect(detailRequests).toBe(2);
     expect(similarRequests).toBe(2);
+    expect(screen.getByRole("button", { name: "事件 event-1" })).toHaveTextContent("✓ 地震");
+    expect(screen.getByText(/人工复核：\s*地震/)).toBeVisible();
   });
 });
 

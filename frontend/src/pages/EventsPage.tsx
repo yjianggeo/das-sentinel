@@ -115,13 +115,13 @@ export default function EventsPage() {
     [],
   );
 
-  const openEvent = useCallback((event: EventSummary) => {
+  const openEvent = useCallback((event: EventSummary, preserveDetail = false) => {
     const sequence = ++requestSequence.current;
     activeDetailController.current?.abort();
     const controller = new AbortController();
     activeDetailController.current = controller;
     setSelected(event);
-    setDetail(null);
+    if (!preserveDetail) setDetail(null);
     setSimilar([]);
     setDetailError("");
     api
@@ -194,7 +194,7 @@ export default function EventsPage() {
 
   const reloadEvents = useCallback(() => {
     setReloadVersion((current) => current + 1);
-    if (selectedRef.current) openEvent(selectedRef.current);
+    if (selectedRef.current) openEvent(selectedRef.current, true);
   }, [openEvent]);
 
   if (collection.kind === "error") {
