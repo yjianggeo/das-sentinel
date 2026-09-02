@@ -14,8 +14,8 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from PIL import Image
 from das_sentinel.domain import Candidate, EventRecord
+from PIL import Image
 
 EVENT_ID = "123e4567-e89b-12d3-a456-426614174000"
 
@@ -121,6 +121,24 @@ def test_filtered_waterfall_title_names_detector_and_exact_band():
         context,
         filtered=True,
     ).startswith(b"\x89PNG\r\n\x1a\n")
+
+
+def test_filtered_waterfall_title_preserves_shortest_round_trip_precision():
+    """Regresses six-significant-digit :g rounding while removing only useless .0."""
+    from das_sentinel.artifacts import WaterfallPlotContext, filtered_waterfall_title
+    from das_sentinel.waterfalls import WaterfallFilter
+
+    context = WaterfallPlotContext(
+        sample_rate_hz=1000.0,
+        site_timezone="Asia/Shanghai",
+        profile_version="7",
+        pipeline_version="v1",
+        model_version="rules-only",
+        filter=WaterfallFilter("stalta", 0.30000000000000004, 40.0),
+    )
+
+    assert "Band-pass 0.30000000000000004–40 Hz" in filtered_waterfall_title(context)
+    assert filtered_waterfall_title(context).endswith("1000 Hz | input unit")
 
 
 def test_renders_complete_event_artifact_set_with_distinct_raw_and_filtered_inputs(tmp_path):

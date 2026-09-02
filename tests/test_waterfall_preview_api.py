@@ -4,7 +4,7 @@ import base64
 import hashlib
 import json
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import h5py
@@ -20,7 +20,12 @@ from das_sentinel.persistence import (
     session_factory,
     upgrade_database,
 )
-from das_sentinel.persistence.models import Base, Event, SourceFile
+from das_sentinel.persistence.models import (
+    Base,
+    Event,
+    ProcessingRun,
+    SourceFile,
+)
 from das_sentinel.services.discovery import fingerprint
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
@@ -84,7 +89,10 @@ def waterfall_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             site_id=site.id,
             version=4,
             payload=ProcessingProfile(
-                device="cpu", stalta_freq_low_hz=3.5, stalta_freq_high_hz=27.25
+                device="cpu",
+                artifact_pad_seconds=0.05,
+                stalta_freq_low_hz=3.5,
+                stalta_freq_high_hz=27.25,
             ).model_dump(mode="json"),
             is_current=False,
         )
@@ -237,6 +245,9 @@ def test_waterfall_preview_returns_two_pngs_after_one_read_without_writes(waterf
         def read_metadata(self, path):
             return original_reader.read_metadata(path)
 
+        def sample_count(self, path):
+            return original_reader.sample_count(path)
+
         def read_block(self, path, start, stop, channels):
             self.read_block_calls += 1
             return original_reader.read_block(path, start, stop, channels)
@@ -278,26 +289,101 @@ def test_waterfall_preview_returns_two_pngs_after_one_read_without_writes(waterf
     )
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {"distance_start_m": 20.0, "distance_stop_m": 12.0},
-        {"distance_start_m": 8.0, "distance_stop_m": 12.0},
-        {"distance_start_m": 12.0, "distance_stop_m": 24.0},
-    ],
-)
-def test_waterfall_preview_rejects_invalid_or_non_strictly_interior_ranges(
-    waterfall_api, payload
-):
+def test_waterfall_preview_rejects_reversed_range(waterfall_api):
     client, _, _, csrf_token, ids, _ = waterfall_api
 
     response = client.post(
         f"/api/v1/events/{ids['event']}/waterfall-preview",
-        json=payload,
+        json={"distance_start_m": 20.0, "distance_stop_m": 12.0},
         headers={"X-CSRF-Token": csrf_token},
     )
 
     assert response.status_code == 422
+
+
+def test_waterfall_preview_accepts_range_outside_automatic_but_inside_available(
+    waterfall_api,
+):
+    """Regresses validation against event bounds instead of source availability."""
+    client, _, _, csrf_token, ids, _ = waterfall_api
+
+    response = client.post(
+        f"/api/v1/events/{ids['event']}/waterfall-preview",
+        json={"distance_start_m": 8.0, "distance_stop_m": 12.0},
+        headers={"X-CSRF-Token": csrf_token},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["distance_start_m"] == 8.0
+    assert response.json()["distance_stop_m"] == 12.0
+
+
+@pytest.mark.parametrize(
+    ("requested", "expected"),
+    [
+        ((11.0, 21.0), (12.0, 20.0, 2)),
+        ((11.0, 13.0), (12.0, 12.0, 1)),
+    ],
+)
+def test_waterfall_preview_reports_actual_usable_distance_extrema(
+    waterfall_api, requested, expected
+):
+    """Regresses echoing off-grid request bounds rather than selected channels."""
+    client, _, _, csrf_token, ids, _ = waterfall_api
+
+    response = client.post(
+        f"/api/v1/events/{ids['event']}/waterfall-preview",
+        json={"distance_start_m": requested[0], "distance_stop_m": requested[1]},
+        headers={"X-CSRF-Token": csrf_token},
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert (body["distance_start_m"], body["distance_stop_m"], body["channel_count"]) == expected
+
+
+@pytest.mark.parametrize(
+    ("event_bounds", "expected_read_bounds"),
+    [((2, 10), (0, 15)), ((190, 198), (185, 200))],
+)
+def test_waterfall_preview_reads_profile_padded_window_clamped_to_source_edges(
+    waterfall_api,
+    monkeypatch: pytest.MonkeyPatch,
+    event_bounds,
+    expected_read_bounds,
+):
+    """Regresses reading the bare event interval or passing padded bounds past EOF."""
+    client, _, sessions, csrf_token, ids, _ = waterfall_api
+    reader = client.app.state.waterfall_preview_service.reader
+    original_read_block = reader.read_block
+    captured: list[tuple[int, int]] = []
+    with sessions.begin() as session:
+        event = session.get(Event, ids["event"])
+        event.start_sample, event.end_sample = event_bounds
+        event.occurred_at = datetime(2026, 7, 26, tzinfo=UTC) + timedelta(
+            seconds=event.start_sample / 100.0
+        )
+        payload = json.loads(event.evidence[0].payload_json)
+        payload.update(
+            start_sample=event_bounds[0],
+            end_sample=event_bounds[1],
+            peak_sample=(event_bounds[0] + event_bounds[1]) // 2,
+        )
+        event.evidence[0].payload_json = json.dumps(payload)
+
+    def capture_read(path, start, stop, channels):
+        captured.append((start, stop))
+        return original_read_block(path, start, stop, channels)
+
+    monkeypatch.setattr(reader, "read_block", capture_read)
+    response = client.post(
+        f"/api/v1/events/{ids['event']}/waterfall-preview",
+        json={"distance_start_m": 12.0, "distance_stop_m": 20.0},
+        headers={"X-CSRF-Token": csrf_token},
+    )
+
+    assert response.status_code == 200
+    assert captured == [expected_read_bounds]
 
 
 def test_waterfall_preview_rejects_non_finite_range(waterfall_api):
@@ -363,9 +449,16 @@ def test_waterfall_preview_rechecks_fingerprint_after_render(
     assert str(source_path) not in response.text
 
 
-@pytest.mark.parametrize("error", [FileNotFoundError("source disappeared"), OSError("read failed")])
+@pytest.mark.parametrize(
+    "error",
+    [
+        FileNotFoundError("source disappeared"),
+        OSError("read failed"),
+        ValueError("source structure is inconsistent"),
+    ],
+)
 def test_waterfall_preview_controls_read_block_io_errors(
-    waterfall_api, monkeypatch: pytest.MonkeyPatch, error: OSError
+    waterfall_api, monkeypatch: pytest.MonkeyPatch, error: Exception
 ):
     client, _, _, csrf_token, ids, source_path = waterfall_api
     reader = client.app.state.waterfall_preview_service.reader
@@ -385,20 +478,27 @@ def test_waterfall_preview_controls_read_block_io_errors(
 
 
 def test_waterfall_preview_rejects_oversized_window_before_read(waterfall_api):
-    client, _, sessions, csrf_token, ids, _ = waterfall_api
-    reader = client.app.state.waterfall_preview_service.reader
+    client, _, _, csrf_token, ids, _ = waterfall_api
+    service = client.app.state.waterfall_preview_service
+    reader = service.reader
     calls = 0
-    with sessions.begin() as session:
-        event = session.get(Event, ids["event"])
-        assert event is not None
-        event.end_sample = event.start_sample + 10_001
+    original_binding = service._binding
+
+    def padded_binding(session, event_id):
+        binding = original_binding(session, event_id)
+        return replace(
+            binding,
+            profile=binding.profile.model_copy(update={"artifact_pad_seconds": 100.0}),
+        )
 
     def count_read_block(path, start, stop, channels):
         nonlocal calls
         calls += 1
         raise AssertionError("oversized preview must not read source data")
 
+    reader.sample_count = lambda path: 20_000
     reader.read_block = count_read_block
+    service._binding = padded_binding
     response = client.post(
         f"/api/v1/events/{ids['event']}/waterfall-preview",
         json={"distance_start_m": 12.0, "distance_stop_m": 20.0},
@@ -407,6 +507,123 @@ def test_waterfall_preview_rejects_oversized_window_before_read(waterfall_api):
 
     assert response.status_code == 422
     assert calls == 0
+
+
+def test_waterfall_preview_parses_evidence_once_per_request(
+    waterfall_api, monkeypatch: pytest.MonkeyPatch
+):
+    """Regresses duplicate evidence deserialization in binding and range lookup."""
+    client, _, _, _, ids, _ = waterfall_api
+    service = client.app.state.waterfall_preview_service
+    original = service._candidates
+    calls = 0
+
+    def count_candidates(event):
+        nonlocal calls
+        calls += 1
+        return original(event)
+
+    monkeypatch.setattr(service, "_candidates", count_candidates)
+    response = client.get(f"/api/v1/events/{ids['event']}/waterfall-options")
+
+    assert response.status_code == 200
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    "corrupt",
+    [
+        "profile_version",
+        "event_time",
+        "event_channel",
+        "evidence_peak",
+        "occurred_at",
+    ],
+)
+def test_waterfall_options_reject_persisted_binding_corruption(
+    waterfall_api, corrupt: str
+):
+    """Regresses serving previews from mutually inconsistent persisted rows."""
+    client, _, sessions, _, ids, source_path = waterfall_api
+    with sessions.begin() as session:
+        event = session.get(Event, ids["event"])
+        assert event is not None
+        run = session.get(ProcessingRun, event.processing_run_id)
+        assert run is not None
+        if corrupt == "profile_version":
+            run.profile_version += 1
+        elif corrupt == "event_time":
+            event.start_sample += 1
+        elif corrupt == "event_channel":
+            event.channel_start = 0
+        elif corrupt == "evidence_peak":
+            payload = json.loads(event.evidence[0].payload_json)
+            payload["peak_sample"] = payload["end_sample"]
+            event.evidence[0].payload_json = json.dumps(payload)
+        else:
+            event.occurred_at += timedelta(seconds=1)
+
+    response = client.get(f"/api/v1/events/{ids['event']}/waterfall-options")
+
+    assert response.status_code == 409
+    assert str(source_path) not in response.text
+
+
+def test_waterfall_options_maps_missing_bound_profile_to_conflict(waterfall_api):
+    """Only an absent event is a 404; missing event dependencies are conflicts."""
+    client, _, sessions, _, ids, source_path = waterfall_api
+    engine = sessions.kw["bind"]
+    with sessions() as session:
+        event = session.get(Event, ids["event"])
+        run = session.get(ProcessingRun, event.processing_run_id)
+        profile_id = run.processing_profile_id
+    with engine.connect() as connection:
+        connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+        connection.exec_driver_sql(
+            "DELETE FROM processing_profiles WHERE id = ?", (profile_id,)
+        )
+        connection.commit()
+
+    response = client.get(f"/api/v1/events/{ids['event']}/waterfall-options")
+
+    assert response.status_code == 409
+    assert str(source_path) not in response.text
+
+
+def test_waterfall_preview_uses_bound_model_version_in_plot_provenance(
+    waterfall_api, monkeypatch: pytest.MonkeyPatch
+):
+    """Regresses labelling model-backed runs as rules-only."""
+    import das_sentinel.services.waterfall_previews as previews
+
+    client, _, sessions, csrf_token, ids, _ = waterfall_api
+    with sessions.begin() as session:
+        event = session.get(Event, ids["event"])
+        run = session.get(ProcessingRun, event.processing_run_id)
+        source = session.get(SourceFile, ids["source"])
+        model = Repositories(session).models.add(
+            site_id=source.site_id,
+            version="model-7.2",
+            artifact_path="unused.zip",
+            bundle_sha256="a" * 64,
+            status="active",
+        )
+        run.model_version_id = model.id
+    observed: list[str] = []
+
+    def capture_render(values, dates, distances, context, **kwargs):
+        observed.append(context.model_version)
+        return b"\x89PNG\r\n\x1a\npreview"
+
+    monkeypatch.setattr(previews, "render_waterfall_png", capture_render)
+    response = client.post(
+        f"/api/v1/events/{ids['event']}/waterfall-preview",
+        json={"distance_start_m": 12.0, "distance_stop_m": 20.0},
+        headers={"X-CSRF-Token": csrf_token},
+    )
+
+    assert response.status_code == 200
+    assert observed == ["model-7.2", "model-7.2"]
 
 
 def test_waterfall_preview_rejects_oversized_channel_read_before_read(
@@ -419,6 +636,8 @@ def test_waterfall_preview_rejects_oversized_channel_read_before_read(
     with sessions.begin() as session:
         event = session.get(Event, ids["event"])
         assert event is not None
+        event.channel_start = 0
+        event.channel_stop = 257
         evidence = event.evidence[0]
         evidence.payload_json = json.dumps(
             {

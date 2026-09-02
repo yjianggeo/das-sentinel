@@ -53,6 +53,13 @@ export default function WaterfallRangeControls({
     await onGenerate(startM, stopM);
   };
 
+  const reset = () => {
+    setStart(String(options.automatic_distance_start_m));
+    setStop(String(options.automatic_distance_stop_m));
+    setValidationError("");
+    onReset();
+  };
+
   return (
     <section className="waterfall-range-controls" aria-label="瀑布图距离范围">
       <p>可用 {options.available_distance_start_m}–{options.available_distance_stop_m} {options.distance_unit}</p>
@@ -84,7 +91,7 @@ export default function WaterfallRangeControls({
         <button type="button" onClick={submit} disabled={busy} aria-busy={busy}>
           生成临时预览
         </button>
-        <button type="button" className="subtle" onClick={onReset} disabled={busy}>
+        <button type="button" className="subtle" onClick={reset} disabled={busy}>
           重置临时预览
         </button>
       </div>

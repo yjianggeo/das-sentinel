@@ -296,8 +296,8 @@ it("uses one preview response for both waterfall tabs while permanent artifacts 
   );
 });
 
-it("reset restores permanent waterfall URLs and revokes both preview URLs", async () => {
-  // Catches previews surviving reset and leaked object URLs.
+it("reset restores automatic inputs, clears validation, permanent URLs, and preview objects", async () => {
+  // Catches a URL-only reset that leaves edited inputs or validation behind.
   server.use(
     http.post("/api/v1/events/event-1/waterfall-preview", () =>
       HttpResponse.json(PREVIEW),
@@ -316,8 +316,16 @@ it("reset restores permanent waterfall URLs and revokes both preview URLs", asyn
   const filteredUrl = screen.getByRole("img", { name: "事件滤波瀑布图" }).getAttribute("src");
   expect(filteredUrl).toMatch(/^blob:/);
 
+  await userEvent.clear(screen.getByLabelText("起始距离（m）"));
+  await userEvent.type(screen.getByLabelText("起始距离（m）"), "21");
+  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+  expect(screen.getByRole("alert")).toHaveTextContent("起始距离必须小于结束距离");
+
   await userEvent.click(screen.getByRole("button", { name: "重置临时预览" }));
 
+  expect(screen.getByLabelText("起始距离（m）")).toHaveValue(12);
+  expect(screen.getByLabelText("结束距离（m）")).toHaveValue(20);
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   expect(screen.getByRole("link", { name: "下载" })).toHaveAttribute(
     "href",
     "/api/v1/artifacts/art-6",
@@ -381,6 +389,75 @@ it.each([409, 422, 500])("preserves the current preview after a %s response", as
 
   expect(await screen.findByRole("alert")).toHaveTextContent("无法生成临时预览");
   expect(screen.getByRole("img", { name: "事件瀑布图" })).toHaveAttribute("src", firstUrl);
+});
+
+it("reclaims a partial raw URL when the second Base64 decode fails", async () => {
+  // Catches a decode failure leaking the first new URL or clearing the active preview.
+  let requestNumber = 0;
+  server.use(
+    http.post("/api/v1/events/event-1/waterfall-preview", () => {
+      requestNumber += 1;
+      return HttpResponse.json(
+        requestNumber === 1
+          ? PREVIEW
+          : { ...PREVIEW, filtered_png_base64: "%not-base64%" },
+      );
+    }),
+  );
+  render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
+  await screen.findByText("可用 8–24 m");
+  const generate = screen.getByRole("button", { name: "生成临时预览" });
+  await userEvent.click(generate);
+  const existingUrl = await waitFor(() => {
+    const url = screen.getByRole("img", { name: "事件瀑布图" }).getAttribute("src");
+    expect(url).toMatch(/^blob:/);
+    return url!;
+  });
+  const callsBeforeFailure = vi.mocked(URL.createObjectURL).mock.calls.length;
+
+  await userEvent.click(generate);
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("无法生成临时预览");
+  expect(screen.getByRole("img", { name: "事件瀑布图" })).toHaveAttribute(
+    "src",
+    existingUrl,
+  );
+  const partialUrl = vi.mocked(URL.createObjectURL).mock.results[callsBeforeFailure].value;
+  expect(URL.revokeObjectURL).toHaveBeenCalledWith(partialUrl);
+  expect(URL.revokeObjectURL).not.toHaveBeenCalledWith(existingUrl);
+});
+
+it("reclaims the first URL when the second createObjectURL call fails", async () => {
+  // Catches partial URL creation replacing or leaking over an existing preview.
+  server.use(
+    http.post("/api/v1/events/event-1/waterfall-preview", () =>
+      HttpResponse.json(PREVIEW),
+    ),
+  );
+  render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
+  await screen.findByText("可用 8–24 m");
+  const generate = screen.getByRole("button", { name: "生成临时预览" });
+  await userEvent.click(generate);
+  const existingUrl = await waitFor(() => {
+    const url = screen.getByRole("img", { name: "事件瀑布图" }).getAttribute("src");
+    expect(url).toMatch(/^blob:/);
+    return url!;
+  });
+  vi.mocked(URL.createObjectURL)
+    .mockImplementationOnce(() => "blob:partial-raw")
+    .mockImplementationOnce(() => {
+      throw new Error("URL allocation failed");
+    });
+
+  await userEvent.click(generate);
+
+  expect(await screen.findByRole("alert")).toHaveTextContent("无法生成临时预览");
+  expect(screen.getByRole("img", { name: "事件瀑布图" })).toHaveAttribute(
+    "src",
+    existingUrl,
+  );
+  expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:partial-raw");
+  expect(URL.revokeObjectURL).not.toHaveBeenCalledWith(existingUrl);
 });
 
 it("aborts superseded preview requests and ignores late results while revoking URLs on unmount", async () => {

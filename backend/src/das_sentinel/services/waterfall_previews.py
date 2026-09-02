@@ -10,9 +10,10 @@ from sqlalchemy.orm import Session
 
 from das_sentinel.artifacts import WaterfallPlotContext, render_waterfall_png
 from das_sentinel.config import ProcessingProfile
-from das_sentinel.domain import Candidate
+from das_sentinel.domain import Candidate, DasMetadata
 from das_sentinel.persistence.models import (
     Event,
+    ModelVersion,
     ProcessingRun,
     Site,
     SourceFile,
@@ -63,11 +64,13 @@ class WaterfallPreview:
 @dataclass(frozen=True)
 class _Binding:
     event: Event
+    candidates: tuple[Candidate, ...]
     source_path: Path
     source_fingerprint: str
     profile: ProcessingProfile
     profile_version: int
     pipeline_version: str
+    model_version: str
     site_timezone: str
     filter: WaterfallFilter
 
@@ -80,6 +83,8 @@ class WaterfallPreviewService:
     def options(self, session: Session, event_id: str) -> WaterfallOptions:
         binding = self._binding(session, event_id)
         metadata = self._metadata(binding)
+        sample_count = self._sample_count(binding)
+        self._validate_event_binding(binding, metadata, sample_count)
         self._verify_fingerprint(binding.source_path, binding.source_fingerprint)
         start_m, stop_m = self._automatic_range(binding, metadata.channel_distance_m)
         return WaterfallOptions(
@@ -99,30 +104,40 @@ class WaterfallPreviewService:
     ) -> WaterfallPreview:
         binding = self._binding(session, event_id)
         metadata = self._metadata(binding)
-        automatic_start, automatic_stop = self._automatic_range(
-            binding, metadata.channel_distance_m
-        )
-        self._validate_range(start_m, stop_m, automatic_start, automatic_stop)
+        sample_count = self._sample_count(binding)
+        self._validate_event_binding(binding, metadata, sample_count)
+        available_start = float(np.min(metadata.channel_distance_m))
+        available_stop = float(np.max(metadata.channel_distance_m))
+        self._validate_range(start_m, stop_m, available_start, available_stop)
         try:
             read_slice = channel_slice_for_distance(
                 metadata.channel_distance_m, start_m, stop_m
             )
-            self._validate_read_bounds(binding.event, read_slice)
+            sample_start, sample_stop = self._preview_window(
+                binding, metadata.sample_rate_hz, sample_count
+            )
+            self._validate_read_bounds(sample_start, sample_stop, read_slice)
         except ValueError as error:
             raise WaterfallPreviewRangeError("requested range is not previewable") from error
         try:
             block = self.reader.read_block(
                 binding.source_path,
-                binding.event.start_sample,
-                binding.event.end_sample,
+                sample_start,
+                sample_stop,
                 read_slice,
             )
+        except (OSError, ValueError) as error:
+            raise WaterfallPreviewConflict("waterfall preview source is unavailable") from error
+        try:
             filtered = preprocess_for_waterfall(
                 block,
                 binding.profile,
                 select_backend("cpu"),
                 binding.filter,
             )
+        except ValueError as error:
+            raise WaterfallPreviewConflict("event binding is inconsistent") from error
+        try:
             indices = usable_channel_indices(
                 block.metadata.channel_distance_m,
                 filtered.bad_channel_mask,
@@ -131,8 +146,6 @@ class WaterfallPreviewService:
             )
         except ValueError as error:
             raise WaterfallPreviewRangeError("requested range is not previewable") from error
-        except OSError as error:
-            raise WaterfallPreviewConflict("waterfall preview source is unavailable") from error
         dates = np.array(
             [
                 block.metadata.start_time_utc
@@ -145,11 +158,13 @@ class WaterfallPreviewService:
             site_timezone=binding.site_timezone,
             profile_version=str(binding.profile_version),
             pipeline_version=binding.pipeline_version,
-            model_version="rules-only",
+            model_version=binding.model_version,
             filter=binding.filter,
         )
         distances = block.metadata.channel_distance_m[indices]
-        note = f"Artificial Distance {start_m:g}–{stop_m:g} m"
+        actual_start_m = float(np.min(distances))
+        actual_stop_m = float(np.max(distances))
+        note = f"Artificial Distance {actual_start_m:g}–{actual_stop_m:g} m"
         try:
             raw_png = render_waterfall_png(
                 block.data[:, indices],
@@ -171,8 +186,8 @@ class WaterfallPreviewService:
             raise WaterfallPreviewConflict("waterfall preview source is unavailable") from error
         self._verify_fingerprint(binding.source_path, binding.source_fingerprint)
         return WaterfallPreview(
-            distance_start_m=float(start_m),
-            distance_stop_m=float(stop_m),
+            distance_start_m=actual_start_m,
+            distance_stop_m=actual_stop_m,
             channel_count=int(indices.size),
             filter=binding.filter,
             raw_png=raw_png,
@@ -189,43 +204,54 @@ class WaterfallPreviewService:
             None if run is None else session.get(ProfileRow, run.processing_profile_id)
         )
         if run is None or source is None or profile_row is None:
-            raise LookupError("event binding not found")
-        if profile_row.site_id != source.site_id:
+            raise WaterfallPreviewConflict("event binding is inconsistent")
+        site = session.get(Site, source.site_id)
+        model = (
+            None
+            if run.model_version_id is None
+            else session.get(ModelVersion, run.model_version_id)
+        )
+        if site is None or (run.model_version_id is not None and model is None):
+            raise WaterfallPreviewConflict("event binding is inconsistent")
+        if (
+            profile_row.site_id != source.site_id
+            or run.profile_version != profile_row.version
+            or (model is not None and model.site_id != source.site_id)
+        ):
             raise WaterfallPreviewConflict("event binding is inconsistent")
         try:
             profile = ProcessingProfile.model_validate(json.loads(profile_row.payload_json))
         except (TypeError, ValueError, json.JSONDecodeError) as error:
             raise WaterfallPreviewConflict("event profile is unavailable") from error
-        source_path = self._source_path(source)
+        source_path = self._source_path(source, site)
         if source.fingerprint != run.source_fingerprint:
             raise WaterfallPreviewConflict("event source changed")
         self._verify_fingerprint(source_path, source.fingerprint)
         try:
-            filter_context = resolve_waterfall_filter(self._candidates(event), profile)
+            candidates = self._candidates(event)
+            self._validate_fused_event(event, candidates)
+            filter_context = resolve_waterfall_filter(candidates, profile)
         except ValueError as error:
             raise WaterfallPreviewConflict("event evidence is unavailable") from error
         return _Binding(
             event=event,
+            candidates=candidates,
             source_path=source_path,
             source_fingerprint=source.fingerprint,
             profile=profile,
             profile_version=profile_row.version,
             pipeline_version=run.pipeline_version,
-            site_timezone=self._site_timezone(session, source.site_id),
+            model_version="rules-only" if model is None else model.version,
+            site_timezone=site.timezone,
             filter=filter_context,
         )
 
-    def _site_timezone(self, session: Session, site_id: str) -> str:
-        site = session.get(Site, site_id)
-        if site is None:
-            raise LookupError("event site not found")
-        return site.timezone
-
-    def _source_path(self, source: SourceFile) -> Path:
+    def _source_path(self, source: SourceFile, site: Site) -> Path:
         try:
             root = self.data_root.resolve(strict=True)
+            site_root = Path(site.data_path).resolve(strict=True)
             path = Path(source.path).resolve(strict=True)
-            if not path.is_relative_to(root):
+            if not site_root.is_relative_to(root) or not path.is_relative_to(site_root):
                 raise ValueError
             return path
         except (OSError, RuntimeError, ValueError) as error:
@@ -260,10 +286,18 @@ class WaterfallPreviewService:
         except (OSError, ValueError) as error:
             raise WaterfallPreviewConflict("waterfall preview source is unavailable") from error
 
+    def _sample_count(self, binding: _Binding) -> int:
+        try:
+            count = self.reader.sample_count(binding.source_path)
+        except (OSError, ValueError) as error:
+            raise WaterfallPreviewConflict("waterfall preview source is unavailable") from error
+        if count <= 0:
+            raise WaterfallPreviewConflict("waterfall preview source is unavailable")
+        return count
+
     def _automatic_range(self, binding: _Binding, distances: np.ndarray) -> tuple[float, float]:
-        candidates = self._candidates(binding.event)
-        start = min(candidate.channel_start for candidate in candidates)
-        stop = max(candidate.channel_stop for candidate in candidates)
+        start = binding.event.channel_start
+        stop = binding.event.channel_stop
         if start < 0 or stop <= start or stop > len(distances):
             raise WaterfallPreviewConflict("event channel bounds are unavailable")
         selected = np.asarray(distances[start:stop], dtype=float)
@@ -272,8 +306,10 @@ class WaterfallPreviewService:
         return float(np.min(selected)), float(np.max(selected))
 
     @staticmethod
-    def _validate_read_bounds(event: Event, channels: slice) -> None:
-        if event.end_sample - event.start_sample > _MAX_PREVIEW_SAMPLES:
+    def _validate_read_bounds(
+        sample_start: int, sample_stop: int, channels: slice
+    ) -> None:
+        if sample_stop - sample_start > _MAX_PREVIEW_SAMPLES:
             raise WaterfallPreviewRangeError("event window exceeds preview limit")
         if channels.stop - channels.start > _MAX_PREVIEW_CHANNELS:
             raise WaterfallPreviewRangeError("channel range exceeds preview limit")
@@ -290,7 +326,62 @@ class WaterfallPreviewService:
         if stop_m <= start_m:
             raise WaterfallPreviewRangeError("distance_stop_m must exceed distance_start_m")
         if start_m < automatic_start or stop_m > automatic_stop:
-            raise WaterfallPreviewRangeError("distance range must remain within the event")
+            raise WaterfallPreviewRangeError("distance range must remain within the source")
+
+    @staticmethod
+    def _preview_window(
+        binding: _Binding, sample_rate_hz: float, sample_count: int
+    ) -> tuple[int, int]:
+        padding = max(0, round(binding.profile.artifact_pad_seconds * sample_rate_hz))
+        start = max(0, binding.event.start_sample - padding)
+        stop = min(sample_count, binding.event.end_sample + padding)
+        if start >= stop:
+            raise ValueError("event window does not overlap source")
+        return start, stop
+
+    @staticmethod
+    def _validate_fused_event(
+        event: Event, candidates: tuple[Candidate, ...]
+    ) -> None:
+        if any(
+            candidate.start_sample < 0
+            or candidate.end_sample <= candidate.start_sample
+            or not candidate.start_sample <= candidate.peak_sample < candidate.end_sample
+            or candidate.channel_start < 0
+            or candidate.channel_stop <= candidate.channel_start
+            or not np.isfinite(candidate.score)
+            for candidate in candidates
+        ):
+            raise WaterfallPreviewConflict("event evidence is unavailable")
+        if (
+            event.start_sample != min(item.start_sample for item in candidates)
+            or event.end_sample != max(item.end_sample for item in candidates)
+            or event.channel_start != min(item.channel_start for item in candidates)
+            or event.channel_stop != max(item.channel_stop for item in candidates)
+        ):
+            raise WaterfallPreviewConflict("event binding is inconsistent")
+
+    @staticmethod
+    def _validate_event_binding(
+        binding: _Binding,
+        metadata: DasMetadata,
+        sample_count: int,
+    ) -> None:
+        distances = metadata.channel_distance_m
+        if not np.isfinite(metadata.sample_rate_hz) or metadata.sample_rate_hz <= 0:
+            raise WaterfallPreviewConflict("event binding is inconsistent")
+        expected_occurred_at = metadata.start_time_utc + timedelta(
+            seconds=binding.event.start_sample / metadata.sample_rate_hz
+        )
+        if (
+            distances.ndim != 1
+            or distances.size == 0
+            or not np.isfinite(distances).all()
+            or binding.event.channel_stop > distances.size
+            or binding.event.end_sample > sample_count
+            or binding.event.occurred_at != expected_occurred_at
+        ):
+            raise WaterfallPreviewConflict("event binding is inconsistent")
 
     @staticmethod
     def _verify_fingerprint(path: Path, expected: str) -> None:

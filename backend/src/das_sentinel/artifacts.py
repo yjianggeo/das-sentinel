@@ -372,7 +372,7 @@ def _png(figure: Any) -> bytes:
 def _frequency(value: float) -> str:
     if not np.isfinite(value):
         raise ValueError("waterfall frequencies must be finite")
-    return f"{value:g}"
+    return str(float(value)).removesuffix(".0")
 
 
 def filtered_waterfall_title(context: WaterfallPlotContext) -> str:
