@@ -42,7 +42,6 @@ from das_sentinel.signal.preprocess import (
     PreprocessedBlock,
     filter_prepared_signal,
     prepare_signal,
-    preprocess_block,
 )
 from das_sentinel.waterfalls import (
     WaterfallFilter,

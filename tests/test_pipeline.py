@@ -915,10 +915,10 @@ def test_pipeline_explicitly_transfers_event_window_before_cpu_features(
     source_path = tmp_path / "cuda.h5"
     _write_boundary_file(source_path)
     captured = []
-    original_preprocess = pipeline.preprocess_block
+    original_preprocess = pipeline.preprocess_for_waterfall
 
-    def device_preprocess(block, profile, backend):
-        prepared = original_preprocess(block, profile, backend)
+    def device_preprocess(block, profile, backend, filter_context):
+        prepared = original_preprocess(block, profile, backend, filter_context)
         return PreprocessedBlock(
             data=_NoImplicitNumpyConversion(prepared.data),
             bad_channel_mask=prepared.bad_channel_mask,
@@ -931,7 +931,7 @@ def test_pipeline_explicitly_transfers_event_window_before_cpu_features(
     monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
     monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
     monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "preprocess_block", device_preprocess)
+    monkeypatch.setattr(pipeline, "preprocess_for_waterfall", device_preprocess)
     def capture_device_artifacts(data, event, features, out_dir):
         captured.append(data)
         return _empty_artifact_manifest(data, event, features, out_dir)

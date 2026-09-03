@@ -1,6 +1,5 @@
-import pytest
 import numpy as np
-
+import pytest
 from das_sentinel.config import ProcessingProfile
 from das_sentinel.domain import Candidate
 from das_sentinel.waterfalls import (
