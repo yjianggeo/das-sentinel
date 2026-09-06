@@ -37,6 +37,10 @@
 
 验收标准是：测试套件在 GitHub Linux 运行器上能够完成收集；构建出的 wheel 继续包含 Alembic 环境与两个现有迁移版本；从已安装包调用 `das-sentinel admin init` 可以完成迁移并创建管理员。
 
+## CI 三轮复验后的批准补充
+
+三轮远程复验确认前端、CPU 容器与 GPU 镜像均已通过，Python 作业只剩一个跨平台测试假设错误。用户批准方案 A：`test_hardening_migration_round_trip_preserves_review_triggers` 不再断言实际驱动必须是标准库 `sqlite3`，而是通过 `_sqlite_driver()` 返回的实际驱动验证版本为 `3.53.3`，并使用该驱动执行真实内存数据库查询。生产驱动选择、版本门禁和迁移逻辑均不修改。
+
 ## 安全边界
 
 磁盘清理只写入 GitHub Actions 的一次性托管运行器，不在用户电脑、NAS、Z 盘或部署服务器上执行。清理命令使用明确的系统工具目录，不使用未解析变量或广泛根目录目标。原始 JJK/HDF5 数据、数据库和应用配置均不受影响。
@@ -51,6 +55,8 @@
 首轮远程复验新增两项 RED 证据：Ruff `DTZ007` 直接证明文件名时间仍为 naive；`tests/test_runtime.py` 新增入口契约测试，证明数据库默认值尚未在迁移前导出。修复后运行对应 JJK 时间测试、入口测试和 Ruff，再进入完整复验。
 
 二轮远程复验提供另外两项 RED 证据：Pytest 收集阶段以 `ModuleNotFoundError: No module named 'tests'` 退出；容器内管理员初始化以 `Path doesn't exist: /usr/local/lib/backend/src/das_sentinel/persistence/migrations` 退出。迁移修复需增加真实 wheel 内容测试和安装布局迁移测试，验证失败由迁移资源缺失或路径推断错误触发，而不是仅检查源文件文本。
+
+三轮远程复验提供测试修复的 RED 证据：CI 正确选择已安装的 `pysqlite3.dbapi2`，但测试以 `assert driver is sqlite3` 失败。修复后需运行该迁移往返测试、完整持久化测试、Ruff 与完整后端测试，并再次通过远程 Python 门禁。
 
 实现后依次验证：
 

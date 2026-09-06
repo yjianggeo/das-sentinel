@@ -300,6 +300,43 @@ git diff --cached --check
 git commit -m "fix: package tests and database migrations"
 ```
 
+- [ ] **Step 0G: 修复迁移往返测试的驱动身份假设**
+
+GitHub 三轮 CI 已提供 RED：项目正确安装并选择 `pysqlite3.dbapi2` 后，`tests/test_persistence.py::test_hardening_migration_round_trip_preserves_review_triggers` 在 `assert driver is sqlite3` 失败；前端、CPU 容器和 GPU 镜像门禁均已通过。
+
+在该测试中删除标准库模块身份断言与直接 `sqlite3.connect()` 查询，改为验证实际选择的驱动：
+
+```python
+driver = persistence_db._sqlite_driver()
+assert driver.sqlite_version == "3.53.3"
+connection = driver.connect(":memory:")
+try:
+    assert connection.execute("SELECT sqlite_version()").fetchone() == ("3.53.3",)
+finally:
+    connection.close()
+assert validate_selected_sqlite_runtime() == (3, 53, 3)
+```
+
+删除因此不再使用的 `import sqlite3`。不得修改 `_sqlite_driver()`、CI 依赖安装、版本门禁或迁移生产代码。
+
+Run:
+
+```powershell
+& 'D:\das-sentinel-runtime\.venv\Scripts\python.exe' -m pytest tests/test_persistence.py::test_hardening_migration_round_trip_preserves_review_triggers -q
+& 'D:\das-sentinel-runtime\.venv\Scripts\python.exe' -m pytest tests/test_persistence.py -q
+& 'D:\das-sentinel-runtime\.venv\Scripts\python.exe' -m ruff check .
+```
+
+Expected GREEN: 聚焦测试与持久化测试通过，Ruff 退出码 0。远程 Python 作业是 `pysqlite3` 分支的最终复验。
+
+- [ ] **Step 0H: 提交三轮 CI 暴露的测试修复**
+
+```powershell
+git add -- tests/test_persistence.py
+git diff --cached --check
+git commit -m "test: validate the selected SQLite driver"
+```
+
 - [ ] **Step 1: 运行完整本地检查**
 
 ```powershell
