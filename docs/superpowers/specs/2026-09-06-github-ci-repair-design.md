@@ -32,10 +32,10 @@
 二轮远程复验确认前端与 GPU 镜像构建已通过，同时暴露两个只在 Linux/已安装包环境出现的既有问题。用户批准继续采用方案 A，以最小范围修复：
 
 1. 将 `tests` 声明为普通 Python 包，使 Linux/Pytest 9 能稳定解析现有的 `tests.fixtures` 与 `tests.synthetic` 导入；不修改测试内容或生产代码导入路径。
-2. 将 Alembic 的 `migrations` 与 `versions` 目录声明为随 `das_sentinel` 安装的 Python 包，并让 `upgrade_database()` 直接定位 `db.py` 同目录下的迁移资源，不再通过固定父目录层级推断仓库根目录。
+2. wheel 内容测试已证明 Alembic 的 `migrations` 与 `versions` 文件原本就随 `das_sentinel` 安装；因此不增加多余包标记，只让 `upgrade_database()` 直接定位 `db.py` 同目录下的迁移资源，不再通过固定父目录层级推断仓库根目录。
 3. `upgrade_database()` 使用完全由代码设置的 Alembic `Config`；数据库 URL、迁移版本和 SQLite 安全检查保持不变。容器入口的 `alembic upgrade head` 流程不改。
 
-验收标准是：测试套件在 GitHub Linux 运行器上能够完成收集；构建出的 wheel 包含 Alembic 环境与两个现有迁移版本；从已安装包调用 `das-sentinel admin init` 可以完成迁移并创建管理员。
+验收标准是：测试套件在 GitHub Linux 运行器上能够完成收集；构建出的 wheel 继续包含 Alembic 环境与两个现有迁移版本；从已安装包调用 `das-sentinel admin init` 可以完成迁移并创建管理员。
 
 ## 安全边界
 

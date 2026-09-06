@@ -4,7 +4,7 @@
 
 **Goal:** 修复 PR #1 已确认的 Python、SQLite wheel、CPU 容器与 GPU 镜像 CI 失败，在全部发布门禁通过后把最新版本合并到 GitHub `main`。
 
-**Architecture:** 保留现有 SQLite 3.53.3、pysqlite3 0.5.4、CUDA 12.8.1 `devel` 镜像和四项发布门禁。补齐传统 wheel 构建依赖、释放一次性 GPU 构建空间，并把测试辅助模块和 Alembic 迁移资源明确打包；每个生产代码修复先由真实行为测试失败证明，再做最小实现。
+**Architecture:** 保留现有 SQLite 3.53.3、pysqlite3 0.5.4、CUDA 12.8.1 `devel` 镜像和四项发布门禁。补齐传统 wheel 构建依赖、释放一次性 GPU 构建空间、明确测试辅助模块，并让已安装程序使用 wheel 中已有的 Alembic 迁移资源；每个生产代码修复先由真实行为测试失败证明，再做最小实现。
 
 **Tech Stack:** Python 3.12、pytest、POSIX shell、Docker、GitHub Actions、GitHub CLI。
 
@@ -165,8 +165,6 @@ git commit -m "ci: free disk space before CUDA image build"
 - Verify: `.github/workflows/ci.yml`
 - Verify: `tests/test_compose.py`
 - Create: `tests/__init__.py`
-- Create: `backend/src/das_sentinel/persistence/migrations/__init__.py`
-- Create: `backend/src/das_sentinel/persistence/migrations/versions/__init__.py`
 - Create: `tests/test_packaging.py`
 - Modify: `backend/src/das_sentinel/persistence/db.py`
 - Modify: `tests/test_persistence.py`
@@ -277,9 +275,9 @@ Run:
 & 'D:\das-sentinel-runtime\.venv\Scripts\python.exe' -m pytest tests/test_packaging.py::test_wheel_contains_database_migrations tests/test_persistence.py::test_upgrade_database_uses_installed_package_migrations -q
 ```
 
-Expected RED: wheel 缺少迁移脚本，且安装式布局被错误解析到临时目录的固定父级路径。
+Expected RED: wheel 内容测试作为既有打包行为的特征测试通过；安装式布局测试因被错误解析到临时目录的固定父级路径而失败，从而提供生产修复的 RED。
 
-创建空文件 `backend/src/das_sentinel/persistence/migrations/__init__.py` 与 `backend/src/das_sentinel/persistence/migrations/versions/__init__.py`，确保 setuptools 将迁移 Python 文件写入 wheel。将 `upgrade_database()` 的配置改为：
+wheel 内容测试已经证明 setuptools 会将现有迁移 Python 文件写入 wheel，不得为此新增包标记或修改 `migrations/env.py`。只将 `upgrade_database()` 的配置改为：
 
 ```python
 configuration = Config()
@@ -297,7 +295,7 @@ configuration.set_main_option("sqlalchemy.url", database_url)
 - [ ] **Step 0F: 提交二轮 CI 暴露的两项根因修复**
 
 ```powershell
-git add -- tests/__init__.py tests/test_packaging.py tests/test_persistence.py backend/src/das_sentinel/persistence/db.py backend/src/das_sentinel/persistence/migrations/__init__.py backend/src/das_sentinel/persistence/migrations/versions/__init__.py
+git add -- tests/__init__.py tests/test_packaging.py tests/test_persistence.py backend/src/das_sentinel/persistence/db.py
 git diff --cached --check
 git commit -m "fix: package tests and database migrations"
 ```
