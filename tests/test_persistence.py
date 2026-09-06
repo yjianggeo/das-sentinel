@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import shutil
 import sqlite3
 import warnings
 from datetime import UTC, datetime, timedelta, timezone
@@ -137,6 +138,27 @@ def test_initial_migration_creates_all_tables_and_is_idempotent(tmp_path):
             "reviews_append_only_delete",
             "processing_profiles_immutable",
         }
+    finally:
+        engine.dispose()
+
+
+def test_upgrade_database_uses_installed_package_migrations(tmp_path, monkeypatch):
+    source_migrations = Path(persistence_db.__file__).resolve().parent / "migrations"
+    installed_persistence = tmp_path / "site-packages" / "das_sentinel" / "persistence"
+    shutil.copytree(source_migrations, installed_persistence / "migrations")
+    installed_db = installed_persistence / "db.py"
+    installed_db.touch()
+    monkeypatch.setattr(persistence_db, "__file__", str(installed_db))
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'installed.sqlite3'}"
+
+    upgrade_database(database_url)
+
+    engine = create_local_engine(database_url)
+    try:
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
+                "0002_job_model_and_review_request"
+            )
     finally:
         engine.dispose()
 
