@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import shutil
-import sqlite3
 import warnings
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -204,11 +203,12 @@ def test_hardening_migration_adds_model_binding_and_review_idempotency(
 
 def test_hardening_migration_round_trip_preserves_review_triggers(database_url):
     driver = persistence_db._sqlite_driver()
-    assert driver is sqlite3
     assert driver.sqlite_version == "3.53.3"
-    assert sqlite3.connect(":memory:").execute(
-        "SELECT sqlite_version()"
-    ).fetchone() == ("3.53.3",)
+    connection = driver.connect(":memory:")
+    try:
+        assert connection.execute("SELECT sqlite_version()").fetchone() == ("3.53.3",)
+    finally:
+        connection.close()
     assert validate_selected_sqlite_runtime() == (3, 53, 3)
 
     repository_root = Path(__file__).resolve().parents[1]
