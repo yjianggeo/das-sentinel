@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 from pathlib import Path
 
@@ -148,6 +149,27 @@ def test_scan_rejects_unsafe_or_invalid_directory(scan_api, path):
     response = client.post(
         f"/api/v1/sites/{ids['site']}/scan",
         json={"path": path},
+        headers={"X-CSRF-Token": token},
+    )
+    assert response.status_code == 422
+    assert str(settings.data_root) not in response.text
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows drive semantics")
+@pytest.mark.parametrize(
+    "path_template",
+    ["{drive}", "{drive}/jjk/day", "//server/share"],
+    ids=["drive-only", "drive-absolute", "unc"],
+)
+def test_scan_rejects_windows_anchored_directory(
+    scan_api,
+    path_template,
+):
+    client, token, ids, settings = scan_api
+    submitted = path_template.format(drive=settings.data_root.drive)
+    response = client.post(
+        f"/api/v1/sites/{ids['site']}/scan",
+        json={"path": submitted},
         headers={"X-CSRF-Token": token},
     )
     assert response.status_code == 422

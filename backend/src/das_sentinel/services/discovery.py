@@ -10,7 +10,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from pathlib import Path, PurePath, PurePosixPath
+from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import BinaryIO, Protocol
 
 from pydantic import ValidationError
@@ -300,7 +300,8 @@ def resolve_scan_directory(
     if "\\" in relative_path:
         raise DiscoveryPathError("scan directory must use POSIX separators")
     wire_path = PurePosixPath(relative_path)
-    if wire_path.is_absolute() or ".." in wire_path.parts:
+    windows_path = PureWindowsPath(relative_path)
+    if wire_path.is_absolute() or windows_path.anchor or ".." in wire_path.parts:
         raise DiscoveryPathError("scan directory must remain under the site root")
     parts = tuple(part for part in wire_path.parts if part not in ("", "."))
     if not parts and not allow_root:

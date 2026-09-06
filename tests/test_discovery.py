@@ -167,6 +167,24 @@ def test_scan_directory_rejects_unsafe_or_invalid_paths(
     assert str(outside) not in str(error.value)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows drive semantics")
+@pytest.mark.parametrize(
+    "path_template",
+    ["{drive}", "{drive}/jjk甲/day", "//server/share"],
+    ids=["drive-only", "drive-absolute", "unc"],
+)
+def test_scan_directory_rejects_windows_anchored_paths(
+    tmp_path: Path,
+    path_template: str,
+):
+    root = tmp_path / "root"
+    (root / "jjk甲" / "day").mkdir(parents=True)
+    submitted = path_template.format(drive=root.drive)
+
+    with pytest.raises(DiscoveryPathError):
+        resolve_scan_directory(_site(root), submitted, allow_root=False)
+
+
 def test_discovery_reports_checked_and_h5_counts_with_recursive_override(tmp_path: Path):
     root = tmp_path / "root"
     selected = root / "selected"
