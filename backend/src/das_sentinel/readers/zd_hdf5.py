@@ -157,8 +157,8 @@ class ZdHdf5Reader:
             return None
         stamp = match.group("stamp")
         format_string = "%Y%m%d%H%M%S" if len(stamp) == 14 else "%Y%m%d%H%M"
-        filename_clock = datetime.strptime(stamp, format_string)
-        raw_clock = raw_start.replace(tzinfo=None, microsecond=0)
+        filename_clock = datetime.strptime(stamp, format_string).replace(tzinfo=UTC)
+        raw_clock = raw_start.replace(microsecond=0)
         if len(stamp) == 12:
             raw_clock = raw_clock.replace(second=0)
         if filename_clock != raw_clock:
