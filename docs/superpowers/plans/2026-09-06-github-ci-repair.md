@@ -2,15 +2,17 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** 修复 PR #1 的 SQLite wheel 与 GPU 镜像 CI 失败，在全部发布门禁通过后把最新版本合并到 GitHub `main`。
+**Goal:** 修复 PR #1 已确认的 Python、SQLite wheel、CPU 容器与 GPU 镜像 CI 失败，在全部发布门禁通过后把最新版本合并到 GitHub `main`。
 
-**Architecture:** 保留现有 SQLite 3.53.3、pysqlite3 0.5.4、CUDA 12.8.1 `devel` 镜像和四项发布门禁。只补齐传统 wheel 构建依赖，并在一次性 GitHub GPU 构建运行器上清理无关的预装工具空间；每个修复先由静态 CI 契约测试失败证明，再做最小实现。
+**Architecture:** 保留现有 SQLite 3.53.3、pysqlite3 0.5.4、CUDA 12.8.1 `devel` 镜像和四项发布门禁。补齐传统 wheel 构建依赖、释放一次性 GPU 构建空间，并把测试辅助模块和 Alembic 迁移资源明确打包；每个生产代码修复先由真实行为测试失败证明，再做最小实现。
 
 **Tech Stack:** Python 3.12、pytest、POSIX shell、Docker、GitHub Actions、GitHub CLI。
 
 ## Global Constraints
 
 - 不修改 DAS 事件检测/分类逻辑、GPU 运行时契约、NAS/Z 盘数据或部署配置；唯一允许的入口变更是为 Alembic 导出与 `Settings.database_url` 一致且可被显式配置覆盖的默认数据库地址。
+- `upgrade_database()` 必须从已安装的 `das_sentinel` 包定位现有迁移资源，不依赖仓库根目录或调用者当前工作目录；数据库 URL、迁移版本和 SQLite 安全检查保持不变。
+- 现有 `tests.fixtures` 与 `tests.synthetic` 导入保持不变；仅把 `tests` 声明为普通 Python 包以兼容 Linux/Pytest 9。
 - SQLite 继续固定为 `sqlite-amalgamation-3530300.zip`，pysqlite3 继续固定为 `0.5.4`，并保留现有 SHA-256 校验。
 - GPU 镜像继续使用 `nvidia/cuda:12.8.1-devel-ubuntu24.04`，不得跳过 `gpu-image-build`。
 - 磁盘清理只在 GitHub Actions 一次性托管运行器执行，目标必须是明确的无关预装工具目录和 Docker 构建缓存。
@@ -162,6 +164,12 @@ git commit -m "ci: free disk space before CUDA image build"
 - Verify: `docker/build-pysqlite3-wheel.sh`
 - Verify: `.github/workflows/ci.yml`
 - Verify: `tests/test_compose.py`
+- Create: `tests/__init__.py`
+- Create: `backend/src/das_sentinel/persistence/migrations/__init__.py`
+- Create: `backend/src/das_sentinel/persistence/migrations/versions/__init__.py`
+- Create: `tests/test_packaging.py`
+- Modify: `backend/src/das_sentinel/persistence/db.py`
+- Modify: `tests/test_persistence.py`
 
 **Interfaces:**
 - Consumes: Task 1 与 Task 2 的两个修复提交、PR #1。
@@ -237,6 +245,61 @@ Expected GREEN: `tests/test_runtime.py` 全部通过。
 git add -- backend/src/das_sentinel/readers/zd_hdf5.py docker/entrypoint-api.sh tests/test_runtime.py
 git diff --cached --check
 git commit -m "fix: make CI runtime defaults explicit"
+```
+
+- [ ] **Step 0D: 修复 Linux 测试辅助模块导入**
+
+GitHub 二轮 CI 已提供 RED：Pytest 9 在 Linux 收集多个测试文件时，对 `from tests.fixtures ...` 与 `from tests.synthetic ...` 报 `ModuleNotFoundError: No module named 'tests'`。
+
+创建空文件 `tests/__init__.py`，把现有测试目录声明为普通 Python 包。不得改写现有测试的导入语句。
+
+Run:
+
+```powershell
+& 'D:\das-sentinel-runtime\.venv\Scripts\python.exe' -m pytest --collect-only -q
+```
+
+Expected GREEN: 测试收集成功，不再出现 `No module named 'tests'`。
+
+- [ ] **Step 0E: 以 TDD 修复已安装包的 Alembic 迁移定位**
+
+先新增两个真实行为测试：
+
+1. `tests/test_packaging.py::test_wheel_contains_database_migrations` 使用 `python -m pip wheel . --no-deps --no-build-isolation` 构建项目 wheel，并用 `zipfile.ZipFile` 验证 wheel 内存在：
+   - `das_sentinel/persistence/migrations/env.py`
+   - `das_sentinel/persistence/migrations/versions/0001_initial.py`
+   - `das_sentinel/persistence/migrations/versions/0002_job_model_and_review_request.py`
+2. `tests/test_persistence.py::test_upgrade_database_uses_installed_package_migrations` 将迁移目录复制到临时的已安装包式布局，临时把 `das_sentinel.persistence.db.__file__` 指向该布局中的 `db.py`，然后调用真实 `upgrade_database()`；断言临时 SQLite 数据库的 Alembic 版本为 `0002_job_model_and_review_request`。
+
+Run:
+
+```powershell
+& 'D:\das-sentinel-runtime\.venv\Scripts\python.exe' -m pytest tests/test_packaging.py::test_wheel_contains_database_migrations tests/test_persistence.py::test_upgrade_database_uses_installed_package_migrations -q
+```
+
+Expected RED: wheel 缺少迁移脚本，且安装式布局被错误解析到临时目录的固定父级路径。
+
+创建空文件 `backend/src/das_sentinel/persistence/migrations/__init__.py` 与 `backend/src/das_sentinel/persistence/migrations/versions/__init__.py`，确保 setuptools 将迁移 Python 文件写入 wheel。将 `upgrade_database()` 的配置改为：
+
+```python
+configuration = Config()
+configuration.set_main_option(
+    "script_location",
+    str(Path(__file__).resolve().parent / "migrations"),
+)
+configuration.set_main_option("sqlalchemy.url", database_url)
+```
+
+不得改变 `validate_selected_sqlite_runtime()`、`validate_local_sqlite_url()`、`command.upgrade(..., "head")` 或升级后的连接检查。
+
+再次运行上述两个聚焦测试，Expected GREEN: 2 passed。随后运行 `tests/test_persistence.py` 全文件与 Ruff。
+
+- [ ] **Step 0F: 提交二轮 CI 暴露的两项根因修复**
+
+```powershell
+git add -- tests/__init__.py tests/test_packaging.py tests/test_persistence.py backend/src/das_sentinel/persistence/db.py backend/src/das_sentinel/persistence/migrations/__init__.py backend/src/das_sentinel/persistence/migrations/versions/__init__.py
+git diff --cached --check
+git commit -m "fix: package tests and database migrations"
 ```
 
 - [ ] **Step 1: 运行完整本地检查**

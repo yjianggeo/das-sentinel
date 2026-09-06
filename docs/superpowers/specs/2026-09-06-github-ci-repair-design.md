@@ -27,6 +27,16 @@
 
 该补充允许修改上述读取器时间表示和容器入口默认值；不授权其他业务逻辑、入口流程或部署配置变更。
 
+## CI 二轮复验后的批准补充
+
+二轮远程复验确认前端与 GPU 镜像构建已通过，同时暴露两个只在 Linux/已安装包环境出现的既有问题。用户批准继续采用方案 A，以最小范围修复：
+
+1. 将 `tests` 声明为普通 Python 包，使 Linux/Pytest 9 能稳定解析现有的 `tests.fixtures` 与 `tests.synthetic` 导入；不修改测试内容或生产代码导入路径。
+2. 将 Alembic 的 `migrations` 与 `versions` 目录声明为随 `das_sentinel` 安装的 Python 包，并让 `upgrade_database()` 直接定位 `db.py` 同目录下的迁移资源，不再通过固定父目录层级推断仓库根目录。
+3. `upgrade_database()` 使用完全由代码设置的 Alembic `Config`；数据库 URL、迁移版本和 SQLite 安全检查保持不变。容器入口的 `alembic upgrade head` 流程不改。
+
+验收标准是：测试套件在 GitHub Linux 运行器上能够完成收集；构建出的 wheel 包含 Alembic 环境与两个现有迁移版本；从已安装包调用 `das-sentinel admin init` 可以完成迁移并创建管理员。
+
 ## 安全边界
 
 磁盘清理只写入 GitHub Actions 的一次性托管运行器，不在用户电脑、NAS、Z 盘或部署服务器上执行。清理命令使用明确的系统工具目录，不使用未解析变量或广泛根目录目标。原始 JJK/HDF5 数据、数据库和应用配置均不受影响。
@@ -40,9 +50,11 @@
 
 首轮远程复验新增两项 RED 证据：Ruff `DTZ007` 直接证明文件名时间仍为 naive；`tests/test_runtime.py` 新增入口契约测试，证明数据库默认值尚未在迁移前导出。修复后运行对应 JJK 时间测试、入口测试和 Ruff，再进入完整复验。
 
+二轮远程复验提供另外两项 RED 证据：Pytest 收集阶段以 `ModuleNotFoundError: No module named 'tests'` 退出；容器内管理员初始化以 `Path doesn't exist: /usr/local/lib/backend/src/das_sentinel/persistence/migrations` 退出。迁移修复需增加真实 wheel 内容测试和安装布局迁移测试，验证失败由迁移资源缺失或路径推断错误触发，而不是仅检查源文件文本。
+
 实现后依次验证：
 
-- 新增的两个聚焦测试；
+- 新增的聚焦测试；
 - `tests/test_compose.py`；
 - 后端完整 pytest；
 - 前端完整测试与生产构建；
