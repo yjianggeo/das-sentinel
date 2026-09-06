@@ -297,6 +297,8 @@ def resolve_scan_directory(
     *,
     allow_root: bool = False,
 ) -> Path:
+    if "\\" in relative_path:
+        raise DiscoveryPathError("scan directory must use POSIX separators")
     wire_path = PurePosixPath(relative_path)
     if wire_path.is_absolute() or ".." in wire_path.parts:
         raise DiscoveryPathError("scan directory must remain under the site root")

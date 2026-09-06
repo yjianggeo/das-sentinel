@@ -130,6 +130,8 @@ def test_scan_directory_listing_is_shallow_sorted_and_root_relative(tmp_path: Pa
 @pytest.mark.parametrize("relative_path", [
     "../outside",
     "/absolute",
+    ".\\",
+    r"folder\child",
     "",
     "missing",
     "regular.txt",
@@ -157,6 +159,7 @@ def test_scan_directory_rejects_unsafe_or_invalid_paths(
         )
     assert str(error.value) in {
         "scan directory must remain under the site root",
+        "scan directory must use POSIX separators",
         "select a directory below the site root",
         "scan path must exist",
         "discovery path component must be a directory",
