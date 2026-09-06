@@ -138,6 +138,13 @@ def test_cpu_image_pins_verified_static_sqlite() -> None:
     assert "SELECT sqlite_version()" in dockerfile
 
 
+def test_static_sqlite_builder_installs_legacy_build_dependencies() -> None:
+    builder = (ROOT / "docker" / "build-pysqlite3-wheel.sh").read_text("utf-8")
+    install = "python -m pip install setuptools wheel"
+    assert install in builder
+    assert builder.index(install) < builder.index("python setup.py build_static bdist_wheel")
+
+
 def test_ci_declares_required_release_jobs() -> None:
     workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text("utf-8"))
     assert set(workflow["jobs"]) >= {

@@ -15,7 +15,7 @@ echo "$pysqlite_sha256  pysqlite3-0.5.4.tar.gz" | sha256sum --check --strict
 unzip -q "$sqlite_archive"
 tar -xzf pysqlite3-0.5.4.tar.gz
 cp sqlite-amalgamation-3530300/sqlite3.c sqlite-amalgamation-3530300/sqlite3.h pysqlite3-0.5.4/
-python -m pip install wheel
+python -m pip install setuptools wheel
 cd pysqlite3-0.5.4
 python setup.py build_static bdist_wheel
 mkdir -p "$output_dir"
