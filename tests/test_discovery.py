@@ -23,12 +23,16 @@ from das_sentinel.services.discovery import (
     DiscoveredFile,
     DiscoveryConfigurationError,
     DiscoveryPathError,
+    DiscoveryProgress,
     DiscoverySite,
+    ScanDirectoryEntry,
     StableFileTracker,
     discover_batch,
     enqueue_discovered,
     fingerprint,
+    list_scan_directories,
     load_discovery_site,
+    resolve_scan_directory,
     watch_site,
 )
 from sqlalchemy import func, select
@@ -96,6 +100,91 @@ def _stabilize(
 ) -> tuple[DiscoveredFile, ...]:
     assert discover_batch(site, path, tracker=tracker, now=0) == ()
     return discover_batch(site, path, tracker=tracker, now=10)
+
+
+def test_scan_directory_listing_is_shallow_sorted_and_root_relative(tmp_path: Path):
+    root = tmp_path / "root"
+    (root / "jjk甲" / "day-01").mkdir(parents=True)
+    (root / "ordinary").mkdir()
+    (root / "ignore.txt").write_text("not a directory", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        (root / "link").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        pass
+
+    listing = list_scan_directories(_site(root))
+
+    assert listing.path == ""
+    assert listing.parent_path is None
+    assert [(item.name, item.path) for item in listing.directories] == [
+        ("jjk甲", "jjk甲"),
+        ("ordinary", "ordinary"),
+    ]
+    nested = list_scan_directories(_site(root), "jjk甲")
+    assert nested.parent_path == ""
+    assert nested.directories == (ScanDirectoryEntry("day-01", "jjk甲/day-01"),)
+
+
+@pytest.mark.parametrize("relative_path", [
+    "../outside",
+    "/absolute",
+    "",
+    "missing",
+    "regular.txt",
+    "link",
+])
+def test_scan_directory_rejects_unsafe_or_invalid_paths(
+    tmp_path: Path, relative_path: str
+):
+    root = tmp_path / "root"
+    root.mkdir()
+    (root / "regular.txt").write_text("x", encoding="utf-8")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    try:
+        (root / "link").symlink_to(outside, target_is_directory=True)
+    except OSError:
+        if relative_path == "link":
+            pytest.skip("directory symlink unavailable")
+
+    with pytest.raises(DiscoveryPathError) as error:
+        resolve_scan_directory(
+            _site(root),
+            relative_path,
+            allow_root=False,
+        )
+    assert str(error.value) in {
+        "scan directory must remain under the site root",
+        "select a directory below the site root",
+        "scan path must exist",
+        "discovery path component must be a directory",
+    } or "symlink or reparse point" in str(error.value)
+    assert str(outside) not in str(error.value)
+
+
+def test_discovery_reports_checked_and_h5_counts_with_recursive_override(tmp_path: Path):
+    root = tmp_path / "root"
+    selected = root / "selected"
+    nested = selected / "nested"
+    nested.mkdir(parents=True)
+    write_zd_h5(selected / "a.h5")
+    write_zd_h5(nested / "b.H5")
+    (nested / "note.txt").write_text("x", encoding="utf-8")
+    progress: list[DiscoveryProgress] = []
+
+    discover_batch(
+        _site(root, recursive=False),
+        selected,
+        tracker=StableFileTracker(),
+        now=0,
+        recursive=True,
+        on_progress=progress.append,
+    )
+
+    assert progress[-1] == DiscoveryProgress(checked_files=3, found_files=2)
+    assert progress == sorted(progress, key=lambda item: item.checked_files)
 
 
 def test_fingerprint_matches_pipeline_canonical_algorithm_and_value_is_frozen(

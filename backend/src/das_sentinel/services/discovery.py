@@ -10,7 +10,7 @@ import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from pathlib import Path, PurePath
+from pathlib import Path, PurePath, PurePosixPath
 from typing import BinaryIO, Protocol
 
 from pydantic import ValidationError
@@ -42,6 +42,25 @@ class DiscoverySite:
     profile_id: str
     profile_version: int
     recursive_discovery: bool
+
+
+@dataclass(frozen=True)
+class DiscoveryProgress:
+    checked_files: int = 0
+    found_files: int = 0
+
+
+@dataclass(frozen=True)
+class ScanDirectoryEntry:
+    name: str
+    path: str
+
+
+@dataclass(frozen=True)
+class ScanDirectoryListing:
+    path: str
+    parent_path: str | None
+    directories: tuple[ScanDirectoryEntry, ...]
 
 
 @dataclass(frozen=True)
@@ -249,6 +268,8 @@ def discover_batch(
     *,
     tracker: StableFileTracker,
     now: float,
+    recursive: bool | None = None,
+    on_progress: Callable[[DiscoveryProgress], None] | None = None,
 ) -> tuple[DiscoveredFile, ...]:
     """Poll one file or directory without opening a database transaction."""
 
@@ -257,7 +278,8 @@ def discover_batch(
     candidates = _candidate_files(
         root,
         scan_path,
-        recursive=site.recursive_discovery,
+        recursive=site.recursive_discovery if recursive is None else recursive,
+        on_progress=on_progress,
     )
     tracker.retain(candidates)
     stable: list[DiscoveredFile] = []
@@ -267,6 +289,71 @@ def discover_batch(
             _validate_discovered(root, discovered)
             stable.append(discovered)
     return tuple(stable)
+
+
+def resolve_scan_directory(
+    site: DiscoverySite,
+    relative_path: str,
+    *,
+    allow_root: bool = False,
+) -> Path:
+    wire_path = PurePosixPath(relative_path)
+    if wire_path.is_absolute() or ".." in wire_path.parts:
+        raise DiscoveryPathError("scan directory must remain under the site root")
+    parts = tuple(part for part in wire_path.parts if part not in ("", "."))
+    if not parts and not allow_root:
+        raise DiscoveryPathError("select a directory below the site root")
+    root = _validated_root(site.data_root)
+    return _validate_under_root(root, root.joinpath(*parts), directory=True)
+
+
+def list_scan_directories(
+    site: DiscoverySite,
+    relative_path: str | None = None,
+) -> ScanDirectoryListing:
+    requested_path = "" if relative_path is None else relative_path
+    directory = resolve_scan_directory(site, requested_path, allow_root=True)
+    root = _validated_root(site.data_root)
+    relative = directory.relative_to(root)
+    wire_path = PurePosixPath(*relative.parts) if relative.parts else PurePosixPath()
+    parent = wire_path.parent
+    path_value = "" if not relative.parts else str(wire_path)
+    parent_path = (
+        None
+        if not relative.parts
+        else ("" if len(relative.parts) == 1 else str(parent))
+    )
+    directories: list[ScanDirectoryEntry] = []
+    try:
+        with os.scandir(directory) as iterator:
+            entries = sorted(
+                iterator,
+                key=lambda entry: (entry.name.casefold(), entry.name),
+            )
+            for entry in entries:
+                entry_path = Path(entry.path)
+                try:
+                    if _is_reparse(entry_path):
+                        continue
+                    if not entry.is_dir(follow_symlinks=False):
+                        continue
+                    entry_relative = entry_path.relative_to(root)
+                    entry_wire_path = PurePosixPath(*entry_relative.parts)
+                    directories.append(
+                        ScanDirectoryEntry(
+                            name=entry.name,
+                            path=str(entry_wire_path),
+                        )
+                    )
+                except (OSError, DiscoveryPathError) as error:
+                    raise DiscoveryPathError("cannot enumerate scan directory") from error
+    except OSError as error:
+        raise DiscoveryPathError("cannot enumerate scan directory") from error
+    return ScanDirectoryListing(
+        path=path_value,
+        parent_path=parent_path,
+        directories=tuple(directories),
+    )
 
 
 def enqueue_discovered(
@@ -665,9 +752,23 @@ def _candidate_files(
     scan_path: Path,
     *,
     recursive: bool,
+    on_progress: Callable[[DiscoveryProgress], None] | None = None,
 ) -> tuple[Path, ...]:
+    progress = DiscoveryProgress()
+
+    def inspect_file(path: Path) -> bool:
+        nonlocal progress
+        found = path.suffix.lower() == ".h5"
+        progress = DiscoveryProgress(
+            checked_files=progress.checked_files + 1,
+            found_files=progress.found_files + int(found),
+        )
+        if on_progress is not None:
+            on_progress(progress)
+        return found
+
     if scan_path.is_file():
-        return (scan_path,) if scan_path.suffix.lower() == ".h5" else ()
+        return (scan_path,) if inspect_file(scan_path) else ()
     if not scan_path.is_dir():
         raise DiscoveryPathError("scan path must be a regular file or directory")
 
@@ -693,7 +794,7 @@ def _candidate_files(
                 )
             try:
                 if entry.is_file(follow_symlinks=False):
-                    if entry_path.suffix.lower() == ".h5":
+                    if inspect_file(entry_path):
                         candidates.append(
                             _validate_under_root(
                                 root,
