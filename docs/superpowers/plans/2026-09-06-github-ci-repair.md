@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- 不修改 DAS 业务逻辑、容器入口、GPU 运行时契约、NAS/Z 盘数据或部署配置。
+- 不修改 DAS 事件检测/分类逻辑、GPU 运行时契约、NAS/Z 盘数据或部署配置；唯一允许的入口变更是为 Alembic 导出与 `Settings.database_url` 一致且可被显式配置覆盖的默认数据库地址。
 - SQLite 继续固定为 `sqlite-amalgamation-3530300.zip`，pysqlite3 继续固定为 `0.5.4`，并保留现有 SHA-256 校验。
 - GPU 镜像继续使用 `nvidia/cuda:12.8.1-devel-ubuntu24.04`，不得跳过 `gpu-image-build`。
 - 磁盘清理只在 GitHub Actions 一次性托管运行器执行，目标必须是明确的无关预装工具目录和 Docker 构建缓存。
@@ -167,6 +167,78 @@ git commit -m "ci: free disk space before CUDA image build"
 - Consumes: Task 1 与 Task 2 的两个修复提交、PR #1。
 - Produces: 全绿的 PR #1，以及包含最新版本的 GitHub `main`。
 
+- [ ] **Step 0A: 复现并修复 JJK 文件名时钟的 Ruff 失败**
+
+先运行：
+
+```powershell
+& 'D:\das-sentinel-runtime\.venv\Scripts\python.exe' -m ruff check backend/src/das_sentinel/readers/zd_hdf5.py --select DTZ007
+```
+
+Expected RED: `backend/src/das_sentinel/readers/zd_hdf5.py:160:26 DTZ007`。
+
+把 naive 比较改成等价的 UTC-aware 比较：
+
+```python
+filename_clock = datetime.strptime(stamp, format_string).replace(tzinfo=UTC)
+raw_clock = raw_start.replace(microsecond=0)
+```
+
+然后运行：
+
+```powershell
+& 'D:\das-sentinel-runtime\.venv\Scripts\python.exe' -m ruff check backend/src/das_sentinel/readers/zd_hdf5.py --select DTZ007
+& 'D:\das-sentinel-runtime\.venv\Scripts\python.exe' -m pytest tests/test_zd_hdf5.py::test_interprets_matching_utc8_filename_clock_as_station_local_time tests/test_zd_hdf5.py::test_does_not_apply_filename_offset_when_wall_clocks_disagree -q
+```
+
+Expected GREEN: Ruff 退出码 0，两个既有行为测试均通过。
+
+- [ ] **Step 0B: 为容器迁移导出可覆盖的默认数据库地址**
+
+先在 `tests/test_runtime.py` 增加失败测试：
+
+```python
+def test_entrypoint_defaults_database_url_before_preflight_and_migration() -> None:
+    text = Path("docker/entrypoint-api.sh").read_text(encoding="utf-8")
+    export = (
+        'export DAS_DATABASE_URL="${DAS_DATABASE_URL:-'
+        'sqlite+pysqlite:////app-data/das-sentinel.sqlite3}"'
+    )
+    assert export in text
+    assert text.index(export) < text.index("python -m das_sentinel.runtime")
+    assert text.index(export) < text.index("alembic upgrade head")
+```
+
+Run:
+
+```powershell
+& 'D:\das-sentinel-runtime\.venv\Scripts\python.exe' -m pytest tests/test_runtime.py::test_entrypoint_defaults_database_url_before_preflight_and_migration -q
+```
+
+Expected RED: FAIL，因为入口尚未导出该默认值。
+
+在 `docker/entrypoint-api.sh` 的 `set -eu` 后加入：
+
+```sh
+export DAS_DATABASE_URL="${DAS_DATABASE_URL:-sqlite+pysqlite:////app-data/das-sentinel.sqlite3}"
+```
+
+Run:
+
+```powershell
+& 'D:\das-sentinel-runtime\.venv\Scripts\python.exe' -m pytest tests/test_runtime.py -q
+```
+
+Expected GREEN: `tests/test_runtime.py` 全部通过。
+
+- [ ] **Step 0C: 提交首轮 CI 暴露的两项根因修复**
+
+```powershell
+git add -- backend/src/das_sentinel/readers/zd_hdf5.py docker/entrypoint-api.sh tests/test_runtime.py
+git diff --cached --check
+git commit -m "fix: make CI runtime defaults explicit"
+```
+
 - [ ] **Step 1: 运行完整本地检查**
 
 ```powershell
@@ -179,7 +251,7 @@ Set-Location ..
 
 Expected: 后端、前端测试和生产构建全部退出码 0。恢复 `npm run build` 产生的 `frontend/tsconfig.tsbuildinfo` 工作树变化，使提交范围保持干净。
 
-- [ ] **Step 2: 在本机 Docker 复现 CPU 构建路径**
+- [ ] **Step 2: 在本机或 GitHub CI 复现 CPU 构建路径**
 
 ```powershell
 docker build -f docker/Dockerfile.cpu -t das-sentinel:ci-repair .
@@ -187,6 +259,8 @@ docker run --rm --entrypoint python das-sentinel:ci-repair -c "import pysqlite3.
 ```
 
 Expected: 镜像构建成功，容器内 SQLite 版本断言通过。此验证不挂载 NAS/Z 盘数据。
+
+若本机仍因已记录的 `auth.docker.io` DNS 故障无法下载基础镜像，则按用户明确批准，以推送后的 GitHub `cpu-container` 作业作为替代验证；不得因此跳过远程 CPU 门禁。
 
 - [ ] **Step 3: 确认提交范围并推送**
 

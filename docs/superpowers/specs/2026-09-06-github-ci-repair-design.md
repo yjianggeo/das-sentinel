@@ -11,12 +11,21 @@
 
 ## 获批方案
 
-采用最小、可逆的 CI 修复，不改变 DAS 业务逻辑、容器入口或 GPU 运行时契约。
+采用最小、可逆的 CI 修复，不改变 DAS 事件检测/分类逻辑或 GPU 运行时契约。容器入口只允许下述经批准的数据库默认值修复。
 
 - 在 SQLite wheel 构建脚本中同时安装 `setuptools` 和 `wheel`，继续使用已有的 SQLite 3.53.3 与 pysqlite3 0.5.4 SHA-256 固定来源。
 - 在 `gpu-image-build` 的 Docker 构建之前，仅清理 GitHub 临时运行器中与本项目无关的大型预装工具目录和现有 Docker 缓存，为 CUDA `devel` 镜像释放空间。
 - 保留现有 CUDA `devel` 基础镜像，不降级为可能缺少 CuPy 运行时编译组件的 `runtime` 镜像。
 - 保留完整 GPU 镜像构建门禁，不跳过或弱化检查。
+
+## CI 首轮复验后的批准补充
+
+首轮远程复验确认 GPU 镜像构建已通过，同时发现两个既有问题。用户批准按方案 A 扩展修复范围：
+
+1. `zd_hdf5.py` 的文件名时钟与原始时钟比较改为两侧都显式使用 UTC-aware `datetime`。只改变时区表示，不改变相等判断、UTC 偏移量或最终事件时间。
+2. `entrypoint-api.sh` 在预检和 Alembic 迁移之前导出可覆盖的默认 `DAS_DATABASE_URL=sqlite+pysqlite:////app-data/das-sentinel.sqlite3`。显式传入的 `DAS_DATABASE_URL` 始终优先，默认路径与 `Settings.database_url` 保持一致。
+
+该补充允许修改上述读取器时间表示和容器入口默认值；不授权其他业务逻辑、入口流程或部署配置变更。
 
 ## 安全边界
 
@@ -28,6 +37,8 @@
 
 1. SQLite 构建脚本必须在调用 `setup.py` 前显式安装 `setuptools` 和 `wheel`。
 2. GPU CI 作业必须在 Docker 构建前执行受限的磁盘清理，同时仍保留且只执行镜像构建，不添加 GPU 运行命令。
+
+首轮远程复验新增两项 RED 证据：Ruff `DTZ007` 直接证明文件名时间仍为 naive；`tests/test_runtime.py` 新增入口契约测试，证明数据库默认值尚未在迁移前导出。修复后运行对应 JJK 时间测试、入口测试和 Ruff，再进入完整复验。
 
 实现后依次验证：
 
