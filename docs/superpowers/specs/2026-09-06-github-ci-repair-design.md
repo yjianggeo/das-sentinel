@@ -1,0 +1,43 @@
+# GitHub CI 修复设计
+
+## 目标
+
+修复 PR #1 中重复出现的三个 GitHub Actions 失败，使 Python、CPU 容器、GPU 镜像和前端四个发布门禁全部通过，然后把当前最新版本合并到 GitHub `main`。
+
+## 已确认根因
+
+1. Python 与 CPU 容器作业都调用 `docker/build-pysqlite3-wheel.sh`。脚本只显式安装 `wheel`，而当前 Python 3.12 构建环境没有可供传统 `setup.py` 导入的 `setuptools`，因此以 `ModuleNotFoundError: No module named 'setuptools'` 退出。
+2. GPU 作业在 GitHub 托管的 Ubuntu 运行器上展开 `nvidia/cuda:12.8.1-devel-ubuntu24.04` 时耗尽磁盘空间。失败发生在项目安装之前，错误为 `no space left on device`。
+
+## 获批方案
+
+采用最小、可逆的 CI 修复，不改变 DAS 业务逻辑、容器入口或 GPU 运行时契约。
+
+- 在 SQLite wheel 构建脚本中同时安装 `setuptools` 和 `wheel`，继续使用已有的 SQLite 3.53.3 与 pysqlite3 0.5.4 SHA-256 固定来源。
+- 在 `gpu-image-build` 的 Docker 构建之前，仅清理 GitHub 临时运行器中与本项目无关的大型预装工具目录和现有 Docker 缓存，为 CUDA `devel` 镜像释放空间。
+- 保留现有 CUDA `devel` 基础镜像，不降级为可能缺少 CuPy 运行时编译组件的 `runtime` 镜像。
+- 保留完整 GPU 镜像构建门禁，不跳过或弱化检查。
+
+## 安全边界
+
+磁盘清理只写入 GitHub Actions 的一次性托管运行器，不在用户电脑、NAS、Z 盘或部署服务器上执行。清理命令使用明确的系统工具目录，不使用未解析变量或广泛根目录目标。原始 JJK/HDF5 数据、数据库和应用配置均不受影响。
+
+## 测试设计
+
+先在 `tests/test_compose.py` 增加两个静态契约测试，并验证它们在当前代码上因缺少目标行为而失败：
+
+1. SQLite 构建脚本必须在调用 `setup.py` 前显式安装 `setuptools` 和 `wheel`。
+2. GPU CI 作业必须在 Docker 构建前执行受限的磁盘清理，同时仍保留且只执行镜像构建，不添加 GPU 运行命令。
+
+实现后依次验证：
+
+- 新增的两个聚焦测试；
+- `tests/test_compose.py`；
+- 后端完整 pytest；
+- 前端完整测试与生产构建；
+- 可用时在本机 Docker 中构建 CPU 镜像；
+- 推送后等待 GitHub PR 的全部 CI 检查结束。
+
+## 交付与合并
+
+修复提交推送到 `docs/chinese-beginner-manual`，由 PR #1 重新运行 CI。仅当全部必需检查成功时，使用普通合并提交将 PR 合并到 `main`；不重写历史，不强制推送。合并后核对 GitHub `main` 指向包含最新手册和 CI 修复的提交。
