@@ -198,7 +198,46 @@ class SiteResponse(StrictSchema):
 
 
 class ScanRequest(StrictSchema):
-    path: str | None = Field(default=None, max_length=1024)
+    path: Annotated[
+        str,
+        StringConstraints(strip_whitespace=True, min_length=1, max_length=1024),
+    ]
+
+
+class ScanDirectoryEntryResponse(StrictSchema):
+    name: str
+    path: str
+
+
+class ScanDirectoryResponse(StrictSchema):
+    site_id: str
+    site_name: str
+    path: str
+    parent_path: str | None
+    directories: list[ScanDirectoryEntryResponse]
+
+
+class ScanResponse(StrictSchema):
+    id: str
+    site_id: str
+    path: str
+    phase: Literal[
+        "initial_scan",
+        "stability_wait",
+        "verification_scan",
+        "enqueueing",
+        "completed",
+        "failed",
+    ]
+    initial_checked_files: int = Field(ge=0)
+    initial_found_files: int = Field(ge=0)
+    verification_checked_files: int = Field(ge=0)
+    verification_found_files: int = Field(ge=0)
+    stable_files: int = Field(ge=0)
+    submitted_files: int = Field(ge=0)
+    skipped_files: int = Field(ge=0)
+    stability_seconds_remaining: int = Field(ge=0)
+    error_message: str | None
 
 
 class JobEnqueueRequest(StrictSchema):

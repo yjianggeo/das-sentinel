@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import pytest
@@ -43,8 +44,11 @@ def scan_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     upgrade_database(settings.database_url)
     engine = create_local_engine(settings.database_url)
     sessions = session_factory(engine)
-    write_zd_h5(settings.data_root / "a.h5")
-    write_zd_h5(settings.data_root / "b.h5")
+    selected = settings.data_root / "jjk" / "day"
+    selected.mkdir(parents=True)
+    (settings.data_root / "empty").mkdir()
+    write_zd_h5(selected / "a.h5")
+    write_zd_h5(selected / "b.h5")
     with sessions.begin() as session:
         repositories = Repositories(session)
         repositories.admins.add(password_hash=PasswordHasher().hash(PASSWORD))
@@ -75,80 +79,205 @@ def scan_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         )
         ids = {"site": site.id, "disabled": disabled.id}
     monkeypatch.setattr("das_sentinel.api.app.check_database_startup", lambda _: None)
-    with TestClient(create_app(settings)) as client:
+    app = create_app(settings)
+    app.state.scan_coordinator.stable_seconds = 0.01
+    with TestClient(app) as client:
         login = client.post("/api/v1/session", json={"password": PASSWORD})
         yield client, login.headers["x-csrf-token"], ids, settings
     engine.dispose()
 
 
-def test_scan_enqueues_only_after_stability_window(scan_api, monkeypatch):
-    client, token, ids, _ = scan_api
-    clock = iter([100.0, 115.0, 130.0])
-    monkeypatch.setattr(
-        "das_sentinel.api.routes.scans.monotonic", lambda: next(clock)
+def poll_scan(client: TestClient, scan_id: str) -> dict:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        response = client.get(f"/api/v1/scans/{scan_id}")
+        assert response.status_code == 200, response.text
+        snapshot = response.json()
+        if snapshot["phase"] in {"completed", "failed"}:
+            return snapshot
+        time.sleep(0.01)
+    raise AssertionError(f"scan {scan_id} did not reach a terminal phase")
+
+
+def test_scan_directory_listing_is_shallow_and_root_relative(scan_api):
+    client, _, ids, _ = scan_api
+
+    root = client.get(f"/api/v1/sites/{ids['site']}/scan-directories")
+    assert root.status_code == 200, root.text
+    assert root.json() == {
+        "site_id": ids["site"],
+        "site_name": "site-a",
+        "path": "",
+        "parent_path": None,
+        "directories": [
+            {"name": "empty", "path": "empty"},
+            {"name": "jjk", "path": "jjk"},
+        ],
+    }
+
+    nested = client.get(
+        f"/api/v1/sites/{ids['site']}/scan-directories", params={"path": "jjk"}
     )
-
-    first = client.post(
-        f"/api/v1/sites/{ids['site']}/scan",
-        json={},
-        headers={"X-CSRF-Token": token},
-    )
-    assert first.status_code == 201, first.text
-    assert first.json() == []
-
-    second = client.post(
-        f"/api/v1/sites/{ids['site']}/scan",
-        json={},
-        headers={"X-CSRF-Token": token},
-    )
-    assert second.status_code == 201, second.text
-    assert len(second.json()) == 2
-    assert {job["pipeline_version"] for job in second.json()} == {"pipeline-v1"}
-
-    listed = client.get("/api/v1/jobs").json()
-    assert len(listed) == 2
-
-    again = client.post(
-        f"/api/v1/sites/{ids['site']}/scan",
-        json={},
-        headers={"X-CSRF-Token": token},
-    )
-    assert again.json() == []
+    assert nested.status_code == 200, nested.text
+    assert nested.json() == {
+        "site_id": ids["site"],
+        "site_name": "site-a",
+        "path": "jjk",
+        "parent_path": "",
+        "directories": [{"name": "day", "path": "jjk/day"}],
+    }
 
 
-def test_scan_rejects_path_outside_site_root(scan_api):
+@pytest.mark.parametrize("path", ["", "   ", "."])
+def test_scan_rejects_blank_or_site_root(scan_api, path):
     client, token, ids, _ = scan_api
     response = client.post(
         f"/api/v1/sites/{ids['site']}/scan",
-        json={"path": "/etc"},
+        json={"path": path},
         headers={"X-CSRF-Token": token},
     )
     assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["../outside", "/absolute", "missing", "jjk/day/a.h5"],
+)
+def test_scan_rejects_unsafe_or_invalid_directory(scan_api, path):
+    client, token, ids, settings = scan_api
+    response = client.post(
+        f"/api/v1/sites/{ids['site']}/scan",
+        json={"path": path},
+        headers={"X-CSRF-Token": token},
+    )
+    assert response.status_code == 422
+    assert str(settings.data_root) not in response.text
+
+
+def test_scan_directory_error_does_not_expose_absolute_path(scan_api):
+    client, _, ids, settings = scan_api
+    response = client.get(
+        f"/api/v1/sites/{ids['site']}/scan-directories",
+        params={"path": "missing"},
+    )
+    assert response.status_code == 422
+    assert str(settings.data_root) not in response.text
+
+
+def test_scan_returns_immediately_then_completes_automatic_recheck(scan_api):
+    client, token, ids, _ = scan_api
+    started = client.post(
+        f"/api/v1/sites/{ids['site']}/scan",
+        json={"path": "jjk/day"},
+        headers={"X-CSRF-Token": token},
+    )
+    assert started.status_code == 202
+    scan_id = started.json()["id"]
+    terminal = poll_scan(client, scan_id)
+    assert terminal["phase"] == "completed"
+    assert terminal["initial_found_files"] == 2
+    assert terminal["verification_found_files"] == 2
+    assert terminal["submitted_files"] == 2
+    assert len(client.get("/api/v1/jobs").json()) == 2
+
+
+def test_duplicate_start_returns_existing_active_scan(scan_api):
+    client, token, ids, _ = scan_api
+    client.app.state.scan_coordinator.stable_seconds = 1
+    first = client.post(
+        f"/api/v1/sites/{ids['site']}/scan",
+        json={"path": "jjk/day"},
+        headers={"X-CSRF-Token": token},
+    )
+    second = client.post(
+        f"/api/v1/sites/{ids['site']}/scan",
+        json={"path": "empty"},
+        headers={"X-CSRF-Token": token},
+    )
+    assert first.status_code == 202
+    assert second.status_code == 200
+    assert second.json()["id"] == first.json()["id"]
+    assert second.json()["path"] == "jjk/day"
+
+
+def test_active_scan_lookup_returns_current_scan(scan_api):
+    client, token, ids, _ = scan_api
+    client.app.state.scan_coordinator.stable_seconds = 1
+    assert client.get(f"/api/v1/sites/{ids['site']}/active-scan").json() is None
+    started = client.post(
+        f"/api/v1/sites/{ids['site']}/scan",
+        json={"path": "jjk/day"},
+        headers={"X-CSRF-Token": token},
+    )
+    active = client.get(f"/api/v1/sites/{ids['site']}/active-scan")
+    assert active.status_code == 200
+    assert active.json()["id"] == started.json()["id"]
+
+
+def test_unknown_scan_returns_404(scan_api):
+    client, _, _, _ = scan_api
+    response = client.get("/api/v1/scans/does-not-exist")
+    assert response.status_code == 404
 
 
 def test_scan_unknown_or_disabled_site(scan_api):
     client, token, ids, _ = scan_api
     missing = client.post(
         "/api/v1/sites/does-not-exist/scan",
-        json={},
+        json={"path": "jjk/day"},
         headers={"X-CSRF-Token": token},
     )
     assert missing.status_code == 404
     disabled = client.post(
         f"/api/v1/sites/{ids['disabled']}/scan",
-        json={},
+        json={"path": "jjk/day"},
         headers={"X-CSRF-Token": token},
     )
     assert disabled.status_code == 409
 
 
-def test_scan_requires_admin_and_csrf(scan_api):
+def test_scan_directory_unknown_or_disabled_site(scan_api):
+    client, _, ids, _ = scan_api
+    missing = client.get("/api/v1/sites/does-not-exist/scan-directories")
+    assert missing.status_code == 404
+    disabled = client.get(f"/api/v1/sites/{ids['disabled']}/scan-directories")
+    assert disabled.status_code == 409
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/v1/sites/site-id/scan-directories",
+        "/api/v1/sites/site-id/active-scan",
+        "/api/v1/scans/scan-id",
+    ],
+)
+def test_scan_gets_require_admin(scan_api, path):
+    client, _, _, _ = scan_api
+    client.cookies.clear()
+    assert client.get(path).status_code == 401
+
+
+def test_scan_post_requires_admin_and_csrf(scan_api):
     client, _, ids, _ = scan_api
     client.cookies.clear()
-    assert (
-        client.post(f"/api/v1/sites/{ids['site']}/scan", json={}).status_code == 401
-    )
+    path = f"/api/v1/sites/{ids['site']}/scan"
+    assert client.post(path, json={"path": "jjk/day"}).status_code == 401
     client.post("/api/v1/session", json={"password": PASSWORD})
-    assert (
-        client.post(f"/api/v1/sites/{ids['site']}/scan", json={}).status_code == 403
+    assert client.post(path, json={"path": "jjk/day"}).status_code == 403
+
+
+def test_empty_directory_scan_completes_successfully(scan_api):
+    client, token, ids, _ = scan_api
+    started = client.post(
+        f"/api/v1/sites/{ids['site']}/scan",
+        json={"path": "empty"},
+        headers={"X-CSRF-Token": token},
     )
+    assert started.status_code == 202
+    terminal = poll_scan(client, started.json()["id"])
+    assert terminal["phase"] == "completed"
+    assert terminal["initial_found_files"] == 0
+    assert terminal["verification_found_files"] == 0
+    assert terminal["submitted_files"] == 0
+    assert terminal["error_message"] is None

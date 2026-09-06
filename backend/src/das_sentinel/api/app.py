@@ -42,6 +42,7 @@ from das_sentinel.persistence import (
 from das_sentinel.readers.zd_hdf5 import ZdHdf5Reader
 from das_sentinel.runtime import probe_storage
 from das_sentinel.services.jobs import JobService
+from das_sentinel.services.scans import ScanCoordinator
 from das_sentinel.services.waterfall_previews import WaterfallPreviewService
 
 
@@ -75,6 +76,7 @@ def create_app(settings: Settings) -> FastAPI:
             )
             yield
         finally:
+            await app.state.scan_coordinator.close()
             engine.dispose()
 
     app = FastAPI(title="DAS Sentinel", version="0.1.0", lifespan=lifespan)
@@ -83,6 +85,12 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.engine = engine
     app.state.session_factory = session_factory(engine)
     app.state.write_coordinator = AsyncWriteCoordinator()
+    app.state.scan_coordinator = ScanCoordinator(
+        app.state.session_factory,
+        settings.app_data_dir / "artifacts",
+        settings.pipeline_version,
+        app.state.write_coordinator,
+    )
     app.state.auth_limiter = asyncio.Semaphore(1)
     app.state.waterfall_preview_service = WaterfallPreviewService(
         settings.data_root,
@@ -107,7 +115,6 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(scans_router, prefix="/api/v1")
     app.include_router(internal_router, prefix="/api/v1")
     app.include_router(health_router)
-    app.state.discovery_trackers = {}
     _mount_spa(app)
     return app
 
