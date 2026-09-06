@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import sqlite3
+import shutil
 import warnings
 from datetime import UTC, datetime, timedelta, timezone
 from pathlib import Path
@@ -141,6 +141,27 @@ def test_initial_migration_creates_all_tables_and_is_idempotent(tmp_path):
         engine.dispose()
 
 
+def test_upgrade_database_uses_installed_package_migrations(tmp_path, monkeypatch):
+    source_migrations = Path(persistence_db.__file__).resolve().parent / "migrations"
+    installed_persistence = tmp_path / "site-packages" / "das_sentinel" / "persistence"
+    shutil.copytree(source_migrations, installed_persistence / "migrations")
+    installed_db = installed_persistence / "db.py"
+    installed_db.touch()
+    monkeypatch.setattr(persistence_db, "__file__", str(installed_db))
+    database_url = f"sqlite+pysqlite:///{tmp_path / 'installed.sqlite3'}"
+
+    upgrade_database(database_url)
+
+    engine = create_local_engine(database_url)
+    try:
+        with engine.connect() as connection:
+            assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
+                "0002_job_model_and_review_request"
+            )
+    finally:
+        engine.dispose()
+
+
 def test_hardening_migration_adds_model_binding_and_review_idempotency(
     migrated_engine,
 ):
@@ -182,11 +203,12 @@ def test_hardening_migration_adds_model_binding_and_review_idempotency(
 
 def test_hardening_migration_round_trip_preserves_review_triggers(database_url):
     driver = persistence_db._sqlite_driver()
-    assert driver is sqlite3
     assert driver.sqlite_version == "3.53.3"
-    assert sqlite3.connect(":memory:").execute(
-        "SELECT sqlite_version()"
-    ).fetchone() == ("3.53.3",)
+    connection = driver.connect(":memory:")
+    try:
+        assert connection.execute("SELECT sqlite_version()").fetchone() == ("3.53.3",)
+    finally:
+        connection.close()
     assert validate_selected_sqlite_runtime() == (3, 53, 3)
 
     repository_root = Path(__file__).resolve().parents[1]

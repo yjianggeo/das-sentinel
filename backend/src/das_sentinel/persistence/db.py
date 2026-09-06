@@ -156,18 +156,10 @@ def check_database_startup(
 def upgrade_database(database_url: str) -> None:
     validate_selected_sqlite_runtime()
     validate_local_sqlite_url(database_url)
-    repository_root = Path(__file__).resolve().parents[4]
-    configuration = Config(str(repository_root / "alembic.ini"))
+    configuration = Config()
     configuration.set_main_option(
         "script_location",
-        str(
-            repository_root
-            / "backend"
-            / "src"
-            / "das_sentinel"
-            / "persistence"
-            / "migrations"
-        ),
+        str(Path(__file__).resolve().parent / "migrations"),
     )
     configuration.set_main_option("sqlalchemy.url", database_url)
     command.upgrade(configuration, "head")

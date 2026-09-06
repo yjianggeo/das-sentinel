@@ -3,6 +3,8 @@
 # the polling analysis worker, anything else is executed verbatim.
 set -eu
 
+export DAS_DATABASE_URL="${DAS_DATABASE_URL:-sqlite+pysqlite:////app-data/das-sentinel.sqlite3}"
+
 case "${1:-api}" in
   api)
     python -m das_sentinel.runtime

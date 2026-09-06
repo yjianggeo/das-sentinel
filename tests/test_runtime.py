@@ -83,6 +83,17 @@ def test_entrypoint_preflights_before_migration() -> None:
     assert "create_runtime_app" in text
 
 
+def test_entrypoint_defaults_database_url_before_preflight_and_migration() -> None:
+    text = Path("docker/entrypoint-api.sh").read_text(encoding="utf-8")
+    export = (
+        'export DAS_DATABASE_URL="${DAS_DATABASE_URL:-'
+        'sqlite+pysqlite:////app-data/das-sentinel.sqlite3}"'
+    )
+    assert export in text
+    assert text.index(export) < text.index("python -m das_sentinel.runtime")
+    assert text.index(export) < text.index("alembic upgrade head")
+
+
 def test_runtime_preflight_loads_settings_and_validates_selected_sqlite(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

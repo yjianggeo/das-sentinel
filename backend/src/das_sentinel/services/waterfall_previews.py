@@ -30,7 +30,7 @@ from das_sentinel.waterfalls import (
     usable_channel_indices,
 )
 
-_MAX_PREVIEW_SAMPLES = 10_000
+_MAX_PREVIEW_SAMPLES = 30_000
 _MAX_PREVIEW_CHANNELS = 256
 
 

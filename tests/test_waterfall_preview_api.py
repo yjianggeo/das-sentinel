@@ -27,6 +27,7 @@ from das_sentinel.persistence.models import (
     SourceFile,
 )
 from das_sentinel.services.discovery import fingerprint
+from das_sentinel.services.waterfall_previews import WaterfallPreviewService
 from fastapi.testclient import TestClient
 from sqlalchemy import func, select
 
@@ -488,7 +489,7 @@ def test_waterfall_preview_rejects_oversized_window_before_read(waterfall_api):
         binding = original_binding(session, event_id)
         return replace(
             binding,
-            profile=binding.profile.model_copy(update={"artifact_pad_seconds": 100.0}),
+            profile=binding.profile.model_copy(update={"artifact_pad_seconds": 400.0}),
         )
 
     def count_read_block(path, start, stop, channels):
@@ -496,7 +497,7 @@ def test_waterfall_preview_rejects_oversized_window_before_read(waterfall_api):
         calls += 1
         raise AssertionError("oversized preview must not read source data")
 
-    reader.sample_count = lambda path: 20_000
+    reader.sample_count = lambda path: 50_000
     reader.read_block = count_read_block
     service._binding = padded_binding
     response = client.post(
@@ -507,6 +508,15 @@ def test_waterfall_preview_rejects_oversized_window_before_read(waterfall_api):
 
     assert response.status_code == 422
     assert calls == 0
+
+
+def test_waterfall_preview_allows_default_padding_around_short_1khz_event():
+    """Regresses rejecting 5 s padding plus a short event at 1 kHz."""
+    WaterfallPreviewService._validate_read_bounds(
+        14_398,
+        24_643,
+        slice(30, 61),
+    )
 
 
 def test_waterfall_preview_parses_evidence_once_per_request(
