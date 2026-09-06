@@ -133,6 +133,43 @@ export interface Site {
   current_profile: ProfileInfo;
 }
 
+export interface ScanDirectoryEntry {
+  name: string;
+  path: string;
+}
+
+export interface ScanDirectoryListing {
+  site_id: string;
+  site_name: string;
+  path: string;
+  parent_path: string | null;
+  directories: ScanDirectoryEntry[];
+}
+
+export type ScanPhase =
+  | "initial_scan"
+  | "stability_wait"
+  | "verification_scan"
+  | "enqueueing"
+  | "completed"
+  | "failed";
+
+export interface ScanStatus {
+  id: string;
+  site_id: string;
+  path: string;
+  phase: ScanPhase;
+  initial_checked_files: number;
+  initial_found_files: number;
+  verification_checked_files: number;
+  verification_found_files: number;
+  stable_files: number;
+  submitted_files: number;
+  skipped_files: number;
+  stability_seconds_remaining: number;
+  error_message: string | null;
+}
+
 export interface Job {
   id: string;
   source_file_id: string;
