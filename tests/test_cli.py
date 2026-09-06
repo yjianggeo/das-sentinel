@@ -175,8 +175,8 @@ def test_scan_commands_require_path(command):
     assert "Missing argument" in result.stderr
 
 
-@pytest.mark.parametrize("path", [".", "..", "C:/data"])
-def test_scan_rejects_root_or_parent_path_before_post(monkeypatch, path):
+@pytest.mark.parametrize("path", [".", "..", "C:/data", "/outside", r"\outside"])
+def test_scan_rejects_root_parent_or_rooted_path_before_post(monkeypatch, path):
     api = FakeApi(payloads={
         ("GET", "/api/v1/sites/site-1"): {"id": "site-1", "data_path": "C:/data"},
     })

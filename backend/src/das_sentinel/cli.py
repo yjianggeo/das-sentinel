@@ -4,7 +4,7 @@ import csv
 import os
 import sqlite3
 import time
-from pathlib import Path, PurePosixPath
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Annotated, Any, Literal
 
 import typer
@@ -98,6 +98,11 @@ def _relative_scan_path(client: ApiClient, site_id: str, value: str) -> str:
     site = client.get(f"/api/v1/sites/{site_id}").json()
     root = Path(site["data_path"])
     candidate = Path(value)
+    has_lexical_anchor = bool(
+        PurePosixPath(value).anchor or PureWindowsPath(value).anchor
+    )
+    if has_lexical_anchor and not candidate.is_absolute():
+        raise typer.BadParameter("PATH 必须是站点根目录下的具体数据目录")
     try:
         relative = candidate.relative_to(root) if candidate.is_absolute() else candidate
     except ValueError as error:
