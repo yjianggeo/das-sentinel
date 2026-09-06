@@ -4,7 +4,7 @@ import csv
 import os
 import sqlite3
 import time
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal
 
 import typer
@@ -22,6 +22,12 @@ app.add_typer(events_app, name="events")
 app.add_typer(models_app, name="models")
 
 _MUTATING = {"POST", "PATCH", "PUT", "DELETE"}
+ACTIVE_SCAN_PHASES = {
+    "initial_scan",
+    "stability_wait",
+    "verification_scan",
+    "enqueueing",
+}
 
 
 def _env(name: str, default: str) -> str:
@@ -86,6 +92,61 @@ def _connect() -> ApiClient:
     if not password:
         password = typer.prompt("管理员密码", hide_input=True)
     return ApiClient(_env("DAS_API_URL", "http://127.0.0.1:8000"), password)
+
+
+def _relative_scan_path(client: ApiClient, site_id: str, value: str) -> str:
+    site = client.get(f"/api/v1/sites/{site_id}").json()
+    root = Path(site["data_path"])
+    candidate = Path(value)
+    try:
+        relative = candidate.relative_to(root) if candidate.is_absolute() else candidate
+    except ValueError as error:
+        raise typer.BadParameter("PATH 必须是站点根目录下的具体数据目录") from error
+    if not relative.parts or ".." in relative.parts or relative == Path("."):
+        raise typer.BadParameter("PATH 必须是站点根目录下的具体数据目录")
+    return PurePosixPath(*relative.parts).as_posix()
+
+
+def _scan_status_message(snapshot: dict[str, Any]) -> str:
+    phase = snapshot["phase"]
+    if phase == "initial_scan":
+        return (
+            f"正在扫描：已检查 {snapshot['initial_checked_files']} 个文件，发现 "
+            f"{snapshot['initial_found_files']} 个 H5 数据文件"
+        )
+    if phase == "stability_wait":
+        return (
+            "首次扫描完成。请等待稳定性复检，剩余 "
+            f"{snapshot['stability_seconds_remaining']} 秒，无需再次点击"
+        )
+    if phase == "verification_scan":
+        return (
+            f"正在进行稳定性复检：已复检 {snapshot['verification_checked_files']} "
+            f"个文件，确认 {snapshot['stable_files']} 个稳定文件"
+        )
+    if phase == "enqueueing":
+        return "正在为稳定文件创建分析任务……"
+    if phase == "completed":
+        return (
+            f"扫描完成：首轮发现 {snapshot['initial_found_files']} 个，复检发现 "
+            f"{snapshot['verification_found_files']} 个，稳定 {snapshot['stable_files']} 个，"
+            f"已提交 {snapshot['submitted_files']} 个，未入队 {snapshot['skipped_files']} 个。"
+        )
+    return str(snapshot.get("error_message") or "扫描失败")
+
+
+def _wait_for_scan(client: ApiClient, snapshot: dict[str, Any]) -> dict[str, Any]:
+    while snapshot["phase"] in ACTIVE_SCAN_PHASES:
+        typer.echo(_scan_status_message(snapshot))
+        time.sleep(1.0)
+        snapshot = client.get(f"/api/v1/scans/{snapshot['id']}").json()
+    return snapshot
+
+
+def _print_terminal_scan_status(snapshot: dict[str, Any]) -> None:
+    typer.echo(_scan_status_message(snapshot))
+    if snapshot["phase"] == "failed":
+        raise typer.Exit(code=1)
 
 
 @admin_app.command("init")
@@ -165,33 +226,33 @@ def site_show(site_id: str) -> None:
 @app.command("scan")
 def scan(
     site_id: str,
-    path: Annotated[str | None, typer.Argument()] = None,
-    settle_seconds: Annotated[float, typer.Option(min=0.0)] = 10.0,
+    path: Annotated[str, typer.Argument()],
 ) -> None:
-    """Discover files under PATH (default: site root) and enqueue jobs."""
+    """Discover files under a concrete PATH and enqueue jobs."""
     client = _connect()
-    payload = {"path": path} if path is not None else {}
-    first = client.post(f"/api/v1/sites/{site_id}/scan", json=payload).json()
-    if settle_seconds > 0:
-        typer.echo(f"等待文件稳定 {settle_seconds:.0f} 秒…")
-        time.sleep(settle_seconds)
-    jobs = client.post(f"/api/v1/sites/{site_id}/scan", json=payload).json()
-    typer.echo(f"本次入队 {len(jobs)} 个任务（首轮 {len(first)} 个）。")
+    relative_path = _relative_scan_path(client, site_id, path)
+    snapshot = client.post(
+        f"/api/v1/sites/{site_id}/scan", json={"path": relative_path}
+    ).json()
+    _print_terminal_scan_status(_wait_for_scan(client, snapshot))
 
 
 @app.command("watch")
 def watch(
     site_id: str,
+    path: Annotated[str, typer.Argument()],
     poll_seconds: Annotated[float, typer.Option(min=1.0)] = 30.0,
     once: Annotated[bool, typer.Option("--once")] = False,
 ) -> None:
-    """Poll the site directory through the API scan endpoint."""
+    """Repeatedly scan a concrete PATH through the API."""
     client = _connect()
+    relative_path = _relative_scan_path(client, site_id, path)
     try:
         while True:
-            jobs = client.post(f"/api/v1/sites/{site_id}/scan", json={}).json()
-            if jobs:
-                typer.echo(f"入队 {len(jobs)} 个任务。")
+            snapshot = client.post(
+                f"/api/v1/sites/{site_id}/scan", json={"path": relative_path}
+            ).json()
+            _print_terminal_scan_status(_wait_for_scan(client, snapshot))
             if once:
                 return
             time.sleep(poll_seconds)
