@@ -264,9 +264,31 @@ exit 1
     ]
 
     gpu_job = workflow["jobs"]["gpu-image-build"]
-    assert _run_steps(gpu_job) == [
-        "docker build -f docker/Dockerfile.gpu -t das-sentinel-gpu:ci ."
+    assert gpu_job["steps"] == [
+        {"uses": "actions/checkout@v4"},
+        {
+            "name": "Free space for CUDA development image",
+            "run": """sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+docker system prune --all --force
+df -h /
+""",
+        },
+        {"run": "docker build -f docker/Dockerfile.gpu -t das-sentinel-gpu:ci ."},
     ]
+
+
+def test_gpu_ci_frees_hosted_runner_space_before_build() -> None:
+    gpu_steps = _ci_workflow()["jobs"]["gpu-image-build"]["steps"]
+    assert gpu_steps[1] == {
+        "name": "Free space for CUDA development image",
+        "run": """sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+docker system prune --all --force
+df -h /
+""",
+    }
+    assert gpu_steps[2] == {
+        "run": "docker build -f docker/Dockerfile.gpu -t das-sentinel-gpu:ci ."
+    }
 
 
 def test_ci_enforces_all_release_gates() -> None:
@@ -300,7 +322,8 @@ def test_ci_enforces_all_release_gates() -> None:
         pytest.param("cpu-container", 9, id="container-sqlite"),
         pytest.param("cpu-container", 10, id="always-logs"),
         pytest.param("cpu-container", 11, id="always-down"),
-        pytest.param("gpu-image-build", 1, id="gpu-image-build"),
+        pytest.param("gpu-image-build", 1, id="gpu-space-cleanup"),
+        pytest.param("gpu-image-build", 2, id="gpu-image-build"),
     ],
 )
 def test_ci_gate_contract_rejects_missing_steps(job_name: str, step_index: int) -> None:

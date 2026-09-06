@@ -77,4 +77,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Free space for CUDA development image
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android
+          docker system prune --all --force
+          df -h /
       - run: docker build -f docker/Dockerfile.gpu -t das-sentinel-gpu:ci .
