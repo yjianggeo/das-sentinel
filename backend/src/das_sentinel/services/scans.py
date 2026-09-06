@@ -131,11 +131,16 @@ class ScanCoordinator:
 
     async def close(self) -> None:
         with self._lock:
-            tasks = tuple(self._tasks_by_site.values())
+            active = tuple(self._tasks_by_site.items())
+        tasks = tuple(task for _site_id, task in active)
         for task in tasks:
             task.cancel()
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        with self._lock:
+            for site_id, task in active:
+                if self._tasks_by_site.get(site_id) is task:
+                    del self._tasks_by_site[site_id]
 
     async def _run(
         self,

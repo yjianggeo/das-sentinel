@@ -302,6 +302,23 @@ def test_concurrent_close_waits_for_an_in_flight_discovery_thread(
     asyncio.run(scenario())
 
 
+def test_immediate_close_releases_a_scan_that_never_started(scan_context):
+    async def scenario():
+        coordinator, site, selected, _sessions = scan_context
+        first, created = coordinator.start(site, selected, "jjk/day")
+        assert created is True
+
+        await coordinator.close()
+
+        assert coordinator.active(site.site_id) is None
+        second, second_created = coordinator.start(site, selected, "jjk/day")
+        assert second_created is True
+        assert second.id != first.id
+        await coordinator.close()
+
+    asyncio.run(scenario())
+
+
 def test_scan_snapshot_is_immutable():
     snapshot = ScanSnapshot(
         id="scan-1",
