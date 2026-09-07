@@ -601,3 +601,49 @@ it("allows only one POST while the first scan request is pending", async () => {
   ).toBeDisabled();
   expect(posts).toBe(1);
 });
+
+it("recovers an existing active scan after a racing scan start fails", async () => {
+  let activeScanRequests = 0;
+  let releaseInitialActiveScan: (() => void) | undefined;
+  const existingScan = scanSnapshot("initial_scan", {
+    id: "existing-scan",
+    initial_checked_files: 3333,
+  });
+  useJobsHandlers();
+  server.use(
+    http.get("/api/v1/sites/site-1/active-scan", () => {
+      activeScanRequests += 1;
+      if (activeScanRequests === 1) {
+        return new Promise((resolve) => {
+          releaseInitialActiveScan = () => resolve(HttpResponse.json(existingScan));
+        });
+      }
+      return HttpResponse.json(existingScan);
+    }),
+    http.post("/api/v1/sites/site-1/scan", () =>
+      HttpResponse.json({ detail: "scan already active" }, { status: 503 })),
+  );
+  renderApp("/jobs");
+
+  await userEvent.click(
+    await screen.findByRole("button", {
+      name: "选择目录并扫描 JJK NAS Archive",
+    }),
+  );
+  await userEvent.click(await screen.findByRole("button", { name: "jjk20240608" }));
+  await userEvent.click(screen.getByRole("button", { name: "选择当前目录" }));
+  await userEvent.click(screen.getByRole("button", { name: "开始扫描" }));
+  expect(await screen.findByRole("alert")).toHaveTextContent("触发扫描失败");
+
+  await act(async () => {
+    releaseInitialActiveScan?.();
+  });
+
+  expect(
+    await screen.findByRole("button", { name: "正在扫描 JJK NAS Archive" }),
+  ).toBeDisabled();
+  expect(screen.getByRole("status")).toHaveTextContent("已检查 3333 个文件");
+  expect(sessionStorage.getItem(ACTIVE_SCAN_STORAGE_KEY)).toBe(
+    JSON.stringify({ "site-1": "existing-scan" }),
+  );
+});

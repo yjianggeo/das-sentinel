@@ -272,8 +272,8 @@ export default function JobsPage() {
       return;
     }
     startingSiteIdsRef.current.add(site.id);
-    siteScanGenerations.current[site.id] =
-      (siteScanGenerations.current[site.id] ?? 0) + 1;
+    const generation = (siteScanGenerations.current[site.id] ?? 0) + 1;
+    siteScanGenerations.current[site.id] = generation;
     setStartingSiteIds((current) => new Set(current).add(site.id));
     const controller = requestController();
     try {
@@ -292,7 +292,27 @@ export default function JobsPage() {
         refresh();
       }
     } catch {
-      if (!controller.signal.aborted) setError("触发扫描失败");
+      if (!controller.signal.aborted) {
+        setError("触发扫描失败");
+        try {
+          const active = await api.get<ScanStatus | null>(
+            `/api/v1/sites/${site.id}/active-scan`,
+            undefined,
+            controller.signal,
+          );
+          if (
+            !controller.signal.aborted
+            && siteScanGenerations.current[site.id] === generation
+            && active !== null
+          ) {
+            setScans((current) => ({ ...current, [site.id]: active }));
+            setPendingScan(null);
+            rememberActiveScan(site.id, active.id);
+          }
+        } catch {
+          // Keep the original start failure visible if reconciliation is unavailable.
+        }
+      }
     } finally {
       releaseController(controller);
       startingSiteIdsRef.current.delete(site.id);
