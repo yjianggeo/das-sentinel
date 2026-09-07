@@ -185,6 +185,25 @@ def test_scan_directory_rejects_windows_anchored_paths(
         resolve_scan_directory(_site(root), submitted, allow_root=False)
 
 
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows path normalization")
+@pytest.mark.parametrize("relative_path", ["...", "....", ".. .", ". /."])
+def test_scan_directory_rejects_windows_normalized_root(
+    tmp_path: Path, relative_path: str
+):
+    root = tmp_path / "root"
+    (root / "selected").mkdir(parents=True)
+    site = _site(root)
+    assert (root / relative_path).resolve(strict=True) == root.resolve(strict=True)
+    assert resolve_scan_directory(site, relative_path, allow_root=True) == root
+    listing = list_scan_directories(site, relative_path)
+    assert listing.path == ""
+    assert listing.parent_path is None
+    assert listing.directories == (ScanDirectoryEntry("selected", "selected"),)
+
+    with pytest.raises(DiscoveryPathError, match="below the site root"):
+        resolve_scan_directory(site, relative_path)
+
+
 def test_discovery_reports_checked_and_h5_counts_with_recursive_override(tmp_path: Path):
     root = tmp_path / "root"
     selected = root / "selected"

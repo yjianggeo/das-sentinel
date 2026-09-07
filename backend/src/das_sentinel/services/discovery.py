@@ -307,7 +307,10 @@ def resolve_scan_directory(
     if not parts and not allow_root:
         raise DiscoveryPathError("select a directory below the site root")
     root = _validated_root(site.data_root)
-    return _validate_under_root(root, root.joinpath(*parts), directory=True)
+    resolved = _validate_under_root(root, root.joinpath(*parts), directory=True)
+    if resolved == root and not allow_root:
+        raise DiscoveryPathError("select a directory below the site root")
+    return resolved
 
 
 def list_scan_directories(

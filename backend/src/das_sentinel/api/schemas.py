@@ -200,8 +200,15 @@ class SiteResponse(StrictSchema):
 class ScanRequest(StrictSchema):
     path: Annotated[
         str,
-        StringConstraints(strip_whitespace=True, min_length=1, max_length=1024),
+        StringConstraints(min_length=1, max_length=1024),
     ]
+
+    @field_validator("path")
+    @classmethod
+    def validate_path(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("path must not be blank")
+        return value
 
 
 class ScanDirectoryEntryResponse(StrictSchema):

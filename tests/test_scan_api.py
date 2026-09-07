@@ -14,7 +14,9 @@ from das_sentinel.persistence import (
     session_factory,
     upgrade_database,
 )
+from das_sentinel.persistence.models import SourceFile
 from fastapi.testclient import TestClient
+from sqlalchemy import select
 
 from tests.fixtures import write_zd_h5
 
@@ -129,7 +131,7 @@ def test_scan_directory_listing_is_shallow_and_root_relative(scan_api):
     }
 
 
-@pytest.mark.parametrize("path", ["", "   ", "."])
+@pytest.mark.parametrize("path", ["", "   ", "\t\n", "."])
 def test_scan_rejects_blank_or_site_root(scan_api, path):
     client, token, ids, _ = scan_api
     response = client.post(
@@ -174,6 +176,62 @@ def test_scan_rejects_windows_anchored_directory(
     )
     assert response.status_code == 422
     assert str(settings.data_root) not in response.text
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows path normalization")
+@pytest.mark.parametrize("path", ["...", "....", ".. .", ". /."])
+def test_scan_rejects_windows_normalized_root_before_start(scan_api, path):
+    client, token, ids, settings = scan_api
+    response = client.post(
+        f"/api/v1/sites/{ids['site']}/scan",
+        json={"path": path},
+        headers={"X-CSRF-Token": token},
+    )
+    assert response.status_code == 422
+    assert str(settings.data_root) not in response.text
+    coordinator = client.app.state.scan_coordinator
+    assert coordinator._snapshots == {}
+    assert coordinator._tasks_by_site == {}
+    assert client.get(f"/api/v1/sites/{ids['site']}/active-scan").json() is None
+    assert client.get("/api/v1/jobs").json() == []
+    with client.app.state.session_factory() as session:
+        assert list(session.scalars(select(SourceFile))) == []
+
+
+@pytest.mark.parametrize("selected_name", [" archive", "archive"])
+def test_scan_preserves_browsed_leading_space_path(scan_api, selected_name):
+    client, token, ids, settings = scan_api
+    for name in (" archive", "archive"):
+        directory = settings.data_root / name / "day"
+        directory.mkdir(parents=True)
+        write_zd_h5(directory / "selected.h5")
+    listing_url = f"/api/v1/sites/{ids['site']}/scan-directories"
+    root = client.get(listing_url)
+    assert root.status_code == 200
+    selected = next(
+        item for item in root.json()["directories"] if item["name"] == selected_name
+    )
+    nested = client.get(listing_url, params={"path": selected["path"]})
+    assert nested.status_code == 200
+    browsed_path = nested.json()["directories"][0]["path"]
+    assert browsed_path == f"{selected_name}/day"
+
+    started = client.post(
+        f"/api/v1/sites/{ids['site']}/scan",
+        json={"path": browsed_path},
+        headers={"X-CSRF-Token": token},
+    )
+    assert started.status_code == 202
+    terminal = poll_scan(client, started.json()["id"])
+    assert terminal["phase"] == "completed"
+    assert terminal["submitted_files"] == 1
+    with client.app.state.session_factory() as session:
+        assert list(session.scalars(select(SourceFile.path))) == [
+            str(settings.data_root / selected_name / "day" / "selected.h5")
+        ]
+    assert started.json()["path"] == browsed_path
+    assert terminal["path"] == browsed_path
+    assert len(client.get("/api/v1/jobs").json()) == 1
 
 
 def test_scan_directory_error_does_not_expose_absolute_path(scan_api):
