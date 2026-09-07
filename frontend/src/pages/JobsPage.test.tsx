@@ -398,3 +398,206 @@ it("aborts an in-flight poll and leaves no timer on unmount", async () => {
   await new Promise((resolve) => setTimeout(resolve, 1100));
   expect(statusRequests).toBe(1);
 }, 5000);
+
+it("keeps successful initial active-scan recovery when another site lookup fails", async () => {
+  server.use(
+    http.get("/api/v1/jobs", () => HttpResponse.json([])),
+    http.get("/api/v1/sites", () => HttpResponse.json([SITE, OTHER_SITE])),
+    http.get("/api/v1/sites/:siteId/active-scan", ({ params }) => {
+      if (params.siteId === SITE.id) {
+        return HttpResponse.json(scanSnapshot("initial_scan"));
+      }
+      return HttpResponse.json({ detail: "site temporarily unavailable" }, { status: 503 });
+    }),
+  );
+  renderApp("/jobs");
+
+  expect(
+    await screen.findByRole("button", { name: "正在扫描 JJK NAS Archive" }),
+  ).toBeDisabled();
+  expect(
+    screen.getByRole("button", { name: "选择目录并扫描 Secondary Archive" }),
+  ).toBeEnabled();
+  expect(sessionStorage.getItem(ACTIVE_SCAN_STORAGE_KEY)).toBe(
+    JSON.stringify({ "site-1": "scan-1" }),
+  );
+});
+
+it("does not let delayed saved-scan recovery overwrite a newly started scan", async () => {
+  let jobsRequests = 0;
+  let posts = 0;
+  let releaseOldScan: (() => void) | undefined;
+  sessionStorage.setItem(
+    ACTIVE_SCAN_STORAGE_KEY,
+    JSON.stringify({ "site-1": "old-scan" }),
+  );
+  useJobsHandlers();
+  server.use(
+    http.get("/api/v1/jobs", () => {
+      jobsRequests += 1;
+      return HttpResponse.json([]);
+    }),
+    http.get("/api/v1/scans/old-scan", () =>
+      new Promise((resolve) => {
+        releaseOldScan = () => resolve(HttpResponse.json(
+          scanSnapshot("completed", { id: "old-scan" }),
+        ));
+      }),
+    ),
+    http.post("/api/v1/sites/site-1/scan", () => {
+      posts += 1;
+      return HttpResponse.json(
+        scanSnapshot("initial_scan", {
+          id: "new-scan",
+          initial_checked_files: 2000,
+        }),
+        { status: 202 },
+      );
+    }),
+  );
+  renderApp("/jobs");
+
+  await userEvent.click(
+    await screen.findByRole("button", {
+      name: "选择目录并扫描 JJK NAS Archive",
+    }),
+  );
+  await userEvent.click(await screen.findByRole("button", { name: "jjk20240608" }));
+  await userEvent.click(screen.getByRole("button", { name: "选择当前目录" }));
+  await userEvent.click(screen.getByRole("button", { name: "开始扫描" }));
+  expect(await screen.findByRole("status")).toHaveTextContent("已检查 2000 个文件");
+  expect(sessionStorage.getItem(ACTIVE_SCAN_STORAGE_KEY)).toBe(
+    JSON.stringify({ "site-1": "new-scan" }),
+  );
+
+  await act(async () => {
+    releaseOldScan?.();
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  });
+
+  expect(screen.getByRole("status")).toHaveTextContent("已检查 2000 个文件");
+  expect(sessionStorage.getItem(ACTIVE_SCAN_STORAGE_KEY)).toBe(
+    JSON.stringify({ "site-1": "new-scan" }),
+  );
+  expect(posts).toBe(1);
+  expect(jobsRequests).toBe(1);
+});
+
+it("isolates polling failures by site and keeps polling after the failed batch", async () => {
+  let primaryPolls = 0;
+  let secondaryPolls = 0;
+  server.use(
+    http.get("/api/v1/jobs", () => HttpResponse.json([])),
+    http.get("/api/v1/sites", () => HttpResponse.json([SITE, OTHER_SITE])),
+    http.get("/api/v1/sites/:siteId/active-scan", ({ params }) => {
+      if (params.siteId === SITE.id) {
+        return HttpResponse.json(scanSnapshot("initial_scan"));
+      }
+      return HttpResponse.json(scanSnapshot("initial_scan", {
+        id: "scan-2",
+        site_id: OTHER_SITE.id,
+      }));
+    }),
+    http.get("/api/v1/scans/:scanId", ({ params }) => {
+      if (params.scanId === "scan-1") {
+        primaryPolls += 1;
+        if (primaryPolls === 1) {
+          return HttpResponse.json({ detail: "temporary poll failure" }, { status: 503 });
+        }
+        return HttpResponse.json(scanSnapshot("verification_scan"));
+      }
+      secondaryPolls += 1;
+      return HttpResponse.json(scanSnapshot("completed", {
+        id: "scan-2",
+        site_id: OTHER_SITE.id,
+      }));
+    }),
+  );
+  renderApp("/jobs");
+
+  expect(
+    await screen.findByRole("button", { name: "正在扫描 JJK NAS Archive" }),
+  ).toBeDisabled();
+  expect(screen.getByRole("button", { name: "正在扫描 Secondary Archive" })).toBeDisabled();
+
+  expect(
+    await screen.findByRole(
+      "button",
+      { name: "选择目录并扫描 Secondary Archive" },
+      { timeout: 2500 },
+    ),
+  ).toBeEnabled();
+  expect(secondaryPolls).toBe(1);
+  await waitFor(() => expect(primaryPolls).toBe(2), { timeout: 2500 });
+  expect(screen.getByText(/正在进行稳定性复检/)).toBeVisible();
+  expect(
+    screen.getByRole("button", { name: "正在扫描 JJK NAS Archive" }),
+  ).toBeDisabled();
+}, 7000);
+
+it("clears an active scan when polling reports it missing", async () => {
+  server.use(
+    http.get("/api/v1/jobs", () => HttpResponse.json([])),
+    http.get("/api/v1/sites", () => HttpResponse.json([SITE])),
+    http.get("/api/v1/sites/site-1/active-scan", () =>
+      HttpResponse.json(scanSnapshot("initial_scan"))),
+    http.get("/api/v1/scans/scan-1", () =>
+      HttpResponse.json({ detail: "scan missing after restart" }, { status: 404 })),
+  );
+  renderApp("/jobs");
+
+  expect(
+    await screen.findByRole("button", { name: "正在扫描 JJK NAS Archive" }),
+  ).toBeDisabled();
+  expect(
+    await screen.findByRole(
+      "button",
+      { name: "选择目录并扫描 JJK NAS Archive" },
+      { timeout: 2500 },
+    ),
+  ).toBeEnabled();
+  expect(screen.getByRole("alert")).toHaveTextContent(
+    "扫描因服务重启而中断，请重新扫描",
+  );
+  expect(sessionStorage.getItem(ACTIVE_SCAN_STORAGE_KEY)).toBeNull();
+});
+
+it("allows only one POST while the first scan request is pending", async () => {
+  let posts = 0;
+  let releasePost: (() => void) | undefined;
+  useJobsHandlers();
+  server.use(
+    http.post("/api/v1/sites/site-1/scan", () => {
+      posts += 1;
+      return new Promise((resolve) => {
+        releasePost = () => resolve(HttpResponse.json(
+          scanSnapshot("initial_scan"),
+          { status: 202 },
+        ));
+      });
+    }),
+  );
+  renderApp("/jobs");
+
+  await userEvent.click(
+    await screen.findByRole("button", {
+      name: "选择目录并扫描 JJK NAS Archive",
+    }),
+  );
+  await userEvent.click(await screen.findByRole("button", { name: "jjk20240608" }));
+  await userEvent.click(screen.getByRole("button", { name: "选择当前目录" }));
+  const start = screen.getByRole("button", { name: "开始扫描" });
+  await userEvent.click(start);
+  await waitFor(() => expect(posts).toBe(1));
+  expect(start).toBeDisabled();
+  await userEvent.click(start);
+  expect(posts).toBe(1);
+
+  await act(async () => {
+    releasePost?.();
+  });
+  expect(
+    await screen.findByRole("button", { name: "正在扫描 JJK NAS Archive" }),
+  ).toBeDisabled();
+  expect(posts).toBe(1);
+});

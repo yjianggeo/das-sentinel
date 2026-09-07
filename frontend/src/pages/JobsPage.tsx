@@ -38,8 +38,9 @@ function rememberActiveScan(siteId: string, scanId: string): void {
   );
 }
 
-function forgetActiveScan(siteId: string): void {
+function forgetActiveScan(siteId: string, expectedScanId?: string): void {
   const saved = savedScanIds();
+  if (expectedScanId !== undefined && saved[siteId] !== expectedScanId) return;
   delete saved[siteId];
   if (Object.keys(saved).length === 0) {
     sessionStorage.removeItem(ACTIVE_SCAN_STORAGE_KEY);
@@ -59,6 +60,7 @@ export default function JobsPage() {
   const mounted = useRef(true);
   const requestControllers = useRef(new Set<AbortController>());
   const startingSiteIdsRef = useRef(new Set<string>());
+  const siteScanGenerations = useRef<Record<string, number>>({});
 
   const requestController = useCallback(() => {
     const controller = new AbortController();
@@ -97,47 +99,65 @@ export default function JobsPage() {
         if (controller.signal.aborted) return;
         setSites(loadedSites);
         const saved = savedScanIds();
-        const restored: Record<string, ScanStatus> = {};
-        await Promise.all(loadedSites.map(async (site) => {
-          const active = await api.get<ScanStatus | null>(
-            `/api/v1/sites/${site.id}/active-scan`,
-            undefined,
-            controller.signal,
+        await Promise.allSettled(loadedSites.map(async (site) => {
+          const generation = siteScanGenerations.current[site.id] ?? 0;
+          const isCurrent = () => (
+            !controller.signal.aborted
+            && (siteScanGenerations.current[site.id] ?? 0) === generation
           );
-          if (active !== null) {
-            restored[site.id] = active;
-            rememberActiveScan(site.id, active.id);
-            return;
-          }
-          const savedId = saved[site.id];
-          if (savedId === undefined) return;
           try {
-            const prior = await api.get<ScanStatus>(
-              `/api/v1/scans/${savedId}`,
+            const active = await api.get<ScanStatus | null>(
+              `/api/v1/sites/${site.id}/active-scan`,
               undefined,
               controller.signal,
             );
-            restored[site.id] = prior;
-            if (isActiveScan(prior)) {
-              rememberActiveScan(site.id, prior.id);
-            } else {
-              forgetActiveScan(site.id);
-              refresh();
-            }
-          } catch (cause: unknown) {
-            if (cause instanceof ApiError && cause.status === 404) {
-              forgetActiveScan(site.id);
-              if (!controller.signal.aborted) {
-                setError("扫描因服务重启而中断，请重新扫描");
-              }
+            if (!isCurrent()) return;
+            if (active !== null) {
+              rememberActiveScan(site.id, active.id);
+              setScans((current) => isCurrent()
+                ? { ...current, [site.id]: active }
+                : current);
               return;
             }
-            throw cause;
+            const savedId = saved[site.id];
+            if (savedId === undefined) return;
+            try {
+              const prior = await api.get<ScanStatus>(
+                `/api/v1/scans/${savedId}`,
+                undefined,
+                controller.signal,
+              );
+              if (!isCurrent()) return;
+              setScans((current) => isCurrent()
+                ? { ...current, [site.id]: prior }
+                : current);
+              if (isActiveScan(prior)) {
+                rememberActiveScan(site.id, prior.id);
+              } else {
+                forgetActiveScan(site.id, savedId);
+                refresh();
+              }
+            } catch (cause: unknown) {
+              if (!isCurrent()) return;
+              if (cause instanceof ApiError && cause.status === 404) {
+                forgetActiveScan(site.id, savedId);
+                setError("扫描因服务重启而中断，请重新扫描");
+                return;
+              }
+              throw cause;
+            }
+          } catch (cause: unknown) {
+            if (controller.signal.aborted) return;
+            if (cause instanceof ApiError && cause.status === 404) {
+              forgetActiveScan(site.id);
+              if (isCurrent()) {
+                setError("扫描因服务重启而中断，请重新扫描");
+              }
+            } else {
+              throw cause;
+            }
           }
         }));
-        if (!controller.signal.aborted) {
-          setScans((current) => ({ ...current, ...restored }));
-        }
       } catch {
         // The jobs table remains usable if site scan controls cannot be loaded.
       } finally {
@@ -160,7 +180,10 @@ export default function JobsPage() {
     let controller: AbortController | null = null;
     const timer = window.setTimeout(() => {
       controller = requestController();
-      Promise.all(
+      const generations = activeScans.map(
+        (scan) => siteScanGenerations.current[scan.site_id] ?? 0,
+      );
+      Promise.allSettled(
         activeScans.map((scan) =>
           api.get<ScanStatus>(
             `/api/v1/scans/${scan.id}`,
@@ -169,22 +192,56 @@ export default function JobsPage() {
           ),
         ),
       )
-        .then((snapshots) => {
+        .then((results) => {
           if (controller?.signal.aborted) return;
-          const terminalSnapshots = snapshots.filter((snapshot) => !isActiveScan(snapshot));
-          for (const snapshot of terminalSnapshots) {
-            forgetActiveScan(snapshot.site_id);
+          const applicableResults = results.flatMap((result, index) => {
+            const polled = activeScans[index];
+            if (
+              (siteScanGenerations.current[polled.site_id] ?? 0) !== generations[index]
+              || scans[polled.site_id]?.id !== polled.id
+            ) {
+              return [];
+            }
+            return [{ generation: generations[index], polled, result }];
+          });
+          let terminalCount = 0;
+          for (const { polled, result } of applicableResults) {
+            if (result.status === "fulfilled" && !isActiveScan(result.value)) {
+              forgetActiveScan(polled.site_id, polled.id);
+              terminalCount += 1;
+            } else if (
+              result.status === "rejected"
+              && result.reason instanceof ApiError
+              && result.reason.status === 404
+            ) {
+              forgetActiveScan(polled.site_id, polled.id);
+              setError("扫描因服务重启而中断，请重新扫描");
+            }
           }
           setScans((current) => {
             const next = { ...current };
-            for (const snapshot of snapshots) {
-              next[snapshot.site_id] = snapshot;
+            let changed = false;
+            applicableResults.forEach(({ generation, polled, result }) => {
+              if (
+                (siteScanGenerations.current[polled.site_id] ?? 0) !== generation
+                || current[polled.site_id]?.id !== polled.id
+              ) {
+                return;
+              }
+              changed = true;
+              if (result.status === "fulfilled") {
+                next[polled.site_id] = result.value;
+              } else if (result.reason instanceof ApiError && result.reason.status === 404) {
+                delete next[polled.site_id];
+              }
+            });
+            if (!changed) {
+              return current;
             }
             return next;
           });
-          if (terminalSnapshots.length > 0) refresh();
+          if (terminalCount > 0) refresh();
         })
-        .catch(() => undefined)
         .finally(() => {
           if (controller !== null) releaseController(controller);
         });
@@ -215,6 +272,8 @@ export default function JobsPage() {
       return;
     }
     startingSiteIdsRef.current.add(site.id);
+    siteScanGenerations.current[site.id] =
+      (siteScanGenerations.current[site.id] ?? 0) + 1;
     setStartingSiteIds((current) => new Set(current).add(site.id));
     const controller = requestController();
     try {
