@@ -81,12 +81,14 @@ def main() -> None:
     app_data = (STACK_DIR / "app-data").resolve()
     raw.mkdir(parents=True)
     app_data.mkdir()
+    selected = raw / "jjk" / "day"
+    selected.mkdir(parents=True)
     write_event_file(
-        raw / "synthetic-earthquake-00.h5",
+        selected / "synthetic-earthquake-00.h5",
         datetime(2026, 7, 26, tzinfo=UTC),
     )
     write_event_file(
-        raw / "synthetic-earthquake-01.h5",
+        selected / "synthetic-earthquake-01.h5",
         datetime(2026, 7, 26, 1, tzinfo=UTC),
     )
 
@@ -145,13 +147,26 @@ def main() -> None:
     client = httpx.Client(base_url=BASE, timeout=30.0)
     login = client.post("/api/v1/session", json={"password": PASSWORD})
     csrf = login.headers["x-csrf-token"]
-    first = client.post(f"/api/v1/sites/{site_id}/scan", json={}, headers={"X-CSRF-Token": csrf})
-    assert first.status_code == 201, first.text
-    print("waiting out the 10 s file-stability window ...", flush=True)
-    time.sleep(11.0)
-    enqueued = client.post(f"/api/v1/sites/{site_id}/scan", json={}, headers={"X-CSRF-Token": csrf})
-    assert enqueued.status_code == 201, enqueued.text
-    print(f"enqueued {len(enqueued.json())} job(s)", flush=True)
+    started = client.post(
+        f"/api/v1/sites/{site_id}/scan",
+        json={"path": "jjk/day"},
+        headers={"X-CSRF-Token": csrf},
+    )
+    assert started.status_code == 202, started.text
+    scan_id = started.json()["id"]
+    print("waiting for the server-owned two-pass scan ...", flush=True)
+    deadline = time.monotonic() + 60.0
+    while time.monotonic() < deadline:
+        response = client.get(f"/api/v1/scans/{scan_id}")
+        assert response.status_code == 200, response.text
+        snapshot = response.json()
+        if snapshot["phase"] in {"completed", "failed"}:
+            break
+        time.sleep(0.1)
+    else:
+        raise RuntimeError(f"scan {scan_id} did not reach a terminal phase")
+    assert snapshot["phase"] == "completed", snapshot
+    print(f"enqueued {snapshot['submitted_files']} job(s)", flush=True)
     jobs_listed = client.get("/api/v1/jobs").json()
     print(f"jobs via API: {len(jobs_listed)}", flush=True)
     assert len(jobs_listed) == 2, jobs_listed

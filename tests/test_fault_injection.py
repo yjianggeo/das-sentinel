@@ -57,9 +57,11 @@ def running_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     engine = create_local_engine(settings.database_url)
     sessions = session_factory(engine)
 
-    corrupt = settings.data_root / "corrupt.h5"
+    selected = settings.data_root / "jjk" / "day"
+    selected.mkdir(parents=True)
+    corrupt = selected / "corrupt.h5"
     write_zd_h5(corrupt, fs=1000.0)
-    valid = settings.data_root / "valid.h5"
+    valid = selected / "valid.h5"
     write_zd_h5(valid, fs=1000.0)
 
     with sessions.begin() as session:
@@ -81,6 +83,7 @@ def running_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr("das_sentinel.api.app.check_database_startup", lambda _: None)
     app = create_app(settings)
+    app.state.scan_coordinator.stable_seconds = 0.01
     server = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=API_PORT, log_level="error")
     )
@@ -98,13 +101,25 @@ def running_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         login = client.post("/api/v1/session", json={"password": PASSWORD})
         csrf = login.headers["x-csrf-token"]
 
-        clock = iter([100.0, 115.0])
-        monkeypatch.setattr("das_sentinel.api.routes.scans.monotonic", lambda: next(clock))
-        client.post(f"/api/v1/sites/{site_id}/scan", json={}, headers={"X-CSRF-Token": csrf})
-        enqueued = client.post(
-            f"/api/v1/sites/{site_id}/scan", json={}, headers={"X-CSRF-Token": csrf}
+        started = client.post(
+            f"/api/v1/sites/{site_id}/scan",
+            json={"path": "jjk/day"},
+            headers={"X-CSRF-Token": csrf},
         )
-        assert len(enqueued.json()) == 2
+        assert started.status_code == 202, started.text
+        scan_id = started.json()["id"]
+        deadline = time.monotonic() + 30.0
+        while time.monotonic() < deadline:
+            response = client.get(f"/api/v1/scans/{scan_id}")
+            assert response.status_code == 200, response.text
+            snapshot = response.json()
+            if snapshot["phase"] in {"completed", "failed"}:
+                break
+            time.sleep(0.05)
+        else:
+            raise AssertionError(f"scan {scan_id} did not reach a terminal phase")
+        assert snapshot["phase"] == "completed", snapshot
+        assert snapshot["submitted_files"] == 2
 
         # Fault injection: the file changes after being fingerprinted and
         # enqueued, so the worker must refuse it and mark the job failed
