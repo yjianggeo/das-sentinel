@@ -407,3 +407,173 @@ def test_waveform_axis_contains_event_and_candidate_exclusive_boundaries(monkeyp
     assert {round(line.get_xdata()[0], 10) for line in axis.lines} >= {round(start, 10), round(end, 10)}
     assert any(round(patch.get_x(), 10) == round(candidate_start, 10) and round(patch.get_x() + patch.get_width(), 10) == round(candidate_end, 10) for patch in axis.patches)
     assert axis.get_xlim()[0] < start and axis.get_xlim()[1] > end
+
+
+def test_time_axes_use_unique_relative_seconds_from_local_integer_reference():
+    """Repeated wall-clock labels or a reference shifted to the first sample must fail."""
+    from das_sentinel.artifacts import _time_axes
+    from matplotlib import dates as mdates
+    from matplotlib import pyplot as plt
+
+    start = datetime(2026, 9, 8, 15, 59, 59, 234_000, tzinfo=UTC)
+    dates = np.array([start + timedelta(seconds=index / 100) for index in range(300)])
+    figures = []
+    axes = []
+    try:
+        for _ in range(2):
+            figure, axis = plt.subplots()
+            _time_axes(axis, dates, "Asia/Shanghai", 100)
+            figure.canvas.draw()
+            figures.append(figure)
+            axes.append(axis)
+
+        labels = [tick.get_text() for tick in axes[0].get_xticklabels() if tick.get_visible()]
+        assert labels
+        assert len(labels) == len(set(labels))
+        assert axes[0].get_xlabel() == "Time relative to reference (s)"
+        assert figures[0].axes[1].get_xlabel() == (
+            "Local reference: 2026-09-08 23:59:59 (Asia/Shanghai)"
+        )
+        assert not figures[0].axes[1].get_xticks().size
+
+        reference = mdates.date2num(datetime(2026, 9, 8, 15, 59, 59, tzinfo=UTC))
+        for tick, label in zip(axes[0].get_xticks(), labels, strict=True):
+            assert float(label) == pytest.approx((tick - reference) * 86_400, abs=2e-6)
+
+        np.testing.assert_array_equal(axes[0].get_xticks(), axes[1].get_xticks())
+        np.testing.assert_array_equal(axes[0].get_xlim(), axes[1].get_xlim())
+    finally:
+        for figure in figures:
+            plt.close(figure)
+
+
+def test_time_axes_keep_subsecond_labels_unique_and_single_sample_bounds_precise():
+    """Coarse labels or Matplotlib's default half-day singleton width must fail."""
+    from das_sentinel.artifacts import _time_axes
+    from matplotlib import dates as mdates
+    from matplotlib import pyplot as plt
+
+    start = datetime(2026, 9, 8, 15, 59, 59, 234_000, tzinfo=UTC)
+    subsecond = np.array([start + timedelta(seconds=index / 100) for index in range(8)])
+    figure, axis = plt.subplots()
+    single_figure, single_axis = plt.subplots()
+    try:
+        _time_axes(axis, subsecond, "Asia/Shanghai", 100)
+        figure.canvas.draw()
+        labels = [tick.get_text() for tick in axis.get_xticklabels() if tick.get_visible()]
+        assert len(labels) == len(set(labels))
+
+        _time_axes(single_axis, np.array([start]), "Asia/Shanghai", 100)
+        single_figure.canvas.draw()
+        left, right = single_axis.get_xlim()
+        assert right - left == pytest.approx(2 / 100 / 86_400, rel=2e-5)
+        assert left == pytest.approx(mdates.date2num(start) - 0.5 / 100 / 86_400)
+    finally:
+        plt.close(figure)
+        plt.close(single_figure)
+
+
+def test_single_sample_waterfall_mesh_uses_sampling_interval_for_time_edges():
+    """Using the generic singleton coordinate width for date coordinates must fail."""
+    from das_sentinel.artifacts import _waterfall_mesh
+    from matplotlib import dates as mdates
+    from matplotlib import pyplot as plt
+
+    figure, axis = plt.subplots()
+    try:
+        time = mdates.date2num(datetime(2026, 9, 8, tzinfo=UTC))
+        mesh = _waterfall_mesh(
+            axis,
+            np.ones((1, 1)),
+            np.array([time]),
+            np.array([12.0]),
+            0.0,
+            1.0,
+            sample_rate_hz=100,
+        )
+        coordinates = mesh.get_coordinates()
+        assert coordinates[0, :, 0].tolist() == pytest.approx(
+            [time - 0.5 / 100 / 86_400, time + 0.5 / 100 / 86_400]
+        )
+        assert coordinates[:, 0, 1].tolist() == [11.5, 12.5]
+    finally:
+        plt.close(figure)
+
+
+def test_public_waveform_renderer_uses_global_offset_and_adds_optional_notes(monkeypatch):
+    """Ignoring the displayed slice offset or either preview note must fail."""
+    from das_sentinel import artifacts
+    from matplotlib import dates as mdates
+    from matplotlib import pyplot as plt
+
+    data = _artifact_data()
+    event = _event()
+    context = artifacts.WaterfallPlotContext(
+        sample_rate_hz=data.sample_rate_hz,
+        site_timezone=data.site_timezone,
+        profile_version=data.profile_version,
+        pipeline_version=data.pipeline_version,
+        model_version=data.model_version,
+        filter=data.waterfall_filter,
+    )
+    dates = np.array([data.start_time_utc + timedelta(seconds=index / 100) for index in range(100)])
+    captured = {}
+
+    def capture(figure):
+        captured["axis"] = figure.axes[0]
+        plt.close(figure)
+        return b"png"
+
+    monkeypatch.setattr(artifacts, "_png", capture)
+    assert artifacts.render_waveform_png(
+        np.zeros(100),
+        dates,
+        context,
+        event,
+        sample_offset=1_000,
+        window_note="window=1.00 s",
+        distance_note="distance=2–8 m",
+    ) == b"png"
+
+    axis = captured["axis"]
+    event_start = mdates.date2num(data.start_time_utc + timedelta(seconds=0.2))
+    assert any(line.get_xdata()[0] == pytest.approx(event_start) for line in axis.lines[1:])
+    assert "samples 1000:1100" in axis.get_title()
+    assert "window=1.00 s" in axis.get_title()
+    assert "distance=2–8 m" in axis.get_title()
+
+
+def test_waterfall_renderer_adds_window_note_without_changing_filter_title(monkeypatch):
+    """Dropping the shared-window annotation or rewriting filter provenance must fail."""
+    from das_sentinel import artifacts
+    from matplotlib import pyplot as plt
+
+    data = _artifact_data()
+    context = artifacts.WaterfallPlotContext(
+        sample_rate_hz=data.sample_rate_hz,
+        site_timezone=data.site_timezone,
+        profile_version=data.profile_version,
+        pipeline_version=data.pipeline_version,
+        model_version=data.model_version,
+        filter=data.waterfall_filter,
+    )
+    captured = {}
+
+    def capture(figure):
+        captured["axis"] = figure.axes[0]
+        plt.close(figure)
+        return b"png"
+
+    monkeypatch.setattr(artifacts, "_png", capture)
+    assert artifacts.render_waterfall_png(
+        np.ones((2, 2)),
+        np.array([data.start_time_utc, data.start_time_utc + timedelta(seconds=0.01)]),
+        np.array([2.0, 8.0]),
+        context,
+        filtered=True,
+        window_note="window=0.02 s",
+        distance_note="distance=2–8 m",
+    ) == b"png"
+    assert captured["axis"].get_title() == (
+        f"{artifacts.filtered_waterfall_title(context)} | window=0.02 s | distance=2–8 m"
+    )

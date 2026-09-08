@@ -3,6 +3,7 @@ from __future__ import annotations
 import errno
 import hashlib
 import json
+import math
 import os
 import stat
 import tempfile
@@ -24,6 +25,7 @@ matplotlib.use("Agg")
 
 from matplotlib import dates as mdates
 from matplotlib import pyplot as plt
+from matplotlib import ticker as mticker
 from scipy.signal import stft, welch
 
 from das_sentinel.domain import EventRecord
@@ -343,12 +345,34 @@ def _time_axes(axis: Any, dates: np.ndarray, timezone: str, sample_rate_hz: floa
     utc_numbers = mdates.date2num(dates)
     step = 1 / sample_rate_hz / 86_400
     axis.set_xlim(utc_numbers[0] - step / 2, utc_numbers[-1] + 1.5 * step)
-    axis.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S", tz=UTC))
-    axis.set_xlabel("UTC time")
+    local_timezone = ZoneInfo(timezone)
+    reference_local = dates[0].astimezone(local_timezone).replace(microsecond=0)
+    reference = mdates.date2num(reference_local)
+    relative_limits = [(value - reference) * 86_400 for value in axis.get_xlim()]
+    locator = mticker.MaxNLocator(nbins=8, min_n_ticks=2)
+    relative_ticks = locator.tick_values(*relative_limits)
+    relative_ticks = relative_ticks[
+        (relative_ticks >= relative_limits[0]) & (relative_ticks <= relative_limits[1])
+    ]
+    tick_spacing = min(np.diff(relative_ticks), default=relative_limits[1] - relative_limits[0])
+    precision = max(0, math.ceil(-math.log10(tick_spacing)) + 1)
+    absolute_ticks = reference + relative_ticks / 86_400
+
+    def relative_seconds(value: float, _position: int | None = None) -> str:
+        seconds = (value - reference) * 86_400
+        if abs(seconds) < 0.5 * 10**-precision:
+            seconds = 0.0
+        return f"{seconds:.{precision}f}"
+
+    axis.xaxis.set_major_locator(mticker.FixedLocator(absolute_ticks))
+    axis.xaxis.set_major_formatter(mticker.FuncFormatter(relative_seconds))
+    axis.set_xlabel("Time relative to reference (s)")
     local = axis.twiny()
     local.set_xlim(axis.get_xlim())
-    local.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M:%S", tz=ZoneInfo(timezone)))
-    local.set_xlabel(f"Station local time ({timezone})")
+    local.set_xticks([])
+    local.set_xlabel(
+        f"Local reference: {reference_local:%Y-%m-%d %H:%M:%S} ({timezone})"
+    )
 
 
 def _png(figure: Any) -> bytes:
@@ -392,11 +416,20 @@ def render_waterfall_png(
     context: WaterfallPlotContext,
     *,
     filtered: bool,
+    window_note: str | None = None,
     distance_note: str | None = None,
 ) -> bytes:
     figure, axis = plt.subplots(figsize=(9, 4))
     low, high = _robust_limits(values)
-    image = _waterfall_mesh(axis, values, mdates.date2num(dates), distances, low, high)
+    image = _waterfall_mesh(
+        axis,
+        values,
+        mdates.date2num(dates),
+        distances,
+        low,
+        high,
+        sample_rate_hz=context.sample_rate_hz,
+    )
     figure.colorbar(image, ax=axis, label="Amplitude")
     axis.set_ylabel("Distance (m)")
     title = (
@@ -406,20 +439,39 @@ def render_waterfall_png(
         f"profile={context.profile_version} pipeline={context.pipeline_version} "
         f"model={context.model_version} | {_frequency(context.sample_rate_hz)} Hz | input unit"
     )
-    axis.set_title(title if distance_note is None else f"{title} | {distance_note}")
+    notes = [note for note in (window_note, distance_note) if note is not None]
+    axis.set_title(" | ".join((title, *notes)))
     _time_axes(axis, dates, context.site_timezone, context.sample_rate_hz)
     return _png(figure)
 
 
-def _coordinate_edges(values: np.ndarray) -> np.ndarray:
+def _coordinate_edges(values: np.ndarray, *, singleton_width: float = 1.0) -> np.ndarray:
     if len(values) == 1:
-        return np.array([values[0] - 0.5, values[0] + 0.5])
+        return np.array([values[0] - singleton_width / 2, values[0] + singleton_width / 2])
     middle = (values[:-1] + values[1:]) / 2
     return np.concatenate(([values[0] - (middle[0] - values[0])], middle, [values[-1] + (values[-1] - middle[-1])]))
 
 
-def _waterfall_mesh(axis: Any, values: np.ndarray, times: np.ndarray, distances: np.ndarray, low: float, high: float) -> Any:
-    return axis.pcolormesh(_coordinate_edges(times), _coordinate_edges(distances), values.T, shading="flat", vmin=low, vmax=high, cmap="viridis")
+def _waterfall_mesh(
+    axis: Any,
+    values: np.ndarray,
+    times: np.ndarray,
+    distances: np.ndarray,
+    low: float,
+    high: float,
+    *,
+    sample_rate_hz: float | None = None,
+) -> Any:
+    time_width = 1.0 if sample_rate_hz is None else 1 / sample_rate_hz / 86_400
+    return axis.pcolormesh(
+        _coordinate_edges(times, singleton_width=time_width),
+        _coordinate_edges(distances),
+        values.T,
+        shading="flat",
+        vmin=low,
+        vmax=high,
+        cmap="viridis",
+    )
 
 
 def _representative_beam(values: np.ndarray) -> np.ndarray:
@@ -428,19 +480,52 @@ def _representative_beam(values: np.ndarray) -> np.ndarray:
     return np.where(np.isfinite(beam), beam, 0.0)
 
 
-def _waveform_png(values: np.ndarray, dates: np.ndarray, data: EventArtifactData, event: EventRecord, samples: slice) -> bytes:
+def render_waveform_png(
+    values: np.ndarray,
+    dates: np.ndarray,
+    context: WaterfallPlotContext,
+    event: EventRecord,
+    *,
+    sample_offset: int,
+    window_note: str | None = None,
+    distance_note: str | None = None,
+) -> bytes:
     figure, axis = plt.subplots(figsize=(9, 3))
     axis.plot(mdates.date2num(dates), values, linewidth=0.8)
     axis.set_ylabel("Filtered amplitude")
     for sample, label in ((event.start_sample, "event start"), (event.end_sample, "event end"), (event.peak_sample, "event peak")):
-        axis.axvline(mdates.date2num(data.start_time_utc + timedelta(seconds=(sample - data.sample_offset) / data.sample_rate_hz)), label=label, linewidth=0.8)
+        axis.axvline(mdates.date2num(dates[0] + timedelta(seconds=(sample - sample_offset) / context.sample_rate_hz)), label=label, linewidth=0.8)
     for candidate in event.evidence:
-        axis.axvspan(mdates.date2num(data.start_time_utc + timedelta(seconds=(candidate.start_sample - data.sample_offset) / data.sample_rate_hz)), mdates.date2num(data.start_time_utc + timedelta(seconds=(candidate.end_sample - data.sample_offset) / data.sample_rate_hz)), alpha=0.1, label=f"{candidate.detector} span")
-        axis.axvline(mdates.date2num(data.start_time_utc + timedelta(seconds=(candidate.peak_sample - data.sample_offset) / data.sample_rate_hz)), label=f"{candidate.detector} peak", linestyle="--", linewidth=0.7)
+        axis.axvspan(mdates.date2num(dates[0] + timedelta(seconds=(candidate.start_sample - sample_offset) / context.sample_rate_hz)), mdates.date2num(dates[0] + timedelta(seconds=(candidate.end_sample - sample_offset) / context.sample_rate_hz)), alpha=0.1, label=f"{candidate.detector} span")
+        axis.axvline(mdates.date2num(dates[0] + timedelta(seconds=(candidate.peak_sample - sample_offset) / context.sample_rate_hz)), label=f"{candidate.detector} peak", linestyle="--", linewidth=0.7)
     axis.legend(fontsize="x-small")
-    axis.set_title(f"Robust filtered good-channel beam | {_versions(data)} | samples {data.sample_offset + samples.start}:{data.sample_offset + samples.stop}")
-    _time_axes(axis, dates, data.site_timezone, data.sample_rate_hz)
+    title = (
+        "Robust filtered good-channel beam | "
+        f"profile={context.profile_version} pipeline={context.pipeline_version} "
+        f"model={context.model_version} | samples {sample_offset}:{sample_offset + len(values)}"
+    )
+    notes = [note for note in (window_note, distance_note) if note is not None]
+    axis.set_title(" | ".join((title, *notes)))
+    _time_axes(axis, dates, context.site_timezone, context.sample_rate_hz)
     return _png(figure)
+
+
+def _waveform_png(values: np.ndarray, dates: np.ndarray, data: EventArtifactData, event: EventRecord, samples: slice) -> bytes:
+    context = WaterfallPlotContext(
+        sample_rate_hz=data.sample_rate_hz,
+        site_timezone=data.site_timezone,
+        profile_version=data.profile_version,
+        pipeline_version=data.pipeline_version,
+        model_version=data.model_version,
+        filter=data.waterfall_filter,
+    )
+    return render_waveform_png(
+        values,
+        dates,
+        context,
+        event,
+        sample_offset=data.sample_offset + samples.start,
+    )
 
 
 def _psd_png(values: np.ndarray, data: EventArtifactData, features: Mapping[str, Any]) -> bytes:
