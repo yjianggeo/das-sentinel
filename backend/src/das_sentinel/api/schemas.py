@@ -38,11 +38,15 @@ class WaterfallOptionsResponse(StrictSchema):
 
 
 class WaterfallPreviewRequest(StrictSchema):
-    distance_start_m: FiniteFloat
-    distance_stop_m: FiniteFloat
+    distance_start_m: Annotated[FiniteFloat, Field(strict=True)] | None = None
+    distance_stop_m: Annotated[FiniteFloat, Field(strict=True)] | None = None
 
     @model_validator(mode="after")
     def validate_order(self) -> WaterfallPreviewRequest:
+        if not self.model_fields_set:
+            return self
+        if self.distance_start_m is None or self.distance_stop_m is None:
+            raise ValueError("both distance bounds must be supplied for a manual range")
         if self.distance_stop_m <= self.distance_start_m:
             raise ValueError("distance_stop_m must exceed distance_start_m")
         return self
@@ -58,6 +62,7 @@ class WaterfallPreviewResponse(StrictSchema):
     filter_high_hz: FiniteFloat = Field(gt=0)
     raw_png_base64: str = Field(min_length=8, max_length=16 * 1024 * 1024)
     filtered_png_base64: str = Field(min_length=8, max_length=16 * 1024 * 1024)
+    waveform_png_base64: str = Field(min_length=8, max_length=16 * 1024 * 1024)
 
 
 WorkerId = Annotated[

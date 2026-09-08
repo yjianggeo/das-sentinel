@@ -8,9 +8,13 @@ from pathlib import Path
 import numpy as np
 from sqlalchemy.orm import Session
 
-from das_sentinel.artifacts import WaterfallPlotContext, render_waterfall_png
+from das_sentinel.artifacts import (
+    WaterfallPlotContext,
+    render_waterfall_png,
+    render_waveform_png,
+)
 from das_sentinel.config import ProcessingProfile
-from das_sentinel.domain import Candidate, DasMetadata
+from das_sentinel.domain import Candidate, DasMetadata, EventRecord
 from das_sentinel.persistence.models import (
     Event,
     ModelVersion,
@@ -19,6 +23,7 @@ from das_sentinel.persistence.models import (
     SourceFile,
 )
 from das_sentinel.persistence.models import ProcessingProfile as ProfileRow
+from das_sentinel.plot_windows import event_display_window
 from das_sentinel.readers.zd_hdf5 import ZdHdf5Reader
 from das_sentinel.services.discovery import fingerprint
 from das_sentinel.signal.backend import select_backend
@@ -59,6 +64,7 @@ class WaterfallPreview:
     filter: WaterfallFilter
     raw_png: bytes
     filtered_png: bytes
+    waveform_png: bytes
 
 
 @dataclass(frozen=True)
@@ -99,22 +105,32 @@ class WaterfallPreviewService:
         self,
         session: Session,
         event_id: str,
-        start_m: float,
-        stop_m: float,
+        start_m: float | None = None,
+        stop_m: float | None = None,
     ) -> WaterfallPreview:
         binding = self._binding(session, event_id)
         metadata = self._metadata(binding)
         sample_count = self._sample_count(binding)
         self._validate_event_binding(binding, metadata, sample_count)
-        available_start = float(np.min(metadata.channel_distance_m))
-        available_stop = float(np.max(metadata.channel_distance_m))
-        self._validate_range(start_m, stop_m, available_start, available_stop)
+        automatic = start_m is None and stop_m is None
+        if not automatic:
+            if start_m is None or stop_m is None:
+                raise WaterfallPreviewRangeError("both distance bounds must be supplied")
+            available_start = float(np.min(metadata.channel_distance_m))
+            available_stop = float(np.max(metadata.channel_distance_m))
+            self._validate_range(start_m, stop_m, available_start, available_stop)
         try:
-            read_slice = channel_slice_for_distance(
-                metadata.channel_distance_m, start_m, stop_m
+            read_slice = (
+                slice(binding.event.channel_start, binding.event.channel_stop)
+                if automatic
+                else channel_slice_for_distance(metadata.channel_distance_m, start_m, stop_m)
             )
-            sample_start, sample_stop = self._preview_window(
-                binding, metadata.sample_rate_hz, sample_count
+            sample_start, sample_stop = event_display_window(
+                binding.event.start_sample,
+                binding.event.end_sample,
+                sample_count,
+                binding.profile.artifact_pad_seconds,
+                metadata.sample_rate_hz,
             )
             self._validate_read_bounds(sample_start, sample_stop, read_slice)
         except ValueError as error:
@@ -138,12 +154,17 @@ class WaterfallPreviewService:
         except ValueError as error:
             raise WaterfallPreviewConflict("event binding is inconsistent") from error
         try:
-            indices = usable_channel_indices(
-                block.metadata.channel_distance_m,
-                filtered.bad_channel_mask,
-                start_m,
-                stop_m,
-            )
+            if automatic:
+                indices = np.flatnonzero(~np.asarray(filtered.bad_channel_mask, dtype=bool))
+                if indices.size == 0:
+                    raise ValueError("event range has no usable channels")
+            else:
+                indices = usable_channel_indices(
+                    block.metadata.channel_distance_m,
+                    filtered.bad_channel_mask,
+                    start_m,
+                    stop_m,
+                )
         except ValueError as error:
             raise WaterfallPreviewRangeError("requested range is not previewable") from error
         dates = np.array(
@@ -164,7 +185,26 @@ class WaterfallPreviewService:
         distances = block.metadata.channel_distance_m[indices]
         actual_start_m = float(np.min(distances))
         actual_stop_m = float(np.max(distances))
-        note = f"Artificial Distance {actual_start_m:g}–{actual_stop_m:g} m"
+        distance_mode = "Automatic event range" if automatic else "Artificial Distance"
+        note = f"{distance_mode} {actual_start_m:g}–{actual_stop_m:g} m"
+        window_note = (
+            f"Display samples {sample_start}:{sample_stop} | "
+            f"duration {(sample_stop - sample_start) / metadata.sample_rate_hz:g} s"
+        )
+        if sample_count / metadata.sample_rate_hz < 3:
+            window_note += " | Source shorter than 3 s; showing actual duration"
+        event = EventRecord(
+            event_id=binding.event.id,
+            start_sample=binding.event.start_sample,
+            end_sample=binding.event.end_sample,
+            peak_sample=min(
+                binding.candidates, key=lambda candidate: (-candidate.score, candidate.peak_sample)
+            ).peak_sample,
+            channel_start=binding.event.channel_start,
+            channel_stop=binding.event.channel_stop,
+            evidence=binding.candidates,
+        )
+        selected_filtered = np.asarray(filtered.data)[:, indices]
         try:
             raw_png = render_waterfall_png(
                 block.data[:, indices],
@@ -172,14 +212,25 @@ class WaterfallPreviewService:
                 distances,
                 context,
                 filtered=False,
+                window_note=window_note,
                 distance_note=note,
             )
             filtered_png = render_waterfall_png(
-                np.asarray(filtered.data)[:, indices],
+                selected_filtered,
                 dates,
                 distances,
                 context,
                 filtered=True,
+                window_note=window_note,
+                distance_note=note,
+            )
+            waveform_png = render_waveform_png(
+                np.median(selected_filtered, axis=1),
+                dates,
+                context,
+                event,
+                sample_offset=block.sample_offset,
+                window_note=window_note,
                 distance_note=note,
             )
         except (ValueError, OSError) as error:
@@ -192,6 +243,7 @@ class WaterfallPreviewService:
             filter=binding.filter,
             raw_png=raw_png,
             filtered_png=filtered_png,
+            waveform_png=waveform_png,
         )
 
     def _binding(self, session: Session, event_id: str) -> _Binding:
@@ -327,17 +379,6 @@ class WaterfallPreviewService:
             raise WaterfallPreviewRangeError("distance_stop_m must exceed distance_start_m")
         if start_m < automatic_start or stop_m > automatic_stop:
             raise WaterfallPreviewRangeError("distance range must remain within the source")
-
-    @staticmethod
-    def _preview_window(
-        binding: _Binding, sample_rate_hz: float, sample_count: int
-    ) -> tuple[int, int]:
-        padding = max(0, round(binding.profile.artifact_pad_seconds * sample_rate_hz))
-        start = max(0, binding.event.start_sample - padding)
-        stop = min(sample_count, binding.event.end_sample + padding)
-        if start >= stop:
-            raise ValueError("event window does not overlap source")
-        return start, stop
 
     @staticmethod
     def _validate_fused_event(

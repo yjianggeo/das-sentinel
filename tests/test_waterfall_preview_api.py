@@ -13,7 +13,7 @@ import pytest
 from argon2 import PasswordHasher
 from das_sentinel.api import create_app
 from das_sentinel.config import ProcessingProfile, Settings
-from das_sentinel.domain import DasBlock
+from das_sentinel.domain import DasBlock, EventRecord
 from das_sentinel.persistence import (
     Repositories,
     create_local_engine,
@@ -29,7 +29,7 @@ from das_sentinel.persistence.models import (
 from das_sentinel.services.discovery import fingerprint
 from das_sentinel.services.waterfall_previews import WaterfallPreviewService
 from fastapi.testclient import TestClient
-from sqlalchemy import func, select
+from sqlalchemy import select
 
 PASSWORD = "correct horse"
 
@@ -50,9 +50,8 @@ def _settings(tmp_path: Path) -> Settings:
     )
 
 
-def _write_source(path: Path) -> None:
+def _write_source(path: Path, sample_count: int = 200) -> None:
     sample_rate_hz = 100.0
-    sample_count = 200
     samples = np.arange(sample_count, dtype=np.float32) / sample_rate_hz
     channels = np.arange(5, dtype=np.float32)
     data = np.sin(2 * np.pi * 8 * samples[:, None] + channels[None, :])
@@ -234,7 +233,10 @@ def test_waterfall_options_reject_conflicted_source_without_disclosing_path(
     assert str(outside) not in response.text
 
 
-def test_waterfall_preview_returns_two_pngs_after_one_read_without_writes(waterfall_api):
+@pytest.mark.parametrize("automatic", [False, True])
+def test_waterfall_preview_returns_three_pngs_after_one_read_without_writes(
+    waterfall_api, automatic: bool
+):
     client, settings, sessions, csrf_token, ids, _ = waterfall_api
     service = client.app.state.waterfall_preview_service
     original_reader = service.reader
@@ -255,9 +257,17 @@ def test_waterfall_preview_returns_two_pngs_after_one_read_without_writes(waterf
 
     counting_reader = CountingReader()
     service.reader = counting_reader
+    original_artifact = settings.app_data_dir / "waveform.png"
+    original_artifact.write_bytes(b"registered original waveform")
+    with sessions.begin() as session:
+        Repositories(session).artifacts.add(
+            event_id=ids["event"], kind="waveform", path=str(original_artifact),
+            media_type="image/png",
+            sha256=hashlib.sha256(original_artifact.read_bytes()).hexdigest(),
+        )
     with sessions() as session:
         before_rows = {
-            table.name: session.scalar(select(func.count()).select_from(table))
+            table.name: session.execute(select(table)).all()
             for table in Base.metadata.sorted_tables
         }
     before_data_root = _tree_snapshot(settings.data_root)
@@ -265,10 +275,11 @@ def test_waterfall_preview_returns_two_pngs_after_one_read_without_writes(waterf
         path.relative_to(settings.app_data_dir).as_posix()
         for path in settings.app_data_dir.rglob("*")
     )
+    before_artifact_bytes = original_artifact.read_bytes()
 
     response = client.post(
         f"/api/v1/events/{ids['event']}/waterfall-preview",
-        json={"distance_start_m": 12.0, "distance_stop_m": 20.0},
+        json={} if automatic else {"distance_start_m": 12.0, "distance_stop_m": 20.0},
         headers={"X-CSRF-Token": csrf_token},
     )
 
@@ -276,14 +287,16 @@ def test_waterfall_preview_returns_two_pngs_after_one_read_without_writes(waterf
     body = response.json()
     assert base64.b64decode(body["raw_png_base64"]).startswith(b"\x89PNG\r\n\x1a\n")
     assert base64.b64decode(body["filtered_png_base64"]).startswith(b"\x89PNG\r\n\x1a\n")
+    assert base64.b64decode(body["waveform_png_base64"]).startswith(b"\x89PNG\r\n\x1a\n")
     assert body["channel_count"] == 2
     assert counting_reader.read_block_calls == 1
     with sessions() as session:
         assert before_rows == {
-            table.name: session.scalar(select(func.count()).select_from(table))
+            table.name: session.execute(select(table)).all()
             for table in Base.metadata.sorted_tables
         }
     assert before_data_root == _tree_snapshot(settings.data_root)
+    assert original_artifact.read_bytes() == before_artifact_bytes
     assert before_artifacts == sorted(
         path.relative_to(settings.app_data_dir).as_posix()
         for path in settings.app_data_dir.rglob("*")
@@ -345,9 +358,9 @@ def test_waterfall_preview_reports_actual_usable_distance_extrema(
 
 @pytest.mark.parametrize(
     ("event_bounds", "expected_read_bounds"),
-    [((2, 10), (0, 15)), ((190, 198), (185, 200))],
+    [((2, 10), (0, 200)), ((190, 198), (0, 200))],
 )
-def test_waterfall_preview_reads_profile_padded_window_clamped_to_source_edges(
+def test_waterfall_preview_reads_full_short_source_at_both_event_edges(
     waterfall_api,
     monkeypatch: pytest.MonkeyPatch,
     event_bounds,
@@ -433,13 +446,30 @@ def test_waterfall_preview_rechecks_fingerprint_after_render(
     client, _, _, csrf_token, ids, source_path = waterfall_api
     expected = fingerprint(source_path)
     calls = 0
+    rendered = []
+    original_waterfall = previews.render_waterfall_png
+    original_waveform = previews.render_waveform_png
+
+    def waterfall(*args, **kwargs):
+        result = original_waterfall(*args, **kwargs)
+        rendered.append("filtered" if kwargs["filtered"] else "raw")
+        return result
+
+    def waveform(*args, **kwargs):
+        result = original_waveform(*args, **kwargs)
+        rendered.append("waveform")
+        return result
 
     def changed_after_initial_check(path: Path) -> str:
         nonlocal calls
         calls += 1
+        if calls > 1:
+            assert rendered == ["raw", "filtered", "waveform"]
         return expected if calls == 1 else "0" * 64
 
     monkeypatch.setattr(previews, "fingerprint", changed_after_initial_check)
+    monkeypatch.setattr(previews, "render_waterfall_png", waterfall)
+    monkeypatch.setattr(previews, "render_waveform_png", waveform)
     response = client.post(
         f"/api/v1/events/{ids['event']}/waterfall-preview",
         json={"distance_start_m": 12.0, "distance_stop_m": 20.0},
@@ -478,7 +508,8 @@ def test_waterfall_preview_controls_read_block_io_errors(
     assert str(source_path) not in response.text
 
 
-def test_waterfall_preview_rejects_oversized_window_before_read(waterfall_api):
+@pytest.mark.parametrize("automatic", [False, True])
+def test_waterfall_preview_rejects_oversized_window_before_read(waterfall_api, automatic):
     client, _, _, csrf_token, ids, _ = waterfall_api
     service = client.app.state.waterfall_preview_service
     reader = service.reader
@@ -502,7 +533,7 @@ def test_waterfall_preview_rejects_oversized_window_before_read(waterfall_api):
     service._binding = padded_binding
     response = client.post(
         f"/api/v1/events/{ids['event']}/waterfall-preview",
-        json={"distance_start_m": 12.0, "distance_stop_m": 20.0},
+        json={} if automatic else {"distance_start_m": 12.0, "distance_stop_m": 20.0},
         headers={"X-CSRF-Token": csrf_token},
     )
 
@@ -636,8 +667,9 @@ def test_waterfall_preview_uses_bound_model_version_in_plot_provenance(
     assert observed == ["model-7.2", "model-7.2"]
 
 
+@pytest.mark.parametrize("automatic", [False, True])
 def test_waterfall_preview_rejects_oversized_channel_read_before_read(
-    waterfall_api, monkeypatch: pytest.MonkeyPatch
+    waterfall_api, monkeypatch: pytest.MonkeyPatch, automatic
 ):
     client, _, sessions, csrf_token, ids, _ = waterfall_api
     reader = client.app.state.waterfall_preview_service.reader
@@ -661,7 +693,9 @@ def test_waterfall_preview_rejects_oversized_channel_read_before_read(
 
     def wide_metadata(path):
         metadata = original_metadata(path)
-        return replace(metadata, channel_distance_m=np.arange(257, dtype=float))
+        distances = np.full(257, 100.0)
+        distances[0], distances[-1] = 0.0, 1.0
+        return replace(metadata, channel_distance_m=distances)
 
     def count_read_block(path, start, stop, channels):
         nonlocal calls
@@ -672,12 +706,270 @@ def test_waterfall_preview_rejects_oversized_channel_read_before_read(
     monkeypatch.setattr(reader, "read_block", count_read_block)
     response = client.post(
         f"/api/v1/events/{ids['event']}/waterfall-preview",
-        json={"distance_start_m": 0.0, "distance_stop_m": 256.0},
+        json={} if automatic else {"distance_start_m": 0.0, "distance_stop_m": 1.0},
         headers={"X-CSRF-Token": csrf_token},
     )
 
     assert response.status_code == 422
     assert calls == 0
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"distance_start_m": 12.0}, {"distance_stop_m": 20.0},
+        {"distance_start_m": None}, {"distance_stop_m": None},
+        {"distance_start_m": None, "distance_stop_m": None},
+        {"distance_start_m": None, "distance_stop_m": 20.0},
+        {"distance_start_m": 12.0, "distance_stop_m": None},
+        {"distance_start_m": "12", "distance_stop_m": 20.0},
+        {"distance_start_m": True, "distance_stop_m": 20.0},
+    ],
+)
+def test_waterfall_preview_rejects_partial_null_or_nonnumeric_range(waterfall_api, payload):
+    client, _, _, csrf_token, ids, _ = waterfall_api
+    response = client.post(
+        f"/api/v1/events/{ids['event']}/waterfall-preview", json=payload,
+        headers={"X-CSRF-Token": csrf_token},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize(
+    ("source_count", "bounds", "pad", "expected", "short"),
+    [
+        (200, (20, 40), 0.05, (0, 200), True),
+        (1000, (2, 10), 0.05, (0, 300), False),
+        (1000, (990, 998), 0.05, (700, 1000), False),
+        (1000, (450, 470), 0.05, (310, 610), False),
+        (1000, (450, 470), 2.0, (250, 670), False),
+    ],
+)
+def test_preview_three_plots_share_real_window_median_and_absolute_markers(
+    waterfall_api, monkeypatch, source_count, bounds, pad, expected, short
+):
+    import das_sentinel.services.waterfall_previews as previews
+    import matplotlib.dates as mdates
+    from das_sentinel import artifacts
+
+    client, _, sessions, csrf_token, ids, source_path = waterfall_api
+    _write_source(source_path, source_count)
+    with sessions.begin() as session:
+        event = session.get(Event, ids["event"])
+        event.start_sample, event.end_sample = bounds
+        event.occurred_at = datetime(2026, 7, 26, tzinfo=UTC) + timedelta(seconds=bounds[0] / 100)
+        run = session.get(ProcessingRun, event.processing_run_id)
+        source = session.get(SourceFile, ids["source"])
+        source.fingerprint = run.source_fingerprint = fingerprint(source_path)
+        payload = json.loads(event.evidence[0].payload_json)
+        payload.update(start_sample=bounds[0], end_sample=bounds[1], peak_sample=bounds[0] + 3)
+        event.evidence[0].payload_json = json.dumps(payload)
+        event.evidence[0].score = 0.5
+        for peak in (bounds[0] + 5, bounds[0] + 4):
+            Repositories(session).events.add_evidence(
+                event.id, detector="stalta", score=0.95,
+                payload={**payload, "peak_sample": peak},
+            )
+    service = client.app.state.waterfall_preview_service
+    original_binding = service._binding
+    original_read = service.reader.read_block
+    original_preprocess = previews.preprocess_for_waterfall
+    original_png = artifacts._png
+    read_bounds, processed, figures = [], [], []
+
+    def padded_binding(session, event_id):
+        binding = original_binding(session, event_id)
+        return replace(binding, profile=binding.profile.model_copy(update={"artifact_pad_seconds": pad}))
+
+    def capture_read(path, start, stop, channels):
+        read_bounds.append((start, stop, channels))
+        return original_read(path, start, stop, channels)
+
+    def capture_preprocess(*args):
+        result = original_preprocess(*args)
+        processed.append(result)
+        return result
+
+    def capture_png(figure):
+        figures.append(figure)
+        return original_png(figure)
+
+    monkeypatch.setattr(service, "_binding", padded_binding)
+    monkeypatch.setattr(service.reader, "read_block", capture_read)
+    monkeypatch.setattr(previews, "preprocess_for_waterfall", capture_preprocess)
+    monkeypatch.setattr(artifacts, "_png", capture_png)
+    response = client.post(
+        f"/api/v1/events/{ids['event']}/waterfall-preview",
+        json={"distance_start_m": 12.0, "distance_stop_m": 20.0},
+        headers={"X-CSRF-Token": csrf_token},
+    )
+    assert response.status_code == 200
+    assert read_bounds == [(*expected, slice(1, 4))]
+    assert len(processed) == 1
+    assert len(figures) == 3
+    duration = (expected[1] - expected[0]) / 100
+    for figure in figures:
+        title = " ".join(figure.axes[0].get_title().split())
+        assert f"Display samples {expected[0]}:{expected[1]} | duration {duration:g} s" in title
+        assert ("Source shorter than 3 s; showing actual duration" in title) is short
+        assert "Artificial Distance 12–20 m" in title
+    waveform = figures[2].axes[0]
+    np.testing.assert_allclose(
+        waveform.lines[0].get_ydata(), np.median(processed[0].data[:, [0, 2]], axis=1)
+    )
+    markers = {line.get_label(): line.get_xdata()[0] for line in waveform.lines[1:]}
+    start_time = datetime(2026, 7, 26, tzinfo=UTC)
+    for label, sample in (("event start", bounds[0]), ("event end", bounds[1]), ("event peak", bounds[0] + 4)):
+        assert abs(markers[label] - mdates.date2num(start_time + timedelta(seconds=sample / 100))) < 1e-11
+    expected_start = mdates.date2num(start_time + timedelta(seconds=expected[0] / 100 - 0.005))
+    expected_stop = mdates.date2num(start_time + timedelta(seconds=expected[1] / 100 + 0.005))
+    for figure in figures:
+        assert abs(figure.axes[0].get_xlim()[0] - expected_start) < 1e-11
+        assert abs(figure.axes[0].get_xlim()[1] - expected_stop) < 1e-11
+
+
+@pytest.mark.parametrize("single_channel", [False, True])
+def test_automatic_preview_uses_exact_event_indices_not_distance_envelope(
+    waterfall_api, monkeypatch, single_channel
+):
+    from das_sentinel import artifacts
+
+    client, _, sessions, csrf_token, ids, _ = waterfall_api
+    reader = client.app.state.waterfall_preview_service.reader
+    original_metadata, original_read = reader.read_metadata, reader.read_block
+    original_png = artifacts._png
+    # Channels outside the event also fall in the event's distance envelope.
+    distances = np.array([16.0, 20.0, 12.0, 16.0, 18.0])
+    if single_channel:
+        with sessions.begin() as session:
+            event = session.get(Event, ids["event"])
+            event.channel_stop = 2
+            payload = json.loads(event.evidence[0].payload_json)
+            payload["channel_stop"] = 2
+            event.evidence[0].payload_json = json.dumps(payload)
+    reads, figures = [], []
+
+    def metadata(path):
+        return replace(original_metadata(path), channel_distance_m=distances)
+
+    def read(path, start, stop, channels):
+        reads.append(channels)
+        block = original_read(path, start, stop, channels)
+        return replace(block, metadata=replace(block.metadata, channel_distance_m=distances[channels]))
+
+    def capture_png(figure):
+        figures.append(figure)
+        return original_png(figure)
+
+    monkeypatch.setattr(reader, "read_metadata", metadata)
+    monkeypatch.setattr(reader, "read_block", read)
+    monkeypatch.setattr(artifacts, "_png", capture_png)
+    response = client.post(
+        f"/api/v1/events/{ids['event']}/waterfall-preview", json={},
+        headers={"X-CSRF-Token": csrf_token},
+    )
+    assert response.status_code == 200
+    assert reads == [slice(1, 2 if single_channel else 4)]
+    assert response.json()["channel_count"] == (1 if single_channel else 2)
+    assert response.json()["distance_start_m"] == (20.0 if single_channel else 16.0)
+    assert response.json()["distance_stop_m"] == 20.0
+    assert len(figures) == 3
+    for figure in figures:
+        assert "Automatic event range" in " ".join(figure.axes[0].get_title().split())
+
+
+def test_preview_service_default_range_returns_waveform(waterfall_api, monkeypatch):
+    import das_sentinel.services.waterfall_previews as previews
+
+    client, _, sessions, _, ids, _ = waterfall_api
+    original_render = previews.render_waveform_png
+    records = []
+
+    def capture_waveform(values, dates, context, event, **kwargs):
+        records.append(event)
+        return original_render(values, dates, context, event, **kwargs)
+
+    monkeypatch.setattr(previews, "render_waveform_png", capture_waveform)
+    with sessions() as session:
+        result = client.app.state.waterfall_preview_service.render(session, ids["event"])
+    assert result.waveform_png.startswith(b"\x89PNG\r\n\x1a\n")
+    assert len(records) == 1
+    assert isinstance(records[0], EventRecord)
+    assert records[0].event_id == ids["event"]
+    assert (records[0].start_sample, records[0].end_sample, records[0].peak_sample) == (20, 40, 30)
+    assert (records[0].channel_start, records[0].channel_stop) == (1, 4)
+    assert len(records[0].evidence) == 1
+
+
+@pytest.mark.parametrize("automatic", [False, True])
+def test_preview_minimum_three_seconds_is_capped_before_source_read(
+    waterfall_api, monkeypatch, automatic
+):
+    client, _, sessions, csrf_token, ids, _ = waterfall_api
+    reader = client.app.state.waterfall_preview_service.reader
+    original_metadata = reader.read_metadata
+    with sessions.begin() as session:
+        event = session.get(Event, ids["event"])
+        event.occurred_at = datetime(2026, 7, 26, tzinfo=UTC) + timedelta(seconds=20 / 10001)
+
+    def high_rate_metadata(path):
+        return replace(original_metadata(path), sample_rate_hz=10001.0)
+
+    def forbidden_read(*args):
+        pytest.fail("the 30003-sample minimum window must be rejected before reading")
+
+    monkeypatch.setattr(reader, "read_metadata", high_rate_metadata)
+    monkeypatch.setattr(reader, "sample_count", lambda path: 50000)
+    monkeypatch.setattr(reader, "read_block", forbidden_read)
+    response = client.post(
+        f"/api/v1/events/{ids['event']}/waterfall-preview",
+        json={} if automatic else {"distance_start_m": 12.0, "distance_stop_m": 20.0},
+        headers={"X-CSRF-Token": csrf_token},
+    )
+    assert response.status_code == 422
+
+
+@pytest.mark.parametrize("failure", ["missing_source", "changed_source", "waveform_render"])
+def test_automatic_preview_conflict_never_returns_partial_images(waterfall_api, monkeypatch, failure):
+    import das_sentinel.services.waterfall_previews as previews
+
+    client, _, _, csrf_token, ids, source_path = waterfall_api
+    if failure == "missing_source":
+        source_path.unlink()
+    elif failure == "changed_source":
+        _write_source(source_path, 300)
+    else:
+        def fail_waveform(*args, **kwargs):
+            raise OSError("waveform render failed")
+
+        monkeypatch.setattr(previews, "render_waveform_png", fail_waveform)
+    response = client.post(
+        f"/api/v1/events/{ids['event']}/waterfall-preview", json={},
+        headers={"X-CSRF-Token": csrf_token},
+    )
+    assert response.status_code == 409
+    assert set(response.json()) == {"detail"}
+    assert str(source_path) not in response.text
+
+
+@pytest.mark.parametrize(
+    "waveform", [None, "1234567", "x" * (16 * 1024 * 1024 + 1)],
+    ids=["missing", "too-short", "too-large"],
+)
+def test_preview_response_requires_bounded_waveform_payload(waveform):
+    from das_sentinel.api.schemas import WaterfallPreviewResponse
+    from pydantic import ValidationError
+
+    payload = {
+        "distance_start_m": 12.0, "distance_stop_m": 20.0, "channel_count": 2,
+        "primary_detector": "stalta", "primary_detector_display": "STA/LTA",
+        "filter_low_hz": 3.5, "filter_high_hz": 27.25,
+        "raw_png_base64": "12345678", "filtered_png_base64": "12345678",
+    }
+    if waveform is not None:
+        payload["waveform_png_base64"] = waveform
+    with pytest.raises(ValidationError):
+        WaterfallPreviewResponse.model_validate(payload)
 
 
 def _tree_snapshot(root: Path) -> dict[str, tuple[int, str]]:

@@ -77,4 +77,5 @@ def waterfall_preview(
         filter_high_hz=preview.filter.high_hz,
         raw_png_base64=base64.b64encode(preview.raw_png).decode("ascii"),
         filtered_png_base64=base64.b64encode(preview.filtered_png).decode("ascii"),
+        waveform_png_base64=base64.b64encode(preview.waveform_png).decode("ascii"),
     )
