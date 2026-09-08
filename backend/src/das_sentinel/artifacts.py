@@ -7,6 +7,7 @@ import math
 import os
 import stat
 import tempfile
+import textwrap
 import time
 from collections.abc import Mapping
 from contextlib import contextmanager
@@ -159,30 +160,40 @@ class ArtifactStore:
                 return ArtifactFile(kind, target, media_type, final_digest)
 
 def render_event_artifacts(
-    data: EventArtifactData, event: EventRecord, features: Mapping[str, Any], out_dir: Path
+    data: EventArtifactData, event: EventRecord, features: Mapping[str, Any], out_dir: Path,
+    *, display_data: EventArtifactData | None = None, source_sample_count: int | None = None,
 ) -> ArtifactManifest:
-    """Render event evidence from explicitly distinct raw and filtered arrays."""
+    """Render display context while retaining original analysis spectra and evidence."""
     time_slice, channels = _event_selection(data, event)
+    analysis_waveform = _representative_beam(data.filtered_data[time_slice][:, channels])
+    display = data if display_data is None else display_data
+    _, display_channels = _event_selection(display, event)
     store = ArtifactStore(Path(out_dir))
-    raw = data.raw_data[time_slice][:, channels]
-    filtered = data.filtered_data[time_slice][:, channels]
-    dates = _sample_dates(data, time_slice)
-    distances = data.channel_distance_m[channels]
+    raw = display.raw_data[:, display_channels]
+    filtered = display.filtered_data[:, display_channels]
+    dates = _sample_dates(display, slice(0, len(raw)))
+    distances = display.channel_distance_m[display_channels]
     waveform = _representative_beam(filtered)
+    window_note = (
+        f"Display samples {display.sample_offset}:{display.sample_offset + len(raw)} | "
+        f"duration {len(raw) / display.sample_rate_hz:g} s"
+    )
+    if source_sample_count is not None and source_sample_count / display.sample_rate_hz < 3:
+        window_note += " | Source shorter than 3 s; showing actual duration"
     waterfall_context = WaterfallPlotContext(
-        sample_rate_hz=data.sample_rate_hz,
-        site_timezone=data.site_timezone,
-        profile_version=data.profile_version,
-        pipeline_version=data.pipeline_version,
-        model_version=data.model_version,
-        filter=data.waterfall_filter,
+        sample_rate_hz=display.sample_rate_hz,
+        site_timezone=display.site_timezone,
+        profile_version=display.profile_version,
+        pipeline_version=display.pipeline_version,
+        model_version=display.model_version,
+        filter=display.waterfall_filter,
     )
     files = {
-        "waterfall_raw": store.write(event.event_id, "waterfall_raw", render_waterfall_png(raw, dates, distances, waterfall_context, filtered=False), "image/png"),
-        "waterfall_filtered": store.write(event.event_id, "waterfall_filtered", render_waterfall_png(filtered, dates, distances, waterfall_context, filtered=True), "image/png"),
-        "waveform": store.write(event.event_id, "waveform", _waveform_png(waveform, dates, data, event, time_slice), "image/png"),
-        "psd": store.write(event.event_id, "psd", _psd_png(waveform, data, features), "image/png"),
-        "stft": store.write(event.event_id, "stft", _stft_png(waveform, data), "image/png"),
+        "waterfall_raw": store.write(event.event_id, "waterfall_raw", render_waterfall_png(raw, dates, distances, waterfall_context, filtered=False, window_note=window_note), "image/png"),
+        "waterfall_filtered": store.write(event.event_id, "waterfall_filtered", render_waterfall_png(filtered, dates, distances, waterfall_context, filtered=True, window_note=window_note), "image/png"),
+        "waveform": store.write(event.event_id, "waveform", render_waveform_png(waveform, dates, waterfall_context, event, sample_offset=display.sample_offset, window_note=window_note), "image/png"),
+        "psd": store.write(event.event_id, "psd", _psd_png(analysis_waveform, data, features), "image/png"),
+        "stft": store.write(event.event_id, "stft", _stft_png(analysis_waveform, data), "image/png"),
     }
     evidence = _evidence(data, event, features, time_slice, channels)
     encoded_evidence = json.dumps(evidence, allow_nan=False, sort_keys=True, separators=(",", ":")).encode("utf-8") + b"\n"
@@ -440,7 +451,7 @@ def render_waterfall_png(
         f"model={context.model_version} | {_frequency(context.sample_rate_hz)} Hz | input unit"
     )
     notes = [note for note in (window_note, distance_note) if note is not None]
-    axis.set_title(" | ".join((title, *notes)))
+    axis.set_title(textwrap.fill(" | ".join((title, *notes)), width=88), fontsize=10)
     _time_axes(axis, dates, context.site_timezone, context.sample_rate_hz)
     return _png(figure)
 
@@ -491,7 +502,7 @@ def render_waveform_png(
     distance_note: str | None = None,
 ) -> bytes:
     figure, axis = plt.subplots(figsize=(9, 3))
-    axis.plot(mdates.date2num(dates), values, linewidth=0.8)
+    axis.plot(mdates.date2num(dates), values, linewidth=0.8, marker="o" if len(values) == 1 else None)
     axis.set_ylabel("Filtered amplitude")
     for sample, label in ((event.start_sample, "event start"), (event.end_sample, "event end"), (event.peak_sample, "event peak")):
         axis.axvline(mdates.date2num(dates[0] + timedelta(seconds=(sample - sample_offset) / context.sample_rate_hz)), label=label, linewidth=0.8)
@@ -505,27 +516,9 @@ def render_waveform_png(
         f"model={context.model_version} | samples {sample_offset}:{sample_offset + len(values)}"
     )
     notes = [note for note in (window_note, distance_note) if note is not None]
-    axis.set_title(" | ".join((title, *notes)))
+    axis.set_title(textwrap.fill(" | ".join((title, *notes)), width=88), fontsize=10)
     _time_axes(axis, dates, context.site_timezone, context.sample_rate_hz)
     return _png(figure)
-
-
-def _waveform_png(values: np.ndarray, dates: np.ndarray, data: EventArtifactData, event: EventRecord, samples: slice) -> bytes:
-    context = WaterfallPlotContext(
-        sample_rate_hz=data.sample_rate_hz,
-        site_timezone=data.site_timezone,
-        profile_version=data.profile_version,
-        pipeline_version=data.pipeline_version,
-        model_version=data.model_version,
-        filter=data.waterfall_filter,
-    )
-    return render_waveform_png(
-        values,
-        dates,
-        context,
-        event,
-        sample_offset=data.sample_offset + samples.start,
-    )
 
 
 def _psd_png(values: np.ndarray, data: EventArtifactData, features: Mapping[str, Any]) -> bytes:

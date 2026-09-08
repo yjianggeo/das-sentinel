@@ -178,6 +178,103 @@ def test_png_artifacts_leave_a_clean_margin_around_plot_content(tmp_path):
         assert np.all(border >= 250), kind
 
 
+@pytest.mark.parametrize("separate_display", [False, True])
+def test_display_context_does_not_replace_analysis_spectra_or_evidence(
+    tmp_path, monkeypatch, separate_display
+):
+    """Cropping display plots or feeding expanded arrays/masks into evidence must fail."""
+    from das_sentinel import artifacts
+
+    data = _artifact_data()
+    display = data
+    if separate_display:
+        raw = np.arange(1800, dtype=np.float32).reshape(300, 6)
+        display = replace(
+            data, raw_data=raw, filtered_data=-raw * np.float32(0.1),
+            sample_offset=900, start_time_utc=data.start_time_utc - timedelta(seconds=1),
+            bad_channel_mask=np.array([False, True, False, False, False, False]),
+        )
+    recorded = {}
+
+    def waterfall(values, dates, distances, context, *, filtered, **kwargs):
+        recorded["filtered" if filtered else "raw"] = (values, dates, distances, kwargs)
+        return b"png"
+
+    def waveform(values, dates, context, event, **kwargs):
+        recorded["waveform"] = (values, dates, kwargs)
+        return b"png"
+
+    def psd(values, input_data, features):
+        recorded["psd"] = (values, input_data)
+        return b"png"
+
+    def stft(values, input_data):
+        recorded["stft"] = (values, input_data)
+        return b"png"
+
+    monkeypatch.setattr(artifacts, "render_waterfall_png", waterfall)
+    monkeypatch.setattr(artifacts, "render_waveform_png", waveform)
+    monkeypatch.setattr(artifacts, "_psd_png", psd)
+    monkeypatch.setattr(artifacts, "_stft_png", stft)
+    kwargs = {"display_data": display, "source_sample_count": 2000} if separate_display else {}
+    manifest = artifacts.render_event_artifacts(data, _event(), {"rms": 1.0}, tmp_path, **kwargs)
+
+    channels = [2, 3, 4] if separate_display else [1, 3, 4]
+    count = 300 if separate_display else 160
+    for kind, expected in (("raw", display.raw_data), ("filtered", display.filtered_data)):
+        values, dates, distances, notes = recorded[kind]
+        assert values.shape == (count, 3)
+        np.testing.assert_array_equal(values, expected[:, channels])
+        np.testing.assert_array_equal(distances, display.channel_distance_m[channels])
+        assert dates[0] == display.start_time_utc
+        assert dates[-1] == display.start_time_utc + timedelta(seconds=(count - 1) / 100)
+        assert notes["window_note"] == recorded["waveform"][2]["window_note"]
+        assert f"samples {display.sample_offset}:{display.sample_offset + count}" in notes["window_note"]
+        assert f"duration {count / 100:g} s" in notes["window_note"]
+        assert "Source shorter" not in notes["window_note"]
+    beam, dates, notes = recorded["waveform"]
+    assert len(beam) == count
+    np.testing.assert_array_equal(beam, np.median(display.filtered_data[:, channels], axis=1))
+    np.testing.assert_array_equal(dates, recorded["raw"][1])
+    assert notes["sample_offset"] == display.sample_offset
+    for kind in ("psd", "stft"):
+        values, input_data = recorded[kind]
+        assert len(values) == 60
+        np.testing.assert_array_equal(values, np.median(data.filtered_data[20:80, [1, 3, 4]], axis=1))
+        assert input_data is data
+    evidence = json.loads(manifest.files["evidence"].path.read_text("utf-8"))
+    assert evidence["source_range"]["sample_start"] == 1020
+    assert evidence["source_range"]["sample_stop"] == 1080
+    assert evidence["source_range"]["channel_indices"] == [1, 3, 4]
+    assert evidence["input_sha256"] == {
+        "raw": hashlib.sha256(data.raw_data.tobytes()).hexdigest(),
+        "filtered": hashlib.sha256(data.filtered_data.tobytes()).hexdigest(),
+    }
+
+
+@pytest.mark.parametrize("source_count,short_source", [(None, False), (2000, False), (160, True)])
+def test_short_source_note_requires_full_source_length(tmp_path, monkeypatch, source_count, short_source):
+    """A short available block must not be mislabeled as a short source file."""
+    from das_sentinel import artifacts
+    from matplotlib import pyplot as plt
+
+    titles = []
+
+    def capture(figure):
+        titles.append(" ".join(figure.axes[0].get_title().split()))
+        plt.close(figure)
+        return b"png"
+
+    data = replace(_artifact_data(), sample_offset=0)
+    event = replace(_event(), start_sample=20, end_sample=80, peak_sample=50, evidence=())
+    monkeypatch.setattr(artifacts, "_png", capture)
+    artifacts.render_event_artifacts(data, event, {}, tmp_path, source_sample_count=source_count)
+    for title in titles[:3]:
+        assert "samples 0:160" in title
+        assert "duration 1.6 s" in title
+        assert ("Source shorter than 3 s" in title) is short_source
+
+
 def test_artifacts_are_confined_to_uuid_event_directory_and_repeatable(tmp_path):
     """Path traversal or a non-idempotent artifact store must make this fail."""
     from das_sentinel.artifacts import render_event_artifacts
@@ -398,7 +495,11 @@ def test_waveform_axis_contains_event_and_candidate_exclusive_boundaries(monkeyp
 
     monkeypatch.setattr(artifacts, "_png", capture)
     dates = artifacts._sample_dates(data, slice(20, 80))
-    artifacts._waveform_png(np.zeros(60), dates, data, event, slice(20, 80))
+    context = artifacts.WaterfallPlotContext(
+        data.sample_rate_hz, data.site_timezone, data.profile_version,
+        data.pipeline_version, data.model_version, data.waterfall_filter,
+    )
+    artifacts.render_waveform_png(np.zeros(60), dates, context, event, sample_offset=1020)
     axis = captured["axis"]
     start = mdates.date2num(data.start_time_utc + timedelta(seconds=.2))
     end = mdates.date2num(data.start_time_utc + timedelta(seconds=.8))
@@ -574,6 +675,77 @@ def test_waterfall_renderer_adds_window_note_without_changing_filter_title(monke
         window_note="window=0.02 s",
         distance_note="distance=2–8 m",
     ) == b"png"
-    assert captured["axis"].get_title() == (
+    assert " ".join(captured["axis"].get_title().split()) == (
         f"{artifacts.filtered_waterfall_title(context)} | window=0.02 s | distance=2–8 m"
     )
+
+
+@pytest.mark.parametrize("kind", ["raw", "filtered", "waveform"])
+def test_display_plot_titles_fit_plot_width_without_overlapping_time_reference(monkeypatch, kind):
+    """Long single-line notes must not shrink the plotted data when the PNG is fitted to the UI."""
+    from das_sentinel import artifacts
+    from matplotlib import pyplot as plt
+
+    data = _artifact_data()
+    context = artifacts.WaterfallPlotContext(
+        data.sample_rate_hz, data.site_timezone, data.profile_version,
+        data.pipeline_version, data.model_version, data.waterfall_filter,
+    )
+    measured = {}
+
+    def capture(figure):
+        try:
+            figure.canvas.draw()
+            renderer = figure.canvas.get_renderer()
+            axis = figure.axes[0]
+            title = axis.title.get_window_extent(renderer)
+            reference = figure.axes[-1].xaxis.label.get_window_extent(renderer)
+            measured["title_width_ratio"] = title.width / axis.get_window_extent(renderer).width
+            measured["clearance"] = title.y0 - reference.y1
+            measured["title"] = " ".join(axis.get_title().split())
+        finally:
+            plt.close(figure)
+        return b"png"
+
+    monkeypatch.setattr(artifacts, "_png", capture)
+    dates = artifacts._sample_dates(data, slice(0, 160))
+    notes = {
+        "window_note": "Display samples 1000:1160 | duration 1.6 s | Source shorter than 3 s; showing actual duration",
+        "distance_note": "Automatic event range 2-8 m",
+    }
+    if kind == "waveform":
+        artifacts.render_waveform_png(data.filtered_data[:, 1], dates, context, _event(), sample_offset=1000, **notes)
+    else:
+        artifacts.render_waterfall_png(data.raw_data, dates, data.channel_distance_m, context, filtered=kind == "filtered", **notes)
+    assert measured["title_width_ratio"] <= 1.25
+    assert measured["clearance"] > 0
+    assert notes["window_note"] in measured["title"]
+    assert notes["distance_note"] in measured["title"]
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_only_single_sample_waveform_has_a_visible_data_marker(monkeypatch, count):
+    """A singleton needs an actual data glyph; ordinary traces must remain marker-free."""
+    from das_sentinel import artifacts
+    from matplotlib import pyplot as plt
+
+    data = _artifact_data()
+    context = artifacts.WaterfallPlotContext(
+        data.sample_rate_hz, data.site_timezone, data.profile_version,
+        data.pipeline_version, data.model_version, data.waterfall_filter,
+    )
+    measured = {}
+
+    def capture(figure):
+        line = figure.axes[0].lines[0]
+        measured["visible_marker"] = line.get_marker() not in (None, "None", "none", "", " ")
+        measured["values"] = line.get_ydata()
+        plt.close(figure)
+        return b"png"
+
+    monkeypatch.setattr(artifacts, "_png", capture)
+    values = np.arange(count, dtype=float) + 0.5
+    event = replace(_event(), start_sample=1000, end_sample=1000 + count, peak_sample=1000, evidence=())
+    artifacts.render_waveform_png(values, artifacts._sample_dates(data, slice(0, count)), context, event, sample_offset=1000)
+    assert measured["visible_marker"] is (count == 1)
+    np.testing.assert_array_equal(measured["values"], values)

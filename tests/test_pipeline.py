@@ -309,7 +309,7 @@ def _assert_detector_preprocessing_golden(
     assert captured == _DETECTOR_PREPROCESSING_GOLDEN
 
 
-def _empty_artifact_manifest(data, event, features, out_dir):
+def _empty_artifact_manifest(data, event, features, out_dir, **kwargs):
     del data, features
     (Path(out_dir) / event.event_id).mkdir(parents=True)
     return ArtifactManifest(event.event_id, {})
@@ -339,7 +339,7 @@ def test_pipeline_uses_bound_model_and_records_model_evidence(
     monkeypatch.setattr(
         pipeline,
         "render_event_artifacts",
-        lambda data, event, features, out_dir: captured.append(data)
+        lambda data, event, features, out_dir, **kwargs: captured.append(data)
         or _empty_artifact_manifest(data, event, features, out_dir),
     )
     context = pipeline.AnalysisContext(
@@ -454,7 +454,7 @@ def test_pipeline_merges_cross_block_event_and_preserves_artifact_inputs(
     expected_raw = _write_boundary_file(source_path)
     captured = []
 
-    def capture_artifacts(data, event, features, out_dir):
+    def capture_artifacts(data, event, features, out_dir, **kwargs):
         del features
         captured.append((data, event))
         (Path(out_dir) / event.event_id).mkdir(parents=True)
@@ -555,7 +555,7 @@ def test_pipeline_preprocessing_golden_preserves_review_identity(tmp_path, monke
     _assert_detector_preprocessing_golden(source_path, monkeypatch)
     captured: dict[str, str | None] = {}
 
-    def capture_artifacts(data, event, features, out_dir):
+    def capture_artifacts(data, event, features, out_dir, **kwargs):
         del features
         captured["raw_sha256"] = hashlib.sha256(
             data.raw_data.tobytes()
@@ -688,6 +688,77 @@ class _RecordingReader:
         return self.delegate.read_block(
             path, sample_start, sample_stop, channel_slice
         )
+
+
+@pytest.mark.parametrize(
+    "padding,analysis_range,display_range",
+    [(0.0, (184, 197), (176, 206)), (5.0, (134, 247), (134, 247))],
+)
+def test_pipeline_isolates_display_reads_from_features_and_reuses_sufficient_context(
+    tmp_path, monkeypatch, padding, analysis_range, display_range
+):
+    """Expanding the analysis read or rereading sufficient display context must fail."""
+    from das_sentinel import artifacts, pipeline
+
+    source_path = tmp_path / "display-boundary.h5"
+    source_data = _write_boundary_file(source_path)
+    reader = _RecordingReader()
+    profile = _profile().model_copy(update={"artifact_pad_seconds": padding})
+    backend = select_backend("cpu")
+    original_extract = pipeline.extract_features
+    recorded = {}
+
+    def capture_features(block, event, *, context):
+        recorded["feature_block"] = block
+        recorded["feature_context"] = context
+        return original_extract(block, event, context=context)
+
+    def capture_png(figure):
+        from matplotlib import pyplot as plt
+
+        axis = figure.axes[0]
+        if "waterfall" in axis.get_title():
+            recorded["filtered" if "Filtered" in axis.get_title() else "raw"] = np.asarray(axis.collections[0].get_array()).copy()
+        elif "beam" in axis.get_title():
+            recorded["waveform"] = np.asarray(axis.lines[0].get_ydata()).copy()
+        plt.close(figure)
+        return b"png"
+
+    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
+    monkeypatch.setattr(pipeline, "detect_energy", _fixed_energy)
+    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
+    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
+    monkeypatch.setattr(pipeline, "extract_features", capture_features)
+    monkeypatch.setattr(artifacts, "_png", capture_png)
+    result = pipeline.analyze_file(source_path, reader, profile, backend, tmp_path / "artifacts")
+
+    expected_reads = [(0, 200), (50, 350), (200, 420), analysis_range]
+    if padding == 0:
+        expected_reads.append(display_range)
+    assert reader.block_ranges == expected_reads
+    assert len(result.events) == 1
+    event = result.events[0]
+    assert (event.start_sample, event.end_sample, event.peak_sample) == (184, 197, 190)
+    assert event.label == Label.UNKNOWN
+    assert event.decision_score == 0.5
+    original_raw = ZdHdf5Reader().read_block(source_path, *analysis_range)
+    original_filtered = pipeline._preprocess_for_band(original_raw, profile, backend, (0.5, 4.0))
+    assert recorded["feature_block"].sample_offset == analysis_range[0]
+    np.testing.assert_array_equal(recorded["feature_block"].data, original_filtered.data)
+    assert event.features == original_extract(original_filtered, event, context=recorded["feature_context"])
+    display_raw = ZdHdf5Reader().read_block(source_path, *display_range)
+    display_filtered = pipeline._preprocess_for_band(display_raw, profile, backend, (0.5, 4.0))
+    channels = np.arange(1, 5)[~display_filtered.bad_channel_mask[1:5]]
+    np.testing.assert_array_equal(recorded["raw"], source_data[slice(*display_range)][:, channels].T)
+    np.testing.assert_array_equal(recorded["filtered"], display_filtered.data[:, channels].T)
+    np.testing.assert_array_equal(recorded["waveform"], np.median(display_filtered.data[:, channels], axis=1))
+    evidence = json.loads(result.artifacts[0].files["evidence"].path.read_text("utf-8"))
+    assert evidence["source_range"]["sample_start"] == 184
+    assert evidence["source_range"]["sample_stop"] == 197
+    assert evidence["input_sha256"] == {
+        "raw": hashlib.sha256(original_raw.data.tobytes()).hexdigest(),
+        "filtered": hashlib.sha256(original_filtered.data.tobytes()).hexdigest(),
+    }
 
 
 def test_pipeline_prepends_lta_history_and_canonically_owns_gap_events(
@@ -932,7 +1003,7 @@ def test_pipeline_explicitly_transfers_event_window_before_cpu_features(
     monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
     monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
     monkeypatch.setattr(pipeline, "preprocess_for_waterfall", device_preprocess)
-    def capture_device_artifacts(data, event, features, out_dir):
+    def capture_device_artifacts(data, event, features, out_dir, **kwargs):
         captured.append(data)
         return _empty_artifact_manifest(data, event, features, out_dir)
 
@@ -1130,8 +1201,8 @@ def test_pipeline_rejects_source_changed_while_rendering(tmp_path, monkeypatch):
     artifact_root = tmp_path / "artifacts"
     original_render = pipeline.render_event_artifacts
 
-    def changing_render(data, event, features, out_dir):
-        manifest = original_render(data, event, features, out_dir)
+    def changing_render(data, event, features, out_dir, **kwargs):
+        manifest = original_render(data, event, features, out_dir, **kwargs)
         stat = source_path.stat()
         os.utime(
             source_path,
@@ -1252,8 +1323,8 @@ def test_pipeline_reuses_and_never_rolls_back_preexisting_artifacts(
 
     original_render = pipeline.render_event_artifacts
 
-    def changing_render(data, event, features, out_dir):
-        manifest = original_render(data, event, features, out_dir)
+    def changing_render(data, event, features, out_dir, **kwargs):
+        manifest = original_render(data, event, features, out_dir, **kwargs)
         stat = source_path.stat()
         os.utime(
             source_path,

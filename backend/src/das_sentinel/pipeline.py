@@ -36,6 +36,7 @@ from das_sentinel.detectors.trajectory import detect_trajectories
 from das_sentinel.domain import Candidate, DasBlock, EventRecord
 from das_sentinel.features import extract_features
 from das_sentinel.fusion import fuse_candidates
+from das_sentinel.plot_windows import event_display_window
 from das_sentinel.readers.base import DasReader
 from das_sentinel.signal.backend import ArrayBackend
 from das_sentinel.signal.preprocess import (
@@ -367,6 +368,36 @@ def analyze_file(
                 waterfall_filter=waterfall_filter,
                 model_output=model_output,
             )
+            timings["render"] += _elapsed_ms(render_started)
+            display_start, display_stop = event_display_window(
+                event.start_sample,
+                event.end_sample,
+                sample_count,
+                profile.artifact_pad_seconds,
+                metadata.sample_rate_hz,
+            )
+            display_data = artifact_data
+            if (display_start, display_stop) != (window_start, window_stop):
+                read_started = time.perf_counter()
+                display_raw = reader.read_block(reader_source, display_start, display_stop)
+                timings["read"] += _elapsed_ms(read_started)
+                preprocess_started = time.perf_counter()
+                display_filtered = _preprocess_for_band(
+                    display_raw,
+                    profile,
+                    backend,
+                    (waterfall_filter.low_hz, waterfall_filter.high_hz),
+                )
+                display_data = replace(
+                    artifact_data,
+                    raw_data=display_raw.data,
+                    filtered_data=np.asarray(backend.asnumpy(display_filtered.data), dtype=np.float32),
+                    sample_offset=display_raw.sample_offset,
+                    start_time_utc=display_raw.metadata.start_time_utc,
+                    bad_channel_mask=display_filtered.bad_channel_mask,
+                )
+                timings["preprocess"] += _elapsed_ms(preprocess_started)
+            render_started = time.perf_counter()
             _ensure_source_unchanged(source, source_fingerprint)
             if transaction is None:
                 raise RuntimeError("artifact transaction is unavailable")
@@ -376,6 +407,8 @@ def analyze_file(
                     classified,
                     features,
                     transaction.staging_root,
+                    display_data=display_data,
+                    source_sample_count=sample_count,
                 )
             )
             _ensure_source_unchanged(source, source_fingerprint)
