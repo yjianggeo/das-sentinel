@@ -53,6 +53,13 @@ const originalCreateObjectUrl = Object.getOwnPropertyDescriptor(URL, "createObje
 const originalRevokeObjectUrl = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
 let objectUrlNumber = 0;
 
+async function waitForDefaultDistanceInputs(start = 12, stop = 20) {
+  await waitFor(() => {
+    expect(screen.getByLabelText("起始距离（m）")).toHaveValue(start);
+    expect(screen.getByLabelText("结束距离（m）")).toHaveValue(stop);
+  });
+}
+
 beforeAll(() => {
   globalThis.AbortController = nativeAbortController;
   Object.defineProperty(URL, "createObjectURL", {
@@ -223,8 +230,7 @@ it("renders the available range, defaults, actual filter band, and detector", as
   render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
 
   expect(await screen.findByText("可用 8–24 m")).toBeVisible();
-  expect(screen.getByLabelText("起始距离（m）")).toHaveValue(12);
-  expect(screen.getByLabelText("结束距离（m）")).toHaveValue(20);
+  await waitForDefaultDistanceInputs();
   expect(screen.getByText("滤波瀑布图（3.5–27.25 Hz）")).toBeVisible();
   expect(screen.getByText("主检测器：STA/LTA")).toBeVisible();
 });
@@ -241,13 +247,17 @@ it("sends an empty automatic request before edits and again after reset", async 
   render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
 
   await screen.findByText("可用 8–24 m");
+  await waitForDefaultDistanceInputs();
   const generate = screen.getByRole("button", { name: "生成临时预览" });
   await userEvent.click(generate);
   await waitFor(() => expect(requestBodies).toHaveLength(1));
   expect(requestBodies[0]).toEqual({});
 
-  await userEvent.clear(screen.getByLabelText("结束距离（m）"));
-  await userEvent.type(screen.getByLabelText("结束距离（m）"), "21");
+  const stopInput = screen.getByLabelText("结束距离（m）");
+  await userEvent.clear(stopInput);
+  expect(stopInput).toHaveValue(null);
+  await userEvent.type(stopInput, "21");
+  expect(stopInput).toHaveValue(21);
   await userEvent.click(screen.getByRole("button", { name: "重置临时预览" }));
   await userEvent.click(generate);
 
@@ -267,8 +277,12 @@ it("sends both numeric bounds after either distance input is edited", async () =
   render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
 
   await screen.findByText("可用 8–24 m");
-  await userEvent.clear(screen.getByLabelText("结束距离（m）"));
-  await userEvent.type(screen.getByLabelText("结束距离（m）"), "21");
+  await waitForDefaultDistanceInputs();
+  const stopInput = screen.getByLabelText("结束距离（m）");
+  await userEvent.clear(stopInput);
+  expect(stopInput).toHaveValue(null);
+  await userEvent.type(stopInput, "21");
+  expect(stopInput).toHaveValue(21);
   await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
 
   await waitFor(() => expect(requestBody).toBeDefined());
@@ -300,8 +314,12 @@ it("returns to automatic mode when the selected event options change", async () 
   );
 
   await screen.findByText("可用 8–24 m");
-  await userEvent.clear(screen.getByLabelText("结束距离（m）"));
-  await userEvent.type(screen.getByLabelText("结束距离（m）"), "21");
+  await waitForDefaultDistanceInputs();
+  const stopInput = screen.getByLabelText("结束距离（m）");
+  await userEvent.clear(stopInput);
+  expect(stopInput).toHaveValue(null);
+  await userEvent.type(stopInput, "21");
+  expect(stopInput).toHaveValue(21);
   view.rerender(<ArtifactViewer eventId="event-2" artifacts={PREVIEW_ARTIFACTS} />);
   await waitFor(() => expect(screen.getByLabelText("结束距离（m）")).toHaveValue(19));
   await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
@@ -354,7 +372,10 @@ it("rejects a blank manual distance before numeric conversion without posting", 
   render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
 
   await screen.findByText("可用 8–24 m");
-  await userEvent.clear(screen.getByLabelText("起始距离（m）"));
+  await waitForDefaultDistanceInputs();
+  const startInput = screen.getByLabelText("起始距离（m）");
+  await userEvent.clear(startInput);
+  expect(startInput).toHaveValue(null);
   await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
 
   expect(screen.getByRole("alert")).toHaveTextContent("请输入有效距离");
@@ -373,8 +394,12 @@ it("rejects an invalid manual distance range without posting", async () => {
   render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
 
   await screen.findByText("可用 8–24 m");
-  await userEvent.clear(screen.getByLabelText("结束距离（m）"));
-  await userEvent.type(screen.getByLabelText("结束距离（m）"), "10");
+  await waitForDefaultDistanceInputs();
+  const stopInput = screen.getByLabelText("结束距离（m）");
+  await userEvent.clear(stopInput);
+  expect(stopInput).toHaveValue(null);
+  await userEvent.type(stopInput, "10");
+  expect(stopInput).toHaveValue(10);
   await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
 
   expect(screen.getByRole("alert")).toHaveTextContent("起始距离必须小于结束距离");
@@ -391,6 +416,7 @@ it("uses one preview response for both waterfalls and waveform while PSD and STF
   render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
 
   await screen.findByText("可用 8–24 m");
+  await waitForDefaultDistanceInputs();
   await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
 
   await waitFor(() => {
@@ -423,8 +449,11 @@ it("uses one preview response for both waterfalls and waveform while PSD and STF
   expect(screen.getByRole("link", { name: "下载" })).toHaveAttribute("href", waveformPreviewUrl);
   expect(screen.getAllByText("当前显示临时预览")).toHaveLength(1);
 
-  await userEvent.clear(screen.getByLabelText("结束距离（m）"));
-  await userEvent.type(screen.getByLabelText("结束距离（m）"), "21");
+  const stopInput = screen.getByLabelText("结束距离（m）");
+  await userEvent.clear(stopInput);
+  expect(stopInput).toHaveValue(null);
+  await userEvent.type(stopInput, "21");
+  expect(stopInput).toHaveValue(21);
   expect(screen.getAllByText("当前显示临时预览")).toHaveLength(1);
   expect(screen.getByRole("img", { name: "事件波形图" })).toHaveAttribute(
     "src",
@@ -455,6 +484,7 @@ it("reset restores automatic inputs, clears validation, permanent URLs, and prev
   render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
 
   await screen.findByText("可用 8–24 m");
+  await waitForDefaultDistanceInputs();
   await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
   const rawUrl = await waitFor(() => {
     const url = screen.getByRole("img", { name: "事件瀑布图" }).getAttribute("src");
@@ -468,8 +498,11 @@ it("reset restores automatic inputs, clears validation, permanent URLs, and prev
   const waveformUrl = screen.getByRole("img", { name: "事件波形图" }).getAttribute("src");
   expect(waveformUrl).toMatch(/^blob:/);
 
-  await userEvent.clear(screen.getByLabelText("起始距离（m）"));
-  await userEvent.type(screen.getByLabelText("起始距离（m）"), "21");
+  const startInput = screen.getByLabelText("起始距离（m）");
+  await userEvent.clear(startInput);
+  expect(startInput).toHaveValue(null);
+  await userEvent.type(startInput, "21");
+  expect(startInput).toHaveValue(21);
   await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
   expect(screen.getByRole("alert")).toHaveTextContent("起始距离必须小于结束距离");
 
@@ -530,6 +563,7 @@ it.each([409, 422, 500])("preserves the current preview after a %s response", as
   render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
 
   await screen.findByText("可用 8–24 m");
+  await waitForDefaultDistanceInputs();
   const generate = screen.getByRole("button", { name: "生成临时预览" });
   await userEvent.click(generate);
   const firstUrl = await waitFor(() => {
@@ -537,8 +571,11 @@ it.each([409, 422, 500])("preserves the current preview after a %s response", as
     expect(url).toMatch(/^blob:/);
     return url!;
   });
-  await userEvent.clear(screen.getByLabelText("结束距离（m）"));
-  await userEvent.type(screen.getByLabelText("结束距离（m）"), "21");
+  const stopInput = screen.getByLabelText("结束距离（m）");
+  await userEvent.clear(stopInput);
+  expect(stopInput).toHaveValue(null);
+  await userEvent.type(stopInput, "21");
+  expect(stopInput).toHaveValue(21);
   await userEvent.click(generate);
 
   expect(await screen.findByRole("alert")).toHaveTextContent("无法生成临时预览");
