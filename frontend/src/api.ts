@@ -250,6 +250,7 @@ export interface WaterfallPreview {
   filter_high_hz: number;
   raw_png_base64: string;
   filtered_png_base64: string;
+  waveform_png_base64: string;
 }
 
 export interface EventRun {

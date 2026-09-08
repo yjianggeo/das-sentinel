@@ -13,17 +13,19 @@ export default function WaterfallRangeControls({
   optionsError: string;
   busy: boolean;
   error: string;
-  onGenerate: (startM: number, stopM: number) => Promise<void>;
+  onGenerate: (startM?: number, stopM?: number) => Promise<void>;
   onReset: () => void;
 }) {
   const [start, setStart] = useState("");
   const [stop, setStop] = useState("");
+  const [manual, setManual] = useState(false);
   const [validationError, setValidationError] = useState("");
 
   useEffect(() => {
     if (!options) return;
     setStart(String(options.automatic_distance_start_m));
     setStop(String(options.automatic_distance_stop_m));
+    setManual(false);
     setValidationError("");
   }, [options]);
 
@@ -32,6 +34,15 @@ export default function WaterfallRangeControls({
   }
 
   const submit = async () => {
+    if (!manual) {
+      setValidationError("");
+      await onGenerate();
+      return;
+    }
+    if (start.trim() === "" || stop.trim() === "") {
+      setValidationError("请输入有效距离");
+      return;
+    }
     const startM = Number(start);
     const stopM = Number(stop);
     if (!Number.isFinite(startM) || !Number.isFinite(stopM)) {
@@ -56,6 +67,7 @@ export default function WaterfallRangeControls({
   const reset = () => {
     setStart(String(options.automatic_distance_start_m));
     setStop(String(options.automatic_distance_stop_m));
+    setManual(false);
     setValidationError("");
     onReset();
   };
@@ -74,7 +86,10 @@ export default function WaterfallRangeControls({
             min={options.available_distance_start_m}
             max={options.available_distance_stop_m}
             value={start}
-            onChange={(event) => setStart(event.target.value)}
+            onChange={(event) => {
+              setStart(event.target.value);
+              setManual(true);
+            }}
           />
         </label>
         <label>
@@ -85,7 +100,10 @@ export default function WaterfallRangeControls({
             min={options.available_distance_start_m}
             max={options.available_distance_stop_m}
             value={stop}
-            onChange={(event) => setStop(event.target.value)}
+            onChange={(event) => {
+              setStop(event.target.value);
+              setManual(true);
+            }}
           />
         </label>
         <button type="button" onClick={submit} disabled={busy} aria-busy={busy}>

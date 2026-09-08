@@ -134,7 +134,9 @@ export default function ArtifactViewer({
       ? preview?.waterfall_raw
       : active.kind === "waterfall_filtered"
         ? preview?.waterfall_filtered
-        : undefined;
+        : active.kind === "waveform"
+          ? preview?.waveform
+          : undefined;
   const imageUrl = previewUrl
     ?? (loadState.kind === "ready" && loadState.eventId === eventId
       ? loadState.url
@@ -239,14 +241,17 @@ export default function ArtifactViewer({
               </div>
             )}
             {isActive && imageUrl && (
-              <button
-                type="button"
-                className="artifact-image-button"
-                onClick={openFullscreen}
-                aria-label="全屏查看"
-              >
-                <img src={imageUrl} alt={meta.alt} onError={showDecodeError} />
-              </button>
+              <>
+                {previewUrl && <p>当前显示临时预览</p>}
+                <button
+                  type="button"
+                  className="artifact-image-button"
+                  onClick={openFullscreen}
+                  aria-label="全屏查看"
+                >
+                  <img src={imageUrl} alt={meta.alt} onError={showDecodeError} />
+                </button>
+              </>
             )}
           </div>
         );

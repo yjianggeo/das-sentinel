@@ -4,12 +4,14 @@ import { api, type WaterfallOptions, type WaterfallPreview } from "../api";
 export interface WaterfallPreviewUrls {
   waterfall_raw: string;
   waterfall_filtered: string;
+  waveform: string;
 }
 
 function revokePreview(preview: WaterfallPreviewUrls | null): void {
   if (!preview) return;
   URL.revokeObjectURL(preview.waterfall_raw);
   URL.revokeObjectURL(preview.waterfall_filtered);
+  URL.revokeObjectURL(preview.waveform);
 }
 
 function decodePng(base64: string): Blob {
@@ -24,13 +26,20 @@ function decodePng(base64: string): Blob {
 function previewUrls(value: WaterfallPreview): WaterfallPreviewUrls {
   let rawUrl: string | null = null;
   let filteredUrl: string | null = null;
+  let waveformUrl: string | null = null;
   try {
     rawUrl = URL.createObjectURL(decodePng(value.raw_png_base64));
     filteredUrl = URL.createObjectURL(decodePng(value.filtered_png_base64));
-    return { waterfall_raw: rawUrl, waterfall_filtered: filteredUrl };
+    waveformUrl = URL.createObjectURL(decodePng(value.waveform_png_base64));
+    return {
+      waterfall_raw: rawUrl,
+      waterfall_filtered: filteredUrl,
+      waveform: waveformUrl,
+    };
   } catch (cause) {
     if (rawUrl) URL.revokeObjectURL(rawUrl);
     if (filteredUrl) URL.revokeObjectURL(filteredUrl);
+    if (waveformUrl) URL.revokeObjectURL(waveformUrl);
     throw cause;
   }
 }
@@ -41,7 +50,7 @@ export function useWaterfallPreview(eventId: string): {
   preview: WaterfallPreviewUrls | null;
   busy: boolean;
   error: string;
-  generate(startM: number, stopM: number): Promise<void>;
+  generate(startM?: number, stopM?: number): Promise<void>;
   reset(): void;
 } {
   const [options, setOptions] = useState<WaterfallOptions | null>(null);
@@ -96,7 +105,7 @@ export function useWaterfallPreview(eventId: string): {
     };
   }, [eventId, replacePreview]);
 
-  const generate = useCallback(async (startM: number, stopM: number) => {
+  const generate = useCallback(async (startM?: number, stopM?: number) => {
     controllerRef.current?.abort();
     const controller = new AbortController();
     controllerRef.current = controller;
@@ -106,7 +115,9 @@ export function useWaterfallPreview(eventId: string): {
     try {
       const value = await api.post<WaterfallPreview>(
         `/api/v1/events/${eventId}/waterfall-preview`,
-        { distance_start_m: startM, distance_stop_m: stopM },
+        startM === undefined && stopM === undefined
+          ? {}
+          : { distance_start_m: startM, distance_stop_m: stopM },
         controller.signal,
       );
       if (sequence !== sequenceRef.current || controller.signal.aborted) return;
