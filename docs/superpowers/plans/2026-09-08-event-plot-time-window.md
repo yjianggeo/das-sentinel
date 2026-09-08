@@ -141,6 +141,8 @@ if (display_start, display_stop) != (window_start, window_stop):
 
 Account for actual read/preprocess time without changing timing keys. Preserve source fingerprint checks and artifact transaction rollback. In rendering, keep `_event_selection(data,event)` for the analysis beam and evidence, but separately use all display samples with the same event channel interval and its display good-channel mask for three plots. Do not let expanded display arrays reach spectra. Put actual display sample interval and duration on all three plots; only call it a short source when full source length proves that fact. Unknown-source standalone renderer fixtures may describe available data without falsely asserting source length.
 
+Visual QA addition: keep rendered provenance/window/distance titles within a bounded multiline layout so tight-bbox output does not shrink the main plot in the UI. Preserve the literal `filtered_waterfall_title` return contract. Add a visible marker only for a singleton waveform, leaving multi-point lines unchanged. First reproduce both issues with real-render geometry/marker tests; check title and top local-reference bounds do not overlap. These are presentation-only corrections observed in the synthetic acceptance images.
+
 - [ ] Step 4: Run complete artifacts/pipeline/window test files and Ruff; inspect source-fingerprint and rollback regressions remain passing.
 - [ ] Step 5: Commit `fix(plots): expand display context without altering analysis`.
 
