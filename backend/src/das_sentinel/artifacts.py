@@ -51,6 +51,8 @@ class EventArtifactData:
     rule_output: Mapping[str, Any]
     waterfall_filter: WaterfallFilter
     model_output: Mapping[str, Any] | None = None
+    source_fingerprint: str | None = None
+    measurements: Mapping[str, Any] | None = None
 
     def __post_init__(self) -> None:
         raw = _finite_float_copy(self.raw_data, "raw_data")
@@ -75,6 +77,13 @@ class EventArtifactData:
             raise ValueError("site_timezone must be a valid IANA timezone") from error
         if not self.profile_version or not self.pipeline_version or not self.model_version or not self.backend_name:
             raise ValueError("profile_version, pipeline_version, model_version, and backend_name must be non-empty")
+        if self.source_fingerprint is not None and (
+            len(self.source_fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in self.source_fingerprint)
+        ):
+            raise ValueError("source_fingerprint must be a lowercase SHA-256 digest")
+        if self.measurements is not None and self.source_fingerprint is None:
+            raise ValueError("source_fingerprint is required with measurements")
         object.__setattr__(self, "raw_data", raw)
         object.__setattr__(self, "filtered_data", filtered)
         object.__setattr__(self, "channel_distance_m", distance)
@@ -509,7 +518,14 @@ def render_waveform_png(
     for candidate in event.evidence:
         axis.axvspan(mdates.date2num(dates[0] + timedelta(seconds=(candidate.start_sample - sample_offset) / context.sample_rate_hz)), mdates.date2num(dates[0] + timedelta(seconds=(candidate.end_sample - sample_offset) / context.sample_rate_hz)), alpha=0.1, label=f"{candidate.detector} span")
         axis.axvline(mdates.date2num(dates[0] + timedelta(seconds=(candidate.peak_sample - sample_offset) / context.sample_rate_hz)), label=f"{candidate.detector} peak", linestyle="--", linewidth=0.7)
-    axis.legend(fontsize="x-small")
+    handles, labels = axis.get_legend_handles_labels()
+    unique_labels = dict(zip(labels, handles, strict=True))
+    axis.legend(
+        unique_labels.values(),
+        unique_labels.keys(),
+        fontsize="x-small",
+        ncols=2 if len(unique_labels) > 8 else 1,
+    )
     title = (
         "Robust filtered good-channel beam | "
         f"profile={context.profile_version} pipeline={context.pipeline_version} "
@@ -578,7 +594,7 @@ def _json_value(value: Any) -> Any:
 
 
 def _evidence(data: EventArtifactData, event: EventRecord, features: Mapping[str, Any], samples: slice, channels: np.ndarray) -> dict[str, Any]:
-    return _json_value({
+    evidence = {
         "event_id": event.event_id,
         "profile": data.profile,
         "profile_version": data.profile_version,
@@ -592,4 +608,18 @@ def _evidence(data: EventArtifactData, event: EventRecord, features: Mapping[str
         "model_output": data.model_output,
         "quality_flags": {"bad_channel_count": int(data.bad_channel_mask.sum()), "event_quality_flags": sorted({flag for candidate in event.evidence for flag in candidate.quality_flags})},
         "input_sha256": {"raw": hashlib.sha256(data.raw_data.tobytes()).hexdigest(), "filtered": hashlib.sha256(data.filtered_data.tobytes()).hexdigest()},
-    })
+    }
+    if data.measurements is not None:
+        evidence.update(
+            {
+                "source_fingerprint": data.source_fingerprint,
+                "event_range": {
+                    "start_sample": event.start_sample,
+                    "end_sample": event.end_sample,
+                    "channel_start": event.channel_start,
+                    "channel_stop": event.channel_stop,
+                },
+                "measurements": data.measurements,
+            }
+        )
+    return _json_value(evidence)

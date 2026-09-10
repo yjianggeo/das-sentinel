@@ -35,7 +35,7 @@ def _settings(tmp_path: Path) -> Settings:
         api_url="http://testserver",
         session_secret="s" * 32,
         worker_token=WORKER_TOKEN,
-        pipeline_version="pipeline-v1",
+        pipeline_version="v2",
         secure_cookies=False,
     )
 
@@ -69,7 +69,7 @@ def _seed(settings: Settings, *, stale: bool = False) -> tuple[str, str, str]:
             )
             if stale:
                 service = JobService(session, settings.app_data_dir / "artifacts")
-                job = service.enqueue(source.id, profile.id, "pipeline-v1")
+                job = service.enqueue(source.id, profile.id, "v2")
                 service.claim(
                     "dead-worker",
                     now=datetime.now(UTC) - timedelta(minutes=3),
@@ -113,7 +113,7 @@ def _enqueue(
         json={
             "source_file_id": source_id,
             "processing_profile_id": profile_id,
-            "pipeline_version": "pipeline-v1",
+            "pipeline_version": "v2",
         },
         headers={"X-CSRF-Token": csrf_token},
     )
@@ -220,7 +220,7 @@ def test_enqueue_claim_heartbeat_complete_protocol_and_no_token_leak(api_client)
         json={
             "worker_id": "worker-a",
             "profile_version": 4,
-            "pipeline_version": "pipeline-v1",
+            "pipeline_version": "v2",
             "artifact_paths": [str(artifact)],
         },
         headers={"X-Worker-Token": WORKER_TOKEN},
@@ -407,6 +407,136 @@ def test_public_retry_cancel_state_rules(api_client):
     ).status_code == 409
 
 
+@pytest.mark.parametrize("version", ["v1", "pipeline-v1", "v3"])
+def test_enqueue_rejects_noncurrent_pipeline_without_creating_job(api_client, version):
+    client, _, token, source_id, profile_id = api_client
+    response = client.post(
+        "/api/v1/jobs",
+        json={"source_file_id": source_id, "processing_profile_id": profile_id,
+              "pipeline_version": version},
+        headers={"X-CSRF-Token": token},
+    )
+    assert response.status_code == 422
+    assert client.get("/api/v1/jobs").json() == []
+
+
+def test_enqueue_accepts_current_pipeline(api_client):
+    client, _, token, source_id, profile_id = api_client
+    response = client.post(
+        "/api/v1/jobs",
+        json={"source_file_id": source_id, "processing_profile_id": profile_id,
+              "pipeline_version": "v2"},
+        headers={"X-CSRF-Token": token},
+    )
+    assert response.status_code == 201
+    assert response.json()["pipeline_version"] == "v2"
+
+
+def test_retry_rejects_legacy_pipeline_without_rebinding_history(api_client):
+    client, settings, token, source_id, profile_id = api_client
+    with client.app.state.session_factory.begin() as session:
+        service = JobService(session, settings.app_data_dir / "artifacts")
+        job = service.enqueue(source_id, profile_id, "v1")
+        service.claim("worker-a")
+        service.fail(job.id, "worker-a", error_code="analysis_failed",
+                     error_message="retryable", retry_eligible=True)
+    before = client.get(f"/api/v1/jobs/{job.id}").json()
+    response = client.post(f"/api/v1/jobs/{job.id}/retry", headers={"X-CSRF-Token": token})
+    assert response.status_code == 409
+    assert "重新扫描" in response.json()["detail"]
+    assert "v2" in response.json()["detail"]
+    assert client.get(f"/api/v1/jobs/{job.id}").json() == before
+
+
+@pytest.mark.parametrize("target", ["cancelled", "missing"])
+def test_delete_job_routes_require_admin_and_csrf(api_client, target):
+    client, _, _, _, _ = api_client
+    url = f"/api/v1/jobs/{target}"
+    assert client.delete(url).status_code == 403
+    assert client.delete(url, headers={"X-CSRF-Token": "wrong"}).status_code == 403
+    client.cookies.clear()
+    assert client.delete(url).status_code == 401
+
+
+def test_delete_cancelled_job_and_missing_job(api_client):
+    client, _, token, source_id, profile_id = api_client
+    job_id = _enqueue(client, token, source_id, profile_id).json()["id"]
+    headers = {"X-CSRF-Token": token}
+    assert client.post(f"/api/v1/jobs/{job_id}/cancel", headers=headers).status_code == 200
+
+    deleted = client.delete(f"/api/v1/jobs/{job_id}", headers=headers)
+
+    assert deleted.status_code == 204
+    assert deleted.content == b""
+    assert client.get(f"/api/v1/jobs/{job_id}").status_code == 404
+    assert client.delete(f"/api/v1/jobs/{job_id}", headers=headers).status_code == 404
+
+
+@pytest.mark.parametrize("job_status", ["queued", "running", "succeeded", "failed"])
+def test_delete_rejects_non_cancelled_job_without_changing_it(api_client, job_status):
+    client, _, token, source_id, profile_id = api_client
+    with client.app.state.session_factory.begin() as session:
+        job = Repositories(session).jobs.add(
+            source_file_id=source_id,
+            processing_profile_id=profile_id,
+            pipeline_version="pipeline-v1",
+            status=job_status,
+        )
+        job_id = job.id
+    before = client.get(f"/api/v1/jobs/{job_id}").json()
+
+    response = client.delete(f"/api/v1/jobs/{job_id}", headers={"X-CSRF-Token": token})
+
+    assert response.status_code == 409
+    assert client.get(f"/api/v1/jobs/{job_id}").json() == before
+
+
+def test_delete_all_cancelled_is_idempotent_and_preserves_other_states(api_client):
+    client, _, token, source_id, profile_id = api_client
+    with client.app.state.session_factory.begin() as session:
+        repositories = Repositories(session)
+        for index, job_status in enumerate(
+            ["queued", "running", "succeeded", "failed", "cancelled", "cancelled"]
+        ):
+            repositories.jobs.add(
+                source_file_id=source_id,
+                processing_profile_id=profile_id,
+                pipeline_version=f"pipeline-{index}",
+                status=job_status,
+            )
+    preserved = [job for job in client.get("/api/v1/jobs").json() if job["status"] != "cancelled"]
+
+    response = client.delete("/api/v1/jobs/cancelled", headers={"X-CSRF-Token": token})
+
+    assert response.status_code == 200
+    assert response.json() == {"deleted_count": 2}
+    assert client.get("/api/v1/jobs").json() == preserved
+    assert client.delete(
+        "/api/v1/jobs/cancelled", headers={"X-CSRF-Token": token}
+    ).json() == {"deleted_count": 0}
+
+
+def test_concurrent_delete_all_counts_cancelled_job_once(api_client):
+    client, _, token, source_id, profile_id = api_client
+    job_id = _enqueue(client, token, source_id, profile_id).json()["id"]
+    headers = {"X-CSRF-Token": token}
+    client.post(f"/api/v1/jobs/{job_id}/cancel", headers=headers)
+    responses = []
+
+    def delete_all():
+        responses.append(client.delete("/api/v1/jobs/cancelled", headers=headers))
+
+    threads = [Thread(target=delete_all) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(5)
+
+    assert len(responses) == 2
+    assert all(response.status_code == 200 for response in responses)
+    assert sorted(response.json()["deleted_count"] for response in responses) == [0, 1]
+
+
 def test_concurrent_internal_claims_return_job_once(api_client):
     client, _, token, source_id, profile_id = api_client
     job_id = _enqueue(client, token, source_id, profile_id).json()["id"]
@@ -458,7 +588,7 @@ def test_complete_rejects_unsafe_artifact_symlink_without_state_change(
         json={
             "worker_id": "worker-a",
             "profile_version": 4,
-            "pipeline_version": "pipeline-v1",
+            "pipeline_version": "v2",
             "artifact_paths": [str(link)],
         },
         headers={"X-Worker-Token": WORKER_TOKEN},

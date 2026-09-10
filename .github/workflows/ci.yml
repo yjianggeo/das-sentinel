@@ -51,7 +51,7 @@ jobs:
       - name: Wait for JSON health
         run: |
           for attempt in $(seq 1 60); do
-            python -c "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/healthz')) == {'status':'ok'}" && exit 0
+            python -c "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/healthz')) == {'status':'ok','pipeline_version':'v2'}" && exit 0
             sleep 2
           done
           exit 1

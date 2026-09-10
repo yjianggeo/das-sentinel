@@ -50,10 +50,10 @@ def _settings(tmp_path: Path) -> Settings:
     )
 
 
-def _write_source(path: Path, sample_count: int = 200) -> None:
+def _write_source(path: Path, sample_count: int = 200, channel_count: int = 5) -> None:
     sample_rate_hz = 100.0
     samples = np.arange(sample_count, dtype=np.float32) / sample_rate_hz
-    channels = np.arange(5, dtype=np.float32)
+    channels = np.arange(channel_count, dtype=np.float32)
     data = np.sin(2 * np.pi * 8 * samples[:, None] + channels[None, :])
     data[:, 2] = 0.0
     start = datetime(2026, 7, 26, tzinfo=UTC)
@@ -297,6 +297,78 @@ def test_waterfall_preview_returns_three_pngs_after_one_read_without_writes(
         }
     assert before_data_root == _tree_snapshot(settings.data_root)
     assert original_artifact.read_bytes() == before_artifact_bytes
+    assert before_artifacts == sorted(
+        path.relative_to(settings.app_data_dir).as_posix()
+        for path in settings.app_data_dir.rglob("*")
+    )
+
+
+@pytest.mark.parametrize(
+    ("channel_count", "expected_stop_m", "expected_usable_channels"),
+    [(832, 3332.0, 831), (1663, 6656.0, 1662)],
+)
+def test_waterfall_preview_reads_full_source_distance_without_writes(
+    waterfall_api, monkeypatch, channel_count, expected_stop_m, expected_usable_channels
+):
+    """Rejecting or truncating a full JJK channel range must fail."""
+    client, settings, sessions, csrf_token, ids, source_path = waterfall_api
+    _write_source(source_path, sample_count=300, channel_count=channel_count)
+    with sessions.begin() as session:
+        source = session.get(SourceFile, ids["source"])
+        source.fingerprint = fingerprint(source_path)
+        source.size_bytes = source_path.stat().st_size
+        source.mtime_ns = source_path.stat().st_mtime_ns
+        event = session.get(Event, ids["event"])
+        run = session.get(ProcessingRun, event.processing_run_id)
+        run.source_fingerprint = source.fingerprint
+
+    reader = client.app.state.waterfall_preview_service.reader
+    original_read = reader.read_block
+    reads = []
+
+    def capture_read(path, start, stop, channels):
+        reads.append((start, stop, channels))
+        return original_read(path, start, stop, channels)
+
+    monkeypatch.setattr(reader, "read_block", capture_read)
+    with sessions() as session:
+        before_rows = {
+            table.name: session.execute(select(table)).all()
+            for table in Base.metadata.sorted_tables
+        }
+    before_data_root = _tree_snapshot(settings.data_root)
+    before_source_stat = source_path.stat()
+    before_artifacts = sorted(
+        path.relative_to(settings.app_data_dir).as_posix()
+        for path in settings.app_data_dir.rglob("*")
+    )
+
+    options = client.get(f"/api/v1/events/{ids['event']}/waterfall-options")
+    assert options.status_code == 200
+    assert options.json()["available_distance_start_m"] == 8.0
+    assert options.json()["available_distance_stop_m"] == expected_stop_m
+    assert reads == []
+    response = client.post(
+        f"/api/v1/events/{ids['event']}/waterfall-preview",
+        json={"distance_start_m": 8.0, "distance_stop_m": expected_stop_m},
+        headers={"X-CSRF-Token": csrf_token},
+    )
+
+    assert response.status_code == 200, response.text
+    assert reads == [(0, 300, slice(0, channel_count))]
+    body = response.json()
+    assert (body["distance_start_m"], body["distance_stop_m"], body["channel_count"]) == (
+        8.0, expected_stop_m, expected_usable_channels
+    )
+    for image_field in ("raw_png_base64", "filtered_png_base64", "waveform_png_base64"):
+        assert base64.b64decode(body[image_field]).startswith(b"\x89PNG\r\n\x1a\n")
+    with sessions() as session:
+        assert before_rows == {
+            table.name: session.execute(select(table)).all()
+            for table in Base.metadata.sorted_tables
+        }
+    assert before_data_root == _tree_snapshot(settings.data_root)
+    assert source_path.stat().st_mtime_ns == before_source_stat.st_mtime_ns
     assert before_artifacts == sorted(
         path.relative_to(settings.app_data_dir).as_posix()
         for path in settings.app_data_dir.rglob("*")
@@ -679,7 +751,7 @@ def test_waterfall_preview_rejects_oversized_channel_read_before_read(
         event = session.get(Event, ids["event"])
         assert event is not None
         event.channel_start = 0
-        event.channel_stop = 257
+        event.channel_stop = 2049
         evidence = event.evidence[0]
         evidence.payload_json = json.dumps(
             {
@@ -687,13 +759,13 @@ def test_waterfall_preview_rejects_oversized_channel_read_before_read(
                 "end_sample": 40,
                 "peak_sample": 30,
                 "channel_start": 0,
-                "channel_stop": 257,
+                "channel_stop": 2049,
             }
         )
 
     def wide_metadata(path):
         metadata = original_metadata(path)
-        distances = np.full(257, 100.0)
+        distances = np.full(2049, 100.0)
         distances[0], distances[-1] = 0.0, 1.0
         return replace(metadata, channel_distance_m=distances)
 

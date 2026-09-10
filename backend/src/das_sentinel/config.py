@@ -5,6 +5,8 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+PIPELINE_VERSION = "v2"
+
 
 class ProcessingProfile(BaseModel):
     model_config = ConfigDict(frozen=True)
@@ -130,7 +132,7 @@ class Settings(BaseSettings):
     session_secret: str = Field(min_length=32)
     worker_token: str = Field(min_length=32)
     secure_cookies: bool = True
-    pipeline_version: str = "v1"
+    pipeline_version: Literal["v2"] = "v2"
     worker_device: Literal["auto", "cpu", "cuda"] = "auto"
 
     @model_validator(mode="after")

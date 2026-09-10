@@ -48,14 +48,17 @@ export function useWaterfallPreview(eventId: string): {
   options: WaterfallOptions | null;
   optionsError: string;
   preview: WaterfallPreviewUrls | null;
+  original: boolean;
   busy: boolean;
   error: string;
   generate(startM?: number, stopM?: number): Promise<void>;
+  rejectPreview(url: string): boolean;
   reset(): void;
 } {
   const [options, setOptions] = useState<WaterfallOptions | null>(null);
   const [optionsError, setOptionsError] = useState("");
   const [preview, setPreview] = useState<WaterfallPreviewUrls | null>(null);
+  const [original, setOriginal] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const controllerRef = useRef<AbortController | null>(null);
@@ -68,48 +71,12 @@ export function useWaterfallPreview(eventId: string): {
     setPreview(next);
   }, []);
 
-  useEffect(() => {
-    controllerRef.current?.abort();
-    const controller = new AbortController();
-    controllerRef.current = controller;
-    const sequence = ++sequenceRef.current;
-    replacePreview(null);
-    setOptions(null);
-    setOptionsError("");
-    setError("");
-    setBusy(false);
-
-    api
-      .get<WaterfallOptions>(
-        `/api/v1/events/${eventId}/waterfall-options`,
-        undefined,
-        controller.signal,
-      )
-      .then((value) => {
-        if (sequence === sequenceRef.current && !controller.signal.aborted) {
-          setOptions(value);
-        }
-      })
-      .catch(() => {
-        if (sequence === sequenceRef.current && !controller.signal.aborted) {
-          setOptionsError("无法加载瀑布图范围");
-        }
-      });
-
-    return () => {
-      controller.abort();
-      controllerRef.current?.abort();
-      controllerRef.current = null;
-      sequenceRef.current += 1;
-      replacePreview(null);
-    };
-  }, [eventId, replacePreview]);
-
   const generate = useCallback(async (startM?: number, stopM?: number) => {
     controllerRef.current?.abort();
     const controller = new AbortController();
     controllerRef.current = controller;
     const sequence = ++sequenceRef.current;
+    setOriginal(false);
     setBusy(true);
     setError("");
     try {
@@ -138,10 +105,64 @@ export function useWaterfallPreview(eventId: string): {
     }
   }, [eventId, replacePreview]);
 
-  const reset = useCallback(() => {
+  useEffect(() => {
+    controllerRef.current?.abort();
+    const controller = new AbortController();
+    controllerRef.current = controller;
+    const sequence = ++sequenceRef.current;
     replacePreview(null);
+    setOriginal(false);
+    setOptions(null);
+    setOptionsError("");
+    setError("");
+    setBusy(false);
+
+    api
+      .get<WaterfallOptions>(
+        `/api/v1/events/${eventId}/waterfall-options`,
+        undefined,
+        controller.signal,
+      )
+      .then((value) => {
+        if (sequence === sequenceRef.current && !controller.signal.aborted) {
+          setOptions(value);
+          void generate();
+        }
+      })
+      .catch(() => {
+        if (sequence === sequenceRef.current && !controller.signal.aborted) {
+          setOptionsError("无法加载瀑布图范围");
+        }
+      });
+
+    return () => {
+      controller.abort();
+      controllerRef.current?.abort();
+      controllerRef.current = null;
+      sequenceRef.current += 1;
+      replacePreview(null);
+    };
+  }, [eventId, generate, replacePreview]);
+
+  const reset = useCallback(() => {
+    controllerRef.current?.abort();
+    sequenceRef.current += 1;
+    replacePreview(null);
+    setOriginal(true);
+    setBusy(false);
     setError("");
   }, [replacePreview]);
 
-  return { options, optionsError, preview, busy, error, generate, reset };
+  const rejectPreview = useCallback((url: string) => {
+    if (!previewRef.current || !Object.values(previewRef.current).includes(url)) return false;
+    controllerRef.current?.abort();
+    sequenceRef.current += 1;
+    replacePreview(null);
+    setOriginal(false);
+    setBusy(false);
+    setError("临时预览图件加载失败");
+    return true;
+  }, [replacePreview]);
+
+  return { options, optionsError, preview, original, busy, error, generate, rejectPreview, reset };
 }

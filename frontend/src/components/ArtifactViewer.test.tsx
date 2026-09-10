@@ -1,4 +1,5 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { StrictMode } from "react";
+import { act, fireEvent, render, renderHook, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { transferableAbortController } from "node:util";
 import { http, HttpResponse } from "msw";
@@ -6,6 +7,7 @@ import { setupServer } from "msw/node";
 import { afterAll, beforeAll, beforeEach, expect, it, vi } from "vitest";
 import type { EventArtifact } from "../api";
 import ArtifactViewer from "./ArtifactViewer";
+import { useWaterfallPreview } from "./useWaterfallPreview";
 
 const ARTIFACTS: EventArtifact[] = [
   { id: "art-1", kind: "waterfall_raw", media_type: "image/png" },
@@ -82,6 +84,9 @@ beforeEach(() => {
     http.get("/api/v1/events/:eventId/waterfall-options", () =>
       HttpResponse.json(OPTIONS),
     ),
+    http.post("/api/v1/events/:eventId/waterfall-preview", () =>
+      HttpResponse.json(PREVIEW),
+    ),
     http.get("/api/v1/artifacts/:artifactId", () =>
       new HttpResponse(new Blob(["png"], { type: "image/png" })),
     ),
@@ -136,6 +141,8 @@ it("keeps a loaded image visible when selecting the already active tab", async (
   const waterfall = screen.getAllByRole("tab")[0];
   const psd = screen.getByRole("tab", { name: "PSD" });
 
+  await screen.findByText("当前显示临时预览");
+  await userEvent.click(screen.getByRole("button", { name: "查看原始图件" }));
   const waterfallImage = await screen.findByRole("img");
   await userEvent.click(waterfall);
   waterfall.focus();
@@ -164,7 +171,7 @@ it("renders a bidirectionally linked panel for every artifact tab", () => {
   }
 });
 
-it("shows and retries an image decoding failure", async () => {
+it("shows and retries an original image decoding failure", async () => {
   let requests = 0;
   server.use(
     http.get("/api/v1/artifacts/art-1", () => {
@@ -174,11 +181,67 @@ it("shows and retries an image decoding failure", async () => {
   );
   render(<ArtifactViewer eventId="event-1" artifacts={ARTIFACTS} />);
 
+  await screen.findByText("当前显示临时预览");
+  await userEvent.click(screen.getByRole("button", { name: "查看原始图件" }));
   fireEvent.error(await screen.findByAltText("事件瀑布图"));
   expect(screen.getByRole("alert")).toHaveTextContent("图件加载失败");
   await userEvent.click(screen.getByRole("button", { name: "重试图件" }));
 
   await waitFor(() => expect(requests).toBe(2));
+});
+
+it("falls back explicitly when a preview image fails to decode and cancels a pending replacement", async () => {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let pendingSignal: AbortSignal | undefined;
+  let requests = 0;
+  server.use(http.post("/api/v1/events/event-1/waterfall-preview", async ({ request }) => {
+    requests += 1;
+    if (requests === 2) {
+      pendingSignal = request.signal;
+      await blocked;
+    }
+    return HttpResponse.json(PREVIEW);
+  }));
+  render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
+  await screen.findByText("当前显示临时预览");
+  const previewUrl = screen.getByAltText("事件瀑布图").getAttribute("src");
+  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+  await waitFor(() => expect(pendingSignal).toBeDefined());
+  await userEvent.click(screen.getByRole("button", { name: "全屏查看" }));
+  fireEvent.error(within(screen.getByRole("dialog")).getByAltText("事件瀑布图"));
+
+  expect(screen.getByRole("alert")).toHaveTextContent("临时预览图件加载失败");
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(pendingSignal?.aborted).toBe(true);
+  expect(URL.revokeObjectURL).toHaveBeenCalledTimes(3);
+  expect(URL.revokeObjectURL).toHaveBeenCalledWith(previewUrl);
+  await screen.findByText(/当前显示原始图件.*预览不可用/);
+  const originalUrl = screen.getByAltText("事件瀑布图").getAttribute("src");
+  expect(originalUrl).not.toBe(previewUrl);
+  expect(screen.getByRole("link", { name: "下载" })).toHaveAttribute("href", "/api/v1/artifacts/art-1");
+  await act(async () => {
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  expect(screen.getByAltText("事件瀑布图")).toHaveAttribute("src", originalUrl);
+  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+  await screen.findByText("当前显示临时预览");
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(screen.getByAltText("事件瀑布图")).not.toHaveAttribute("src", originalUrl);
+});
+
+it("ignores a late decode error for a preview trio that has already been replaced", async () => {
+  const { result } = renderHook(() => useWaterfallPreview("event-1"));
+  await waitFor(() => expect(result.current.preview).not.toBeNull());
+  const firstUrl = result.current.preview!.waterfall_raw;
+  await act(async () => { await result.current.generate(); });
+  const currentPreview = result.current.preview;
+  expect(currentPreview!.waterfall_raw).not.toBe(firstUrl);
+  act(() => { result.current.rejectPreview(firstUrl); });
+  expect(result.current.preview).toEqual(currentPreview);
+  expect(result.current.error).toBe("");
+  expect(URL.revokeObjectURL).toHaveBeenCalledTimes(3);
 });
 
 it("focuses the fullscreen close control and restores its trigger on Escape", async () => {
@@ -209,20 +272,16 @@ it("does not close the fullscreen dialog when its content is clicked", async () 
 
 it("revokes replaced and unmounted object URLs", async () => {
   const view = render(<ArtifactViewer eventId="event-1" artifacts={ARTIFACTS} />);
-  expect(await screen.findByAltText("事件瀑布图")).toHaveAttribute(
-    "src",
-    "blob:artifact-1",
-  );
+  await screen.findByText("当前显示临时预览");
+  await userEvent.click(screen.getByRole("button", { name: "查看原始图件" }));
+  const originalRawUrl = (await screen.findByAltText("事件瀑布图")).getAttribute("src");
 
   await userEvent.click(screen.getByRole("tab", { name: "PSD" }));
-  expect(await screen.findByAltText("事件功率谱")).toHaveAttribute(
-    "src",
-    "blob:artifact-2",
-  );
-  expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:artifact-1");
+  const psdUrl = (await screen.findByAltText("事件功率谱")).getAttribute("src");
+  expect(URL.revokeObjectURL).toHaveBeenCalledWith(originalRawUrl);
 
   view.unmount();
-  expect(URL.revokeObjectURL).toHaveBeenCalledWith("blob:artifact-2");
+  expect(URL.revokeObjectURL).toHaveBeenCalledWith(psdUrl);
 });
 
 it("renders the available range, defaults, actual filter band, and detector", async () => {
@@ -249,7 +308,7 @@ it("sends an empty automatic request before edits and again after reset", async 
   await screen.findByText("可用 8–24 m");
   await waitForDefaultDistanceInputs();
   const generate = screen.getByRole("button", { name: "生成临时预览" });
-  await userEvent.click(generate);
+  await screen.findByText("当前显示临时预览");
   await waitFor(() => expect(requestBodies).toHaveLength(1));
   expect(requestBodies[0]).toEqual({});
 
@@ -258,11 +317,165 @@ it("sends an empty automatic request before edits and again after reset", async 
   expect(stopInput).toHaveValue(null);
   await userEvent.type(stopInput, "21");
   expect(stopInput).toHaveValue(21);
-  await userEvent.click(screen.getByRole("button", { name: "重置临时预览" }));
+  await userEvent.click(screen.getByRole("button", { name: "查看原始图件" }));
   await userEvent.click(generate);
 
   await waitFor(() => expect(requestBodies).toHaveLength(2));
   expect(requestBodies[1]).toEqual({});
+});
+
+it("automatically loads one preview trio after options and hides old images and download while waiting", async () => {
+  let releaseOptions!: () => void;
+  let releasePreview!: () => void;
+  const optionsBlocked = new Promise<void>((resolve) => { releaseOptions = resolve; });
+  const previewBlocked = new Promise<void>((resolve) => { releasePreview = resolve; });
+  const requestBodies: unknown[] = [];
+  let originalRequests = 0;
+  server.use(
+    http.get("/api/v1/events/event-1/waterfall-options", async () => {
+      await optionsBlocked;
+      return HttpResponse.json(OPTIONS);
+    }),
+    http.post("/api/v1/events/event-1/waterfall-preview", async ({ request }) => {
+      requestBodies.push(await request.json());
+      await previewBlocked;
+      return HttpResponse.json(PREVIEW);
+    }),
+    http.get("/api/v1/artifacts/:artifactId", () => {
+      originalRequests += 1;
+      return new HttpResponse(new Blob(["old UTC image"], { type: "image/png" }));
+    }),
+  );
+  render(<StrictMode><ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} /></StrictMode>);
+
+  expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "下载" })).not.toBeInTheDocument();
+  expect(requestBodies).toEqual([]);
+  await act(async () => { releaseOptions(); });
+  await waitFor(() => expect(requestBodies).toEqual([{}]));
+  expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "下载" })).not.toBeInTheDocument();
+  await act(async () => { releasePreview(); });
+  const rawUrl = (await screen.findByAltText("事件瀑布图")).getAttribute("src");
+  expect(rawUrl).toMatch(/^blob:/);
+  expect(screen.getByRole("link", { name: "下载" })).toHaveAttribute("href", rawUrl);
+  await userEvent.click(screen.getByRole("tab", { name: "滤波瀑布图" }));
+  expect(screen.getByAltText("事件滤波瀑布图")).toBeVisible();
+  await userEvent.click(screen.getByRole("tab", { name: "波形" }));
+  expect(screen.getByAltText("事件波形图")).toBeVisible();
+  await userEvent.click(screen.getByRole("tab", { name: "瀑布图" }));
+  expect(screen.getByAltText("事件瀑布图")).toHaveAttribute("src", rawUrl);
+  expect(requestBodies).toEqual([{}]);
+  expect(originalRequests).toBe(0);
+});
+
+it.each([
+  ["waterfall_raw", "瀑布图"],
+  ["waterfall_filtered", "滤波瀑布图"],
+  ["waveform", "波形"],
+])("prefers %s over PSD or STFT when opening an event", async (kind, name) => {
+  server.use(http.post("/api/v1/events/:eventId/waterfall-preview", () => HttpResponse.json(PREVIEW)));
+  const artifacts = [
+    { id: "art-2", kind: "psd", media_type: "image/png" },
+    { id: "art-5", kind: "stft", media_type: "image/png" },
+    { id: "art-selected", kind, media_type: "image/png" },
+  ];
+  render(<ArtifactViewer eventId="event-1" artifacts={artifacts} />);
+  expect(screen.getByRole("tab", { name })).toHaveAttribute("aria-selected", "true");
+  await screen.findByText("当前显示临时预览");
+});
+
+it.each(["options", "preview"])("labels original fallback when automatic %s loading fails", async (failure) => {
+  server.use(
+    http.get("/api/v1/events/event-1/waterfall-options", () => failure === "options"
+      ? HttpResponse.json({ detail: "unavailable" }, { status: 500 })
+      : HttpResponse.json(OPTIONS)),
+    http.post("/api/v1/events/event-1/waterfall-preview", () =>
+      HttpResponse.json({ detail: "unavailable" }, { status: 500 })),
+  );
+  render(<ArtifactViewer eventId="event-1" artifacts={ARTIFACTS} />);
+  await screen.findByRole("alert");
+  expect(await screen.findByText(/当前显示原始图件/)).toBeVisible();
+  expect(screen.getByText(/预览不可用/)).toBeVisible();
+  expect(await screen.findByAltText("事件瀑布图")).toBeVisible();
+});
+
+it("keeps originals explicitly selected until regeneration or the event changes", async () => {
+  const requestedEvents: string[] = [];
+  server.use(http.post("/api/v1/events/:eventId/waterfall-preview", ({ params }) => {
+    requestedEvents.push(String(params.eventId));
+    return HttpResponse.json(PREVIEW);
+  }));
+  const view = render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
+  await screen.findByText("当前显示临时预览");
+  await userEvent.click(screen.getByRole("button", { name: "查看原始图件" }));
+  await screen.findByText(/当前显示原始图件/);
+  await userEvent.click(screen.getByRole("tab", { name: "波形" }));
+  await screen.findByAltText("事件波形图");
+  expect(screen.getByText(/当前显示原始图件/)).toBeVisible();
+  expect(requestedEvents).toEqual(["event-1"]);
+  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+  await screen.findByText("当前显示临时预览");
+  expect(requestedEvents).toEqual(["event-1", "event-1"]);
+  await userEvent.click(screen.getByRole("button", { name: "查看原始图件" }));
+  view.rerender(<ArtifactViewer eventId="event-2" artifacts={PREVIEW_ARTIFACTS} />);
+  expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "下载" })).not.toBeInTheDocument();
+  expect(screen.getByRole("tab", { name: "瀑布图" })).toHaveAttribute("aria-selected", "true");
+  await screen.findByText("当前显示临时预览");
+  expect(requestedEvents).toEqual(["event-1", "event-1", "event-2"]);
+});
+
+it("does not generate a preview from options that arrive after leaving the event", async () => {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  let optionsSignal: AbortSignal | undefined;
+  const requestedEvents: string[] = [];
+  server.use(
+    http.get("/api/v1/events/event-1/waterfall-options", async ({ request }) => {
+      optionsSignal = request.signal;
+      await blocked;
+      return HttpResponse.json(OPTIONS);
+    }),
+    http.post("/api/v1/events/:eventId/waterfall-preview", ({ params }) => {
+      requestedEvents.push(String(params.eventId));
+      return HttpResponse.json(PREVIEW);
+    }),
+  );
+  const view = render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
+  await waitFor(() => expect(optionsSignal).toBeDefined());
+  view.rerender(<ArtifactViewer eventId="event-2" artifacts={PREVIEW_ARTIFACTS} />);
+  expect(optionsSignal?.aborted).toBe(true);
+  await screen.findByText("当前显示临时预览");
+  const currentUrl = screen.getByAltText("事件瀑布图").getAttribute("src");
+  await act(async () => {
+    release();
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  });
+  expect(requestedEvents).toEqual(["event-2"]);
+  expect(screen.getByAltText("事件瀑布图")).toHaveAttribute("src", currentUrl);
+});
+
+it("clears the previous event preview and fullscreen while the next event is preparing", async () => {
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => { release = resolve; });
+  server.use(http.post("/api/v1/events/event-2/waterfall-preview", async () => {
+    await blocked;
+    return HttpResponse.json(PREVIEW);
+  }));
+  const view = render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
+  await screen.findByText("当前显示临时预览");
+  const previousUrl = screen.getByAltText("事件瀑布图").getAttribute("src");
+  await userEvent.click(screen.getByRole("button", { name: "全屏查看" }));
+  expect(screen.getByRole("dialog")).toBeVisible();
+  view.rerender(<ArtifactViewer eventId="event-2" artifacts={PREVIEW_ARTIFACTS} />);
+  expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  expect(screen.queryByRole("link", { name: "下载" })).not.toBeInTheDocument();
+  expect(URL.revokeObjectURL).toHaveBeenCalledTimes(3);
+  await act(async () => { release(); });
+  await screen.findByText("当前显示临时预览");
+  expect(screen.getByAltText("事件瀑布图")).not.toHaveAttribute("src", previousUrl);
 });
 
 it("sends both numeric bounds after either distance input is edited", async () => {
@@ -285,8 +498,39 @@ it("sends both numeric bounds after either distance input is edited", async () =
   expect(stopInput).toHaveValue(21);
   await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
 
-  await waitFor(() => expect(requestBody).toBeDefined());
-  expect(requestBody).toEqual({ distance_start_m: 12, distance_stop_m: 21 });
+  await waitFor(() => expect(requestBody).toEqual({ distance_start_m: 12, distance_stop_m: 21 }));
+});
+
+it("selects the full available distance range before explicitly generating the preview", async () => {
+  const requestBodies: unknown[] = [];
+  server.use(
+    http.post("/api/v1/events/event-1/waterfall-preview", async ({ request }) => {
+      requestBodies.push(await request.json());
+      return HttpResponse.json(PREVIEW);
+    }),
+  );
+  render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
+  await screen.findByText("当前显示临时预览");
+  await waitForDefaultDistanceInputs();
+
+  await userEvent.clear(screen.getByLabelText("起始距离（m）"));
+  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+  expect(screen.getByRole("alert")).toHaveTextContent("请输入有效距离");
+  await userEvent.click(screen.getByRole("button", { name: "全距离范围" }));
+
+  expect(screen.getByLabelText("起始距离（m）")).toHaveValue(8);
+  expect(screen.getByLabelText("结束距离（m）")).toHaveValue(24);
+  expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  expect(requestBodies).toEqual([{}]);
+  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+  await waitFor(() => expect(requestBodies).toEqual([
+    {}, { distance_start_m: 8, distance_stop_m: 24 },
+  ]));
+  await waitFor(() => expect(screen.getByRole("button", { name: "查看原始图件" })).toBeEnabled());
+  await userEvent.click(screen.getByRole("button", { name: "查看原始图件" }));
+  await waitForDefaultDistanceInputs();
+  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+  await waitFor(() => expect(requestBodies[2]).toEqual({}));
 });
 
 it("returns to automatic mode when the selected event options change", async () => {
@@ -322,7 +566,7 @@ it("returns to automatic mode when the selected event options change", async () 
   expect(stopInput).toHaveValue(21);
   view.rerender(<ArtifactViewer eventId="event-2" artifacts={PREVIEW_ARTIFACTS} />);
   await waitFor(() => expect(screen.getByLabelText("结束距离（m）")).toHaveValue(19));
-  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+  await screen.findByText("当前显示临时预览");
 
   await waitFor(() => expect(requestBody).toBeDefined());
   expect(requestBody).toEqual({});
@@ -351,7 +595,7 @@ it("allows an untouched single-channel automatic range", async () => {
   render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
 
   await screen.findByText("可用 8–24 m");
-  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+  await screen.findByText("当前显示临时预览");
 
   await waitFor(() => expect(requestBody).toEqual({}));
   expect(screen.getByRole("img", { name: "事件瀑布图" })).toHaveAttribute(
@@ -360,7 +604,7 @@ it("allows an untouched single-channel automatic range", async () => {
   );
 });
 
-it("rejects a blank manual distance before numeric conversion without posting", async () => {
+it("rejects a blank manual distance without posting again after the automatic preview", async () => {
   // Catches Number("") silently converting a blank bound to zero.
   let postCount = 0;
   server.use(
@@ -373,16 +617,18 @@ it("rejects a blank manual distance before numeric conversion without posting", 
 
   await screen.findByText("可用 8–24 m");
   await waitForDefaultDistanceInputs();
+  await screen.findByText("当前显示临时预览");
+  expect(postCount).toBe(1);
   const startInput = screen.getByLabelText("起始距离（m）");
   await userEvent.clear(startInput);
   expect(startInput).toHaveValue(null);
   await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
 
   expect(screen.getByRole("alert")).toHaveTextContent("请输入有效距离");
-  expect(postCount).toBe(0);
+  expect(postCount).toBe(1);
 });
 
-it("rejects an invalid manual distance range without posting", async () => {
+it("rejects an invalid manual distance range without posting again after the automatic preview", async () => {
   // Catches client-side validation being bypassed before the preview POST.
   let postCount = 0;
   server.use(
@@ -395,6 +641,8 @@ it("rejects an invalid manual distance range without posting", async () => {
 
   await screen.findByText("可用 8–24 m");
   await waitForDefaultDistanceInputs();
+  await screen.findByText("当前显示临时预览");
+  expect(postCount).toBe(1);
   const stopInput = screen.getByLabelText("结束距离（m）");
   await userEvent.clear(stopInput);
   expect(stopInput).toHaveValue(null);
@@ -403,7 +651,7 @@ it("rejects an invalid manual distance range without posting", async () => {
   await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
 
   expect(screen.getByRole("alert")).toHaveTextContent("起始距离必须小于结束距离");
-  expect(postCount).toBe(0);
+  expect(postCount).toBe(1);
 });
 
 it("uses one preview response for both waterfalls and waveform while PSD and STFT stay original", async () => {
@@ -417,7 +665,7 @@ it("uses one preview response for both waterfalls and waveform while PSD and STF
 
   await screen.findByText("可用 8–24 m");
   await waitForDefaultDistanceInputs();
-  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+  await screen.findByText("当前显示临时预览");
 
   await waitFor(() => {
     expect(screen.getByRole("img", { name: "事件瀑布图" })).toHaveAttribute(
@@ -461,12 +709,14 @@ it("uses one preview response for both waterfalls and waveform while PSD and STF
   );
 
   await userEvent.click(screen.getByRole("tab", { name: "PSD" }));
+  await screen.findByAltText("事件功率谱");
   expect(screen.queryByText("当前显示临时预览")).not.toBeInTheDocument();
   expect(screen.getByRole("link", { name: "下载" })).toHaveAttribute(
     "href",
     "/api/v1/artifacts/art-2",
   );
   await userEvent.click(screen.getByRole("tab", { name: "STFT" }));
+  await screen.findByAltText("事件时频图");
   expect(screen.queryByText("当前显示临时预览")).not.toBeInTheDocument();
   expect(screen.getByRole("link", { name: "下载" })).toHaveAttribute(
     "href",
@@ -474,7 +724,7 @@ it("uses one preview response for both waterfalls and waveform while PSD and STF
   );
 });
 
-it("reset restores automatic inputs, clears validation, permanent URLs, and preview objects", async () => {
+it("viewing originals restores automatic inputs, clears validation, and revokes the preview trio", async () => {
   // Catches a URL-only reset that leaves edited inputs or validation behind.
   server.use(
     http.post("/api/v1/events/event-1/waterfall-preview", () =>
@@ -485,7 +735,7 @@ it("reset restores automatic inputs, clears validation, permanent URLs, and prev
 
   await screen.findByText("可用 8–24 m");
   await waitForDefaultDistanceInputs();
-  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+  await screen.findByText("当前显示临时预览");
   const rawUrl = await waitFor(() => {
     const url = screen.getByRole("img", { name: "事件瀑布图" }).getAttribute("src");
     expect(url).toMatch(/^blob:/);
@@ -506,12 +756,12 @@ it("reset restores automatic inputs, clears validation, permanent URLs, and prev
   await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
   expect(screen.getByRole("alert")).toHaveTextContent("起始距离必须小于结束距离");
 
-  await userEvent.click(screen.getByRole("button", { name: "重置临时预览" }));
+  await userEvent.click(screen.getByRole("button", { name: "查看原始图件" }));
 
   expect(screen.getByLabelText("起始距离（m）")).toHaveValue(12);
   expect(screen.getByLabelText("结束距离（m）")).toHaveValue(20);
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
-  expect(screen.getByRole("link", { name: "下载" })).toHaveAttribute(
+  expect(await screen.findByRole("link", { name: "下载" })).toHaveAttribute(
     "href",
     "/api/v1/artifacts/art-3",
   );
@@ -537,7 +787,7 @@ it("revokes the first preview trio before displaying a second trio", async () =>
   render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
 
   await screen.findByText("可用 8–24 m");
-  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
+  await screen.findByText("当前显示临时预览");
   const firstRaw = await waitFor(() => {
     const url = screen.getByRole("img", { name: "事件瀑布图" }).getAttribute("src");
     expect(url).toMatch(/^blob:/);
@@ -565,7 +815,7 @@ it.each([409, 422, 500])("preserves the current preview after a %s response", as
   await screen.findByText("可用 8–24 m");
   await waitForDefaultDistanceInputs();
   const generate = screen.getByRole("button", { name: "生成临时预览" });
-  await userEvent.click(generate);
+  await screen.findByText("当前显示临时预览");
   const firstUrl = await waitFor(() => {
     const url = screen.getByRole("img", { name: "事件瀑布图" }).getAttribute("src");
     expect(url).toMatch(/^blob:/);
@@ -598,7 +848,7 @@ it("reclaims only the new raw and filtered URLs when the waveform Base64 decode 
   render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
   await screen.findByText("可用 8–24 m");
   const generate = screen.getByRole("button", { name: "生成临时预览" });
-  await userEvent.click(generate);
+  await screen.findByText("当前显示临时预览");
   const existingRawUrl = await waitFor(() => {
     const url = screen.getByRole("img", { name: "事件瀑布图" }).getAttribute("src");
     expect(url).toMatch(/^blob:/);
@@ -640,7 +890,7 @@ it("reclaims the first URL when the second createObjectURL call fails", async ()
   render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
   await screen.findByText("可用 8–24 m");
   const generate = screen.getByRole("button", { name: "生成临时预览" });
-  await userEvent.click(generate);
+  await screen.findByText("当前显示临时预览");
   const existingUrl = await waitFor(() => {
     const url = screen.getByRole("img", { name: "事件瀑布图" }).getAttribute("src");
     expect(url).toMatch(/^blob:/);
@@ -679,20 +929,21 @@ it("aborts superseded preview requests and ignores late results while revoking U
   );
   const view = render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
   await screen.findByText("可用 8–24 m");
-  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
   await waitFor(() => expect(postSignal).toBeDefined());
 
   view.rerender(<ArtifactViewer eventId="event-2" artifacts={PREVIEW_ARTIFACTS} />);
   expect(postSignal?.aborted).toBe(true);
+  expect(screen.queryByRole("img")).not.toBeInTheDocument();
+  await screen.findByText("当前显示临时预览");
+  const currentUrl = screen.getByAltText("事件瀑布图").getAttribute("src");
   await act(async () => {
     release();
     await new Promise((resolve) => setTimeout(resolve, 0));
   });
-  expect(screen.queryByRole("img", { name: "事件瀑布图" })).not.toHaveAttribute(
-    "src",
-    expect.stringMatching(/^blob:/),
-  );
+  expect(screen.getByAltText("事件瀑布图")).toHaveAttribute("src", currentUrl);
+  expect(URL.createObjectURL).toHaveBeenCalledTimes(3);
   view.unmount();
+  expect(URL.revokeObjectURL).toHaveBeenCalledTimes(3);
 });
 
 it("aborts a pending preview on direct unmount without creating late object URLs", async () => {
@@ -712,7 +963,6 @@ it("aborts a pending preview on direct unmount without creating late object URLs
   const view = render(<ArtifactViewer eventId="event-1" artifacts={PREVIEW_ARTIFACTS} />);
   await screen.findByText("可用 8–24 m");
   const createdBeforePreview = vi.mocked(URL.createObjectURL).mock.calls.length;
-  await userEvent.click(screen.getByRole("button", { name: "生成临时预览" }));
   await waitFor(() => expect(postSignal).toBeDefined());
 
   view.unmount();

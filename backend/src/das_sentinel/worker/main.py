@@ -47,6 +47,10 @@ class WorkerFatalProtocolError(RuntimeError):
     """A worker API response that must stop the polling process."""
 
 
+class WorkerClaimLostError(RuntimeError):
+    """The claimed job was removed or is no longer owned by this worker."""
+
+
 class CudaOutOfMemoryError(RuntimeError):
     """Explicit adapter exception for an exact CUDA allocation failure."""
 
@@ -178,6 +182,8 @@ class HttpxWorkerClient:
         method: str,
         path: str,
         json: dict[str, Any] | None = None,
+        *,
+        claimed_job_id: str | None = None,
     ) -> httpx.Response:
         try:
             response = self._client.request(method, path, json=json)
@@ -188,6 +194,20 @@ class HttpxWorkerClient:
                 f"worker API returned HTTP {response.status_code}"
             )
         if response.status_code >= 400:
+            if claimed_job_id is not None and response.status_code in {404, 409}:
+                try:
+                    body = response.json()
+                except ValueError:
+                    body = None
+                detail = body.get("detail") if isinstance(body, dict) else None
+                if (
+                    response.status_code == 404
+                    and detail == f"job not found: {claimed_job_id}"
+                ) or (
+                    response.status_code == 409
+                    and detail in ("job is not running", "worker is not the job owner")
+                ):
+                    raise WorkerClaimLostError("worker no longer owns the claimed job")
             raise WorkerFatalProtocolError(
                 f"worker API returned HTTP {response.status_code}"
             )
@@ -219,6 +239,7 @@ class HttpxWorkerClient:
                 "numerator": numerator,
                 "denominator": denominator,
             },
+            claimed_job_id=job_id,
         )
 
     def submit_result(self, job_id: str, payload: dict[str, Any]) -> None:
@@ -226,6 +247,7 @@ class HttpxWorkerClient:
             "POST",
             f"/api/v1/internal/jobs/{job_id}/result",
             json=payload,
+            claimed_job_id=job_id,
         )
 
     def fail(
@@ -245,6 +267,7 @@ class HttpxWorkerClient:
                 "error_message": error_message,
                 "retry_eligible": retry_eligible,
             },
+            claimed_job_id=job_id,
         )
 
 
@@ -278,7 +301,7 @@ class Worker:
         self.heartbeat_thread: threading.Thread | None = None
         self._heartbeat_stop: threading.Event | None = None
         self._heartbeat_error: (
-            WorkerTransientError | WorkerFatalProtocolError | None
+            WorkerTransientError | WorkerFatalProtocolError | WorkerClaimLostError | None
         ) = None
 
     def run_once(self) -> WorkerOutcome:
@@ -327,7 +350,7 @@ class Worker:
                     )
                     try:
                         self.client.submit_result(claim.id, payload)
-                    except (WorkerTransientError, WorkerFatalProtocolError):
+                    except (WorkerTransientError, WorkerFatalProtocolError, WorkerClaimLostError):
                         raise
                     except Exception as error:
                         raise ResultSubmissionError(
@@ -342,6 +365,13 @@ class Worker:
                     )
                 finally:
                     self._stop_heartbeat()
+        except WorkerClaimLostError:
+            self._stop_heartbeat()
+            return WorkerOutcome(
+                status="claim_lost",
+                job_id=claim.id,
+                requested_backend=requested_backend,
+            )
         except (WorkerTransientError, WorkerFatalProtocolError):
             self._stop_heartbeat()
             raise
@@ -349,12 +379,19 @@ class Worker:
             self._stop_heartbeat()
             code = _failure_code(error)
             message = self._safe_error_message(error, claim)
-            self._report_failure(
-                claim.id,
-                code,
-                message,
-                _failure_retry_eligible(error),
-            )
+            try:
+                self._report_failure(
+                    claim.id,
+                    code,
+                    message,
+                    _failure_retry_eligible(error),
+                )
+            except WorkerClaimLostError:
+                return WorkerOutcome(
+                    status="claim_lost",
+                    job_id=claim.id,
+                    requested_backend=requested_backend,
+                )
             return WorkerOutcome(
                 status="failed",
                 job_id=claim.id,
@@ -364,6 +401,8 @@ class Worker:
 
     @contextmanager
     def _validate_claim(self, claim: WorkerClaim):
+        if claim.pipeline_version != self.settings.pipeline_version:
+            raise ValueError("claim pipeline version does not match this worker")
         if claim.worker_id != self.worker_id:
             raise ValueError("claim worker does not match this worker")
         if claim.profile_version < 1 or claim.attempt_count < 1:
@@ -512,7 +551,7 @@ class Worker:
             while not stop.wait(self.heartbeat_interval_seconds):
                 try:
                     self.client.heartbeat(claim.id, self.worker_id, 0, 1)
-                except (WorkerTransientError, WorkerFatalProtocolError) as error:
+                except (WorkerTransientError, WorkerFatalProtocolError, WorkerClaimLostError) as error:
                     self._heartbeat_error = error
                     return
                 except Exception:  # noqa: BLE001 - heartbeat failure stops this helper
@@ -572,7 +611,7 @@ class Worker:
                 error_message,
                 retry_eligible,
             )
-        except (WorkerTransientError, WorkerFatalProtocolError):
+        except (WorkerTransientError, WorkerFatalProtocolError, WorkerClaimLostError):
             raise
         except Exception:  # noqa: BLE001 - failure reporting must not kill polling
             return False

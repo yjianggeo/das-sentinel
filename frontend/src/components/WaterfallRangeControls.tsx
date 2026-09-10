@@ -72,6 +72,13 @@ export default function WaterfallRangeControls({
     onReset();
   };
 
+  const selectFullRange = () => {
+    setStart(String(options.available_distance_start_m));
+    setStop(String(options.available_distance_stop_m));
+    setManual(true);
+    setValidationError("");
+  };
+
   return (
     <section className="waterfall-range-controls" aria-label="瀑布图距离范围">
       <p>可用 {options.available_distance_start_m}–{options.available_distance_stop_m} {options.distance_unit}</p>
@@ -106,13 +113,22 @@ export default function WaterfallRangeControls({
             }}
           />
         </label>
+        <button
+          type="button"
+          className="subtle"
+          onClick={selectFullRange}
+          disabled={busy || options.available_distance_start_m >= options.available_distance_stop_m}
+        >
+          全距离范围
+        </button>
         <button type="button" onClick={submit} disabled={busy} aria-busy={busy}>
           生成临时预览
         </button>
         <button type="button" className="subtle" onClick={reset} disabled={busy}>
-          重置临时预览
+          查看原始图件
         </button>
       </div>
+      <p>全距离范围覆盖源文件全部通道，预览仍按当前规则剔除坏道。</p>
       {busy && <p role="status">正在生成临时预览…</p>}
       {(validationError || error) && <p className="error" role="alert">{validationError || error}</p>}
     </section>

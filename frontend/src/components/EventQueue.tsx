@@ -35,6 +35,8 @@ export default function EventQueue({
   loadingMore,
   onLoadMore,
   showEmpty,
+  loading,
+  loadMoreError,
 }: {
   events: EventSummary[];
   selectedId: string | null;
@@ -47,9 +49,12 @@ export default function EventQueue({
   loadingMore: boolean;
   onLoadMore: () => void;
   showEmpty: boolean;
+  loading: boolean;
+  loadMoreError: string;
 }) {
   return (
     <aside className="event-queue" aria-label="事件队列">
+      <h2 className="event-panel-heading">事件队列</h2>
       <div className="queue-filters">
         <label>
           机器标签
@@ -81,6 +86,7 @@ export default function EventQueue({
           </select>
         </label>
       </div>
+      {loading && <p className="loading">正在加载…</p>}
       <ul className="queue-list">
         {events.map((event) => (
           <li key={event.id}>
@@ -106,6 +112,7 @@ export default function EventQueue({
         ))}
         {showEmpty && events.length === 0 && <li className="loading">暂无事件</li>}
       </ul>
+      {loadMoreError && <p className="error" role="alert">{loadMoreError}</p>}
       {hasMore && (
         <button
           type="button"

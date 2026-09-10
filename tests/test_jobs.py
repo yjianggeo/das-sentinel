@@ -14,7 +14,14 @@ from das_sentinel.persistence import (
     session_factory,
     upgrade_database,
 )
-from das_sentinel.persistence.models import Job
+from das_sentinel.persistence.models import (
+    Artifact,
+    Event,
+    Job,
+    ProcessingRun,
+    Review,
+    SourceFile,
+)
 from das_sentinel.services.jobs import (
     MAX_SQLITE_INTEGER,
     STALE_AFTER,
@@ -76,6 +83,100 @@ def test_enqueue_is_idempotent_for_source_profile_pipeline(job_database):
 
         assert second.id == first.id
         assert service.list() == [first]
+
+
+@pytest.mark.parametrize("delete_all", [False, True])
+def test_delete_cancelled_preserves_analysis_history_and_files(job_database, tmp_path, delete_all):
+    with seeded_service(job_database) as (service, repositories, _, profile, source):
+        job = service.enqueue(source.id, profile.id, "pipeline-v1")
+        service.cancel(job.id)
+        run = repositories.runs.add(
+            source_file_id=source.id,
+            processing_profile_id=profile.id,
+            pipeline_version="pipeline-v1",
+            requested_backend="cpu",
+            actual_backend="cpu",
+            job_id=job.id,
+            status="failed",
+        )
+        event = repositories.events.add(
+            run_id=run.id,
+            event_uid="preserved-event",
+            start_sample=0,
+            end_sample=20,
+            channel_start=0,
+            channel_stop=2,
+            occurred_at=datetime(2026, 9, 9, tzinfo=UTC),
+        )
+        review = repositories.reviews.add(event.id, label="earthquake", note="keep")
+        raw_path = tmp_path / "raw.h5"
+        raw_path.write_bytes(b"source-data")
+        source.path = str(raw_path)
+        artifact_path = service.artifact_root / job.id / "waterfall.png"
+        artifact_path.parent.mkdir()
+        artifact_path.write_bytes(b"retained-image")
+        artifact = repositories.artifacts.add(
+            event_id=event.id,
+            kind="waterfall",
+            path=str(artifact_path),
+            media_type="image/png",
+            sha256="b" * 64,
+        )
+        queued = service.enqueue(source.id, profile.id, "pipeline-v2")
+        queued_run = repositories.runs.add(
+            source_file_id=source.id,
+            processing_profile_id=profile.id,
+            pipeline_version="pipeline-v2",
+            requested_backend="cpu",
+            actual_backend="cpu",
+            job_id=queued.id,
+        )
+
+        if delete_all:
+            assert service.delete_cancelled() == 1
+        else:
+            service.delete(job.id)
+
+        service.session.expire_all()
+        assert service.session.get(Job, job.id) is None
+        assert service.get(queued.id).status == "queued"
+        assert service.session.get(ProcessingRun, run.id).job_id is None
+        assert service.session.get(ProcessingRun, queued_run.id).job_id == queued.id
+        assert service.session.get(SourceFile, source.id).path == str(raw_path)
+        assert service.session.get(Event, event.id).processing_run_id == run.id
+        assert service.session.get(Review, review.id).note == "keep"
+        assert service.session.get(Artifact, artifact.id).path == str(artifact_path)
+        assert raw_path.read_bytes() == b"source-data"
+        assert artifact_path.read_bytes() == b"retained-image"
+
+
+@pytest.mark.parametrize("delete_all", [False, True])
+def test_delete_cancelled_remains_in_callers_transaction(job_database, delete_all):
+    sessions, artifact_root = job_database
+    with seeded_service(job_database) as (service, repositories, _, profile, source):
+        job = service.enqueue(source.id, profile.id, "pipeline-v1")
+        service.cancel(job.id)
+        run = repositories.runs.add(
+            source_file_id=source.id,
+            processing_profile_id=profile.id,
+            pipeline_version="pipeline-v1",
+            requested_backend="cpu",
+            actual_backend="cpu",
+            job_id=job.id,
+        )
+        job_id, run_id = job.id, run.id
+
+    with sessions() as session:
+        service = JobService(session, artifact_root)
+        if delete_all:
+            service.delete_cancelled()
+        else:
+            service.delete(job_id)
+        session.rollback()
+
+    with sessions() as session:
+        assert session.get(Job, job_id).status == "cancelled"
+        assert session.get(ProcessingRun, run_id).job_id == job_id
 
 
 def test_enqueue_creates_new_job_after_nonretryable_failure(job_database):
@@ -335,6 +436,33 @@ def test_heartbeat_requires_strict_sqlite_range_integers_without_partial_change(
         assert (unchanged.progress_numerator, unchanged.progress_denominator) == (0, 0)
 
 
+@pytest.mark.parametrize(
+    ("numerator", "denominator", "completed_progress"),
+    [(0, 0, (1, 1)), (0, 1, (1, 1)), (4, 10, (10, 10))],
+)
+def test_complete_records_full_progress(
+    job_database, numerator, denominator, completed_progress
+):
+    with seeded_service(job_database) as (service, _, _, profile, source):
+        job = service.enqueue(source.id, profile.id, "pipeline-v1")
+        service.claim("worker-a")
+        service.heartbeat(job.id, "worker-a", numerator, denominator)
+
+        completed = service.complete(
+            job.id, "worker-a", profile.version, "pipeline-v1"
+        )
+
+        assert completed.status == "succeeded"
+        assert (
+            completed.progress_numerator, completed.progress_denominator
+        ) == completed_progress
+        service.session.expire_all()
+        persisted = service.get(job.id)
+        assert (
+            persisted.progress_numerator, persisted.progress_denominator
+        ) == completed_progress
+
+
 def test_complete_requires_owner_and_exact_versions(job_database, tmp_path: Path):
     with seeded_service(job_database) as (service, _, _, profile, source):
         job = service.enqueue(source.id, profile.id, "pipeline-v1")
@@ -342,6 +470,7 @@ def test_complete_requires_owner_and_exact_versions(job_database, tmp_path: Path
         artifact = service.artifact_root / "run" / "waterfall.png"
         artifact.parent.mkdir(parents=True)
         artifact.write_bytes(b"png")
+        before = service.heartbeat(job.id, "worker-a", 4, 10)
 
         with pytest.raises(JobConflictError, match="owner"):
             service.complete(
@@ -351,6 +480,7 @@ def test_complete_requires_owner_and_exact_versions(job_database, tmp_path: Path
                 "pipeline-v1",
                 [artifact],
             )
+        assert service.get(job.id) == before
         with pytest.raises(JobConflictError, match="profile version"):
             service.complete(
                 job.id,
@@ -359,6 +489,7 @@ def test_complete_requires_owner_and_exact_versions(job_database, tmp_path: Path
                 "pipeline-v1",
                 [artifact],
             )
+        assert service.get(job.id) == before
         with pytest.raises(JobConflictError, match="pipeline version"):
             service.complete(
                 job.id,
@@ -367,6 +498,7 @@ def test_complete_requires_owner_and_exact_versions(job_database, tmp_path: Path
                 "pipeline-v2",
                 [artifact],
             )
+        assert service.get(job.id) == before
 
         completed = service.complete(
             job.id,
@@ -399,6 +531,7 @@ def test_complete_rejects_unsafe_artifacts_without_changing_job(
         job = service.enqueue(source.id, profile.id, "pipeline-v1")
         service.claim("worker-a")
         unsafe = artifact_builder(service.artifact_root, outside)
+        before = service.heartbeat(job.id, "worker-a", 4, 10)
 
         with pytest.raises(JobValidationError, match="artifact"):
             service.complete(
@@ -409,7 +542,7 @@ def test_complete_rejects_unsafe_artifacts_without_changing_job(
                 [unsafe],
             )
 
-        assert service.get(job.id).status == "running"
+        assert service.get(job.id) == before
 
 
 def test_complete_rejects_symlinked_artifact_root_even_for_resolved_file(
@@ -537,6 +670,7 @@ def test_fail_retry_limit_and_cancel_transitions(job_database):
     with seeded_service(job_database) as (service, repositories, site, profile, source):
         failed_job = service.enqueue(source.id, profile.id, "pipeline-fail")
         service.claim("worker-a")
+        service.heartbeat(failed_job.id, "worker-a", 4, 10)
         failed = service.fail(
             failed_job.id,
             "worker-a",
@@ -547,6 +681,7 @@ def test_fail_retry_limit_and_cancel_transitions(job_database):
         assert failed.status == "failed"
         assert failed.retry_eligible is True
         assert failed.error_code == "analysis_failed"
+        assert (failed.progress_numerator, failed.progress_denominator) == (4, 10)
 
         retried = service.retry(failed_job.id)
         assert retried.status == "queued"

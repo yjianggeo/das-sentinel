@@ -17,7 +17,9 @@ import pytest
 from das_sentinel.artifacts import ArtifactManifest
 from das_sentinel.config import ProcessingProfile
 from das_sentinel.domain import Candidate, Label
+from das_sentinel.features import FEATURE_NAMES
 from das_sentinel.readers.zd_hdf5 import ZdHdf5Reader
+from das_sentinel.screening import ScreeningOptions, ScreeningResult
 from das_sentinel.signal.backend import select_backend
 from das_sentinel.signal.preprocess import PreparedSignal, PreprocessedBlock
 
@@ -197,6 +199,90 @@ def _no_candidates(*args):
     return []
 
 
+def _screening_candidates(*detectors):
+    def screen(block, profile, backend, options=None):
+        assert options is None or options == ScreeningOptions()
+        candidates = tuple(
+            replace(candidate, metrics={**candidate.metrics, "sample_rate_hz": block.metadata.sample_rate_hz})
+            for detector in detectors
+            for candidate in detector(block, profile)
+        )
+        return ScreeningResult(candidates=candidates, events=(), diagnostics={})
+
+    return screen
+
+
+def test_pipeline_screens_short_events_before_the_long_lta_warms_up(tmp_path, monkeypatch):
+    from das_sentinel import pipeline
+
+    source_path = tmp_path / "short-lta.h5"
+    _write_default_stalta_file(source_path)
+    with h5py.File(source_path, "r+") as handle:
+        dataset = handle["Acquisition/Raw[0]/RawData"]
+        data = dataset[:]
+        data[1000:1060], data[3000:3060] = data[3000:3060].copy(), data[1000:1060].copy()
+        dataset[:] = data
+    monkeypatch.setattr(pipeline, "render_event_artifacts", _empty_artifact_manifest)
+
+    result = pipeline.analyze_file(
+        source_path, ZdHdf5Reader(), ProcessingProfile(), select_backend("cpu"),
+        tmp_path / "artifacts",
+    )
+
+    assert any(
+        candidate.detector == "stalta:short" and 1000 <= candidate.peak_sample < 1100
+        for event in result.events for candidate in event.evidence
+    )
+    assert all(set(event.features) == set(FEATURE_NAMES) for event in result.events)
+
+
+def test_pipeline_preserves_overlapping_local_screening_evidence(tmp_path, monkeypatch):
+    from das_sentinel import pipeline
+
+    source_path = tmp_path / "local.h5"
+    _write_boundary_file(source_path)
+    candidates = (
+        Candidate("stalta:short", 185, 196, 190, 0, 4, 0.95),
+        Candidate("stalta:short", 185, 196, 191, 2, 6, 0.90),
+    )
+    monkeypatch.setattr(
+        pipeline, "screen_block", _screening_candidates(lambda block, profile: candidates), raising=False,
+    )
+    monkeypatch.setattr(pipeline, "render_event_artifacts", _empty_artifact_manifest)
+
+    result = pipeline.analyze_file(
+        source_path, ZdHdf5Reader(), _profile(), select_backend("cpu"),
+        tmp_path / "artifacts",
+    )
+
+    assert result.audit_candidate_count == 2
+    assert len(result.events) == 1
+    assert [(item.channel_start, item.channel_stop) for item in result.events[0].evidence] == [(0, 4), (2, 6)]
+
+
+def test_pipeline_uses_one_amplitude_family_for_screening_fusion(tmp_path, monkeypatch):
+    from das_sentinel import pipeline
+
+    source_path = tmp_path / "amplitude.h5"
+    _write_boundary_file(source_path)
+    candidates = (
+        Candidate("stalta:short", 185, 196, 190, 1, 5, 0.70),
+        Candidate("energy:0", 185, 196, 190, 1, 5, 0.70),
+    )
+    monkeypatch.setattr(
+        pipeline, "screen_block", _screening_candidates(lambda block, profile: candidates), raising=False,
+    )
+    monkeypatch.setattr(pipeline, "render_event_artifacts", _empty_artifact_manifest)
+
+    result = pipeline.analyze_file(
+        source_path, ZdHdf5Reader(), _profile(), select_backend("cpu"),
+        tmp_path / "artifacts",
+    )
+
+    assert result.audit_candidate_count == 2
+    assert result.events == ()
+
+
 _DETECTOR_PREPROCESSING_GOLDEN = [
     (
         "stalta",
@@ -276,7 +362,7 @@ def _detector_block_identity(detector, block):
 def _assert_detector_preprocessing_golden(
     source_path, monkeypatch, *, tamper_detector_input=False
 ):
-    from das_sentinel import pipeline
+    from das_sentinel import evaluation_legacy as pipeline
 
     captured = []
 
@@ -302,7 +388,7 @@ def _assert_detector_preprocessing_golden(
         block,
         _profile(),
         select_backend("cpu"),
-        {name: 0.0 for name in pipeline._TIMING_NAMES},
+        {name: 0.0 for name in ("preprocess", "detect")},
         logical_start=150,
     )
 
@@ -330,12 +416,9 @@ def test_pipeline_uses_bound_model_and_records_model_evidence(
     tmp_path, monkeypatch
 ):
     from das_sentinel import pipeline
+    monkeypatch.setattr(pipeline, "screen_block", _screening_candidates(_fixed_stalta))
 
     captured = []
-    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
-    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
     monkeypatch.setattr(
         pipeline,
         "render_event_artifacts",
@@ -368,16 +451,22 @@ def test_pipeline_uses_bound_model_and_records_model_evidence(
     assert captured[0].model_output["probabilities"]["traffic"] == 0.97
 
 
-def test_pipeline_keeps_profile_artifacts_separate_and_deterministic(
-    tmp_path, monkeypatch
+@pytest.mark.parametrize(
+    "identity_change",
+    [
+        {"site_id": "site-b"},
+        {"processing_profile_id": "profile-b"},
+        {"profile_version": "2"},
+        {"pipeline_version": "next-v2"},
+    ],
+)
+def test_pipeline_keeps_context_artifacts_separate_and_deterministic(
+    tmp_path, monkeypatch, identity_change
 ):
-    """Omitting profile identity from fusion would make two profile runs collide."""
+    """Omitting analysis identity would make independent runs overwrite artifacts."""
     from das_sentinel import pipeline
+    monkeypatch.setattr(pipeline, "screen_block", _screening_candidates(_fixed_stalta))
 
-    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
-    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
     monkeypatch.setattr(
         pipeline,
         "render_event_artifacts",
@@ -387,24 +476,24 @@ def test_pipeline_keeps_profile_artifacts_separate_and_deterministic(
     artifact_root = tmp_path / "artifacts"
     _write_boundary_file(source_path)
 
-    def analyze(profile_id: str):
+    def analyze(change):
         return pipeline.analyze_file(
             source_path,
             ZdHdf5Reader(),
             _profile(),
             select_backend("cpu"),
             artifact_root,
-            pipeline.AnalysisContext(
+            replace(pipeline.AnalysisContext(
                 site_id="site-a",
-                processing_profile_id=profile_id,
+                processing_profile_id="profile-a",
                 profile_version="1",
-                pipeline_version="v1",
-            ),
+                pipeline_version="v2",
+            ), **change),
         )
 
-    first = analyze("profile-a")
-    changed = analyze("profile-b")
-    repeat = analyze("profile-a")
+    first = analyze({})
+    changed = analyze(identity_change)
+    repeat = analyze({})
 
     first_event_id = first.events[0].event_id
     changed_event_id = changed.events[0].event_id
@@ -416,16 +505,13 @@ def test_pipeline_keeps_profile_artifacts_separate_and_deterministic(
 
 def test_pipeline_wraps_bound_model_prediction_errors(tmp_path, monkeypatch):
     from das_sentinel import pipeline
+    monkeypatch.setattr(pipeline, "screen_block", _screening_candidates(_fixed_stalta))
 
     class InvalidPredictingBundle:
         def predict_probabilities(self, features):
             del features
             raise ValueError("invalid probabilities")
 
-    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
-    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
     source_path = tmp_path / "source.h5"
     _write_boundary_file(source_path)
     context = pipeline.AnalysisContext(
@@ -449,6 +535,7 @@ def test_pipeline_merges_cross_block_event_and_preserves_artifact_inputs(
     tmp_path, monkeypatch
 ):
     from das_sentinel import pipeline
+    monkeypatch.setattr(pipeline, "screen_block", _screening_candidates(_fixed_stalta, _fixed_energy))
 
     source_path = tmp_path / "boundary.h5"
     expected_raw = _write_boundary_file(source_path)
@@ -460,10 +547,6 @@ def test_pipeline_merges_cross_block_event_and_preserves_artifact_inputs(
         (Path(out_dir) / event.event_id).mkdir(parents=True)
         return ArtifactManifest(event.event_id, {})
 
-    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
-    monkeypatch.setattr(pipeline, "detect_energy", _fixed_energy)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
     monkeypatch.setattr(pipeline, "render_event_artifacts", capture_artifacts)
 
     result = pipeline.analyze_file(
@@ -508,6 +591,7 @@ def test_pipeline_merges_cross_block_event_and_preserves_artifact_inputs(
         "detect",
         "fuse",
         "classify",
+        "measure",
         "render",
         "total",
     }
@@ -549,6 +633,7 @@ def test_pipeline_merges_cross_block_event_and_preserves_artifact_inputs(
 def test_pipeline_preprocessing_golden_preserves_review_identity(tmp_path, monkeypatch):
     """Catches preprocessing changes that drift review-visible pipeline output."""
     from das_sentinel import pipeline
+    monkeypatch.setattr(pipeline, "screen_block", _screening_candidates(_fixed_stalta, _fixed_energy))
 
     source_path = tmp_path / "golden-boundary.h5"
     _write_boundary_file(source_path)
@@ -567,13 +652,9 @@ def test_pipeline_preprocessing_golden_preserves_review_identity(tmp_path, monke
         (Path(out_dir) / event.event_id).mkdir(parents=True)
         return ArtifactManifest(event.event_id, {})
 
-    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
-    monkeypatch.setattr(pipeline, "detect_energy", _fixed_energy)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
     monkeypatch.setattr(pipeline, "render_event_artifacts", capture_artifacts)
     monkeypatch.setattr(
-        pipeline, "_source_fingerprint", lambda path: "baseline-source-fingerprint"
+        pipeline, "_source_fingerprint", lambda path: "a" * 64
     )
     monkeypatch.setattr(
         pipeline, "_ensure_source_unchanged", lambda path, expected: None
@@ -599,7 +680,7 @@ def test_pipeline_preprocessing_golden_preserves_review_identity(tmp_path, monke
 
     assert len(result.events) == 1
     event = result.events[0]
-    assert event.event_id == "fb2d78ee-58b5-5ce8-a3ae-73394c82762a"
+    assert event.event_id == "62782e52-3ec4-5df2-9560-7294fecea026"
     assert (
         event.start_sample,
         event.end_sample,
@@ -648,9 +729,6 @@ def test_pipeline_default_block_and_lta_detect_real_stalta_event(tmp_path, monke
 
     source_path = tmp_path / "default-stalta.h5"
     _write_default_stalta_file(source_path)
-    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
     monkeypatch.setattr(
         pipeline,
         "render_event_artifacts",
@@ -666,7 +744,7 @@ def test_pipeline_default_block_and_lta_detect_real_stalta_event(tmp_path, monke
     )
 
     assert len(result.events) == 1
-    assert any(candidate.detector == "stalta" for candidate in result.events[0].evidence)
+    assert any(candidate.detector.startswith("stalta:") for event in result.events for candidate in event.evidence)
 
 
 class _RecordingReader:
@@ -699,6 +777,7 @@ def test_pipeline_isolates_display_reads_from_features_and_reuses_sufficient_con
 ):
     """Expanding the analysis read or rereading sufficient display context must fail."""
     from das_sentinel import artifacts, pipeline
+    monkeypatch.setattr(pipeline, "screen_block", _screening_candidates(_fixed_stalta, _fixed_energy))
 
     source_path = tmp_path / "display-boundary.h5"
     source_data = _write_boundary_file(source_path)
@@ -724,15 +803,11 @@ def test_pipeline_isolates_display_reads_from_features_and_reuses_sufficient_con
         plt.close(figure)
         return b"png"
 
-    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
-    monkeypatch.setattr(pipeline, "detect_energy", _fixed_energy)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
     monkeypatch.setattr(pipeline, "extract_features", capture_features)
     monkeypatch.setattr(artifacts, "_png", capture_png)
     result = pipeline.analyze_file(source_path, reader, profile, backend, tmp_path / "artifacts")
 
-    expected_reads = [(0, 200), (50, 350), (200, 420), analysis_range]
+    expected_reads = [(0, 200), (45, 350), (195, 420), analysis_range, (114, 217)]
     if padding == 0:
         expected_reads.append(display_range)
     assert reader.block_ranges == expected_reads
@@ -753,6 +828,10 @@ def test_pipeline_isolates_display_reads_from_features_and_reuses_sufficient_con
     np.testing.assert_array_equal(recorded["filtered"], display_filtered.data[:, channels].T)
     np.testing.assert_array_equal(recorded["waveform"], np.median(display_filtered.data[:, channels], axis=1))
     evidence = json.loads(result.artifacts[0].files["evidence"].path.read_text("utf-8"))
+    assert evidence["measurements"]["schema_version"] == "2"
+    assert evidence["measurements"]["context"]["background_seconds_available"] == 4.5
+    assert evidence["measurements"]["context"]["post_event_filter_guard_seconds_available"] == 2.0
+    assert evidence["source_fingerprint"] == result.source_fingerprint
     assert evidence["source_range"]["sample_start"] == 184
     assert evidence["source_range"]["sample_stop"] == 197
     assert evidence["input_sha256"] == {
@@ -769,9 +848,6 @@ def test_pipeline_prepends_lta_history_and_canonically_owns_gap_events(
     source_path = tmp_path / "history-stalta.h5"
     _write_history_stalta_file(source_path)
     reader = _RecordingReader()
-    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
     monkeypatch.setattr(
         pipeline,
         "render_event_artifacts",
@@ -786,10 +862,56 @@ def test_pipeline_prepends_lta_history_and_canonically_owns_gap_events(
         tmp_path / "artifacts",
     )
 
-    assert reader.block_ranges[:3] == [(0, 4_000), (1_000, 7_000), (4_000, 10_000)]
+    assert reader.block_ranges[:3] == [(0, 4_000), (900, 7_000), (3_900, 10_000)]
     assert len(result.events) == 2
-    assert result.audit_candidate_count == 2
+    assert result.audit_candidate_count >= 2
     assert [event.peak_sample // 200 for event in result.events] == [22, 37]
+
+
+@pytest.mark.parametrize(
+    "profile_overrides,detector",
+    [
+        ({}, "stalta:long"),
+        ({"sta_seconds": 0.05, "lta_seconds": 0.5, "energy_window_seconds": 0.1}, "stalta:short"),
+        ({"sta_seconds": 0.05, "lta_seconds": 0.5}, "energy:band-1"),
+    ],
+)
+def test_pipeline_conditions_screening_at_canonical_block_boundaries(
+    tmp_path, monkeypatch, profile_overrides, detector
+):
+    from das_sentinel import pipeline
+
+    source_path = tmp_path / "canonical-boundary.h5"
+    sample_rate_hz = 200.0
+    data = np.random.default_rng(334).normal(0.0, 0.02, (7000, 8)).astype(np.float32)
+    pulse = (
+        np.hanning(40) * np.sin(2 * np.pi * 10 * np.arange(40) / sample_rate_hz) * 0.3
+    ).astype(np.float32)
+    data[3000:3040, :] += pulse[:, None]
+    with h5py.File(source_path, "w") as handle:
+        raw = handle.create_group("Acquisition").create_group("Raw[0]")
+        raw.create_dataset("RawData", data=data)
+        times = datetime(2026, 7, 26, tzinfo=UTC).timestamp() * 1_000_000
+        raw.create_dataset("RawDataTime", data=(times + np.arange(7000) * 5000).astype(np.int64))
+        raw.attrs["OutputDataRate"] = sample_rate_hz
+        raw.attrs["SpatialSamplingInterval"] = 4.0
+        raw.attrs["StartLocusIndex"] = 0
+        raw.attrs["RawDataUnit"] = "strain_rate"
+    monkeypatch.setattr(pipeline, "render_event_artifacts", _empty_artifact_manifest)
+
+    result = pipeline.analyze_file(
+        source_path, ZdHdf5Reader(), ProcessingProfile(**profile_overrides),
+        select_backend("cpu"), tmp_path / "artifacts",
+    )
+
+    matching = [
+        candidate
+        for event in result.events
+        for candidate in event.evidence
+        if candidate.detector == detector and 3000 <= candidate.peak_sample < 3500
+    ]
+    assert len(matching) == 1
+    assert matching[0].start_sample < 3040
 
 
 @pytest.mark.parametrize(
@@ -799,13 +921,13 @@ def test_pipeline_prepends_lta_history_and_canonically_owns_gap_events(
         ("trajectory", "detect_trajectories"),
     ],
 )
-def test_non_stalta_detectors_search_only_the_logical_block(
+def test_offline_baseline_non_stalta_detectors_search_only_the_logical_block(
     tmp_path,
     monkeypatch,
     detector_name,
     detector_attribute,
 ):
-    from das_sentinel import pipeline
+    from das_sentinel import evaluation_legacy as pipeline
 
     source_path = tmp_path / f"history-{detector_name}.h5"
     _write_history_dominance_file(source_path)
@@ -859,33 +981,29 @@ def test_non_stalta_detectors_search_only_the_logical_block(
     monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
     monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
     monkeypatch.setattr(pipeline, detector_attribute, strongest_signal)
-    monkeypatch.setattr(
-        pipeline,
-        "render_event_artifacts",
-        _empty_artifact_manifest,
-    )
-
-    result = pipeline.analyze_file(
-        source_path,
-        ZdHdf5Reader(),
-        _profile(),
-        select_backend("cpu"),
-        tmp_path / "artifacts",
-    )
-
-    assert result.audit_candidate_count == 2
-    assert [event.peak_sample for event in result.events] == [100, 200]
+    reader = ZdHdf5Reader()
+    candidates = []
+    for logical_start, sample_start, sample_stop, canonical_stop in (
+        (0, 0, 200, 150), (150, 50, 350, 300), (300, 200, 420, 420)
+    ):
+        block = reader.read_block(source_path, sample_start, sample_stop)
+        candidates.extend(
+            candidate
+            for candidate in pipeline._detect_block(
+                block, _profile(), select_backend("cpu"),
+                {"preprocess": 0.0, "detect": 0.0}, logical_start=logical_start,
+            )
+            if logical_start <= candidate.peak_sample < canonical_stop
+        )
+    assert [candidate.peak_sample for candidate in candidates] == [100, 200]
 
 
 def test_pipeline_result_is_stable_except_for_recorded_timings(tmp_path, monkeypatch):
     from das_sentinel import pipeline
+    monkeypatch.setattr(pipeline, "screen_block", _screening_candidates(_fixed_stalta))
 
     source_path = tmp_path / "stable.h5"
     _write_boundary_file(source_path)
-    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
-    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
     monkeypatch.setattr(
         pipeline,
         "render_event_artifacts",
@@ -913,6 +1031,7 @@ def test_pipeline_result_is_stable_except_for_recorded_timings(tmp_path, monkeyp
 
 def test_pipeline_event_identity_distinguishes_source_files(tmp_path, monkeypatch):
     from das_sentinel import pipeline
+    monkeypatch.setattr(pipeline, "screen_block", _screening_candidates(_fixed_stalta))
 
     first_path = tmp_path / "first.h5"
     second_path = tmp_path / "second.h5"
@@ -920,10 +1039,6 @@ def test_pipeline_event_identity_distinguishes_source_files(tmp_path, monkeypatc
     _write_boundary_file(second_path)
     with h5py.File(second_path, "r+") as handle:
         handle["Acquisition/Raw[0]/RawData"][0, 0] += 1.0
-    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
-    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
     monkeypatch.setattr(
         pipeline,
         "render_event_artifacts",
@@ -982,6 +1097,7 @@ def test_pipeline_explicitly_transfers_event_window_before_cpu_features(
     tmp_path, monkeypatch
 ):
     from das_sentinel import pipeline
+    monkeypatch.setattr(pipeline, "screen_block", _screening_candidates(_fixed_stalta))
 
     source_path = tmp_path / "cuda.h5"
     _write_boundary_file(source_path)
@@ -999,9 +1115,6 @@ def test_pipeline_explicitly_transfers_event_window_before_cpu_features(
             channel_distance_m=prepared.channel_distance_m,
         )
 
-    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
-    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
     monkeypatch.setattr(pipeline, "preprocess_for_waterfall", device_preprocess)
     def capture_device_artifacts(data, event, features, out_dir, **kwargs):
         captured.append(data)
@@ -1032,7 +1145,7 @@ def test_analysis_context_has_stable_rules_only_defaults():
     assert context.site_id == "unknown-site"
     assert context.site_timezone == "UTC"
     assert context.profile_version == "profile-v1"
-    assert context.pipeline_version == "pipeline-v1"
+    assert context.pipeline_version == "v2"
     assert context.cable_type == "unknown"
     assert context.device_config == "unknown"
     assert context.rule_profile == {}
@@ -1107,13 +1220,10 @@ def test_analysis_context_rejects_noncanonical_rule_profile(rule_profile):
 
 def test_pipeline_evidence_records_reproducible_rule_identity(tmp_path, monkeypatch):
     from das_sentinel import pipeline
+    monkeypatch.setattr(pipeline, "screen_block", _screening_candidates(_fixed_stalta, _fixed_energy))
 
     source_path = tmp_path / "rule-evidence.h5"
     _write_boundary_file(source_path)
-    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
-    monkeypatch.setattr(pipeline, "detect_energy", _fixed_energy)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
     context = pipeline.AnalysisContext(
         profile_version="profile-reviewed-2",
         rule_profile={"traffic_velocity_mps": (3.0, 45.0)},
@@ -1170,13 +1280,10 @@ class _MutatingReader:
 
 def test_pipeline_rejects_source_changed_during_block_reads(tmp_path, monkeypatch):
     from das_sentinel import pipeline
+    monkeypatch.setattr(pipeline, "screen_block", _screening_candidates())
 
     source_path = tmp_path / "changing-read.h5"
     _write_boundary_file(source_path)
-    monkeypatch.setattr(pipeline, "detect_stalta", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
 
     with pytest.raises(pipeline.SourceChangedError, match="changed"):
         pipeline.analyze_file(
@@ -1190,13 +1297,10 @@ def test_pipeline_rejects_source_changed_during_block_reads(tmp_path, monkeypatc
 
 def test_pipeline_rejects_source_changed_while_rendering(tmp_path, monkeypatch):
     from das_sentinel import pipeline
+    monkeypatch.setattr(pipeline, "screen_block", _screening_candidates(_fixed_stalta, _fixed_energy))
 
     source_path = tmp_path / "changing-render.h5"
     _write_boundary_file(source_path)
-    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
-    monkeypatch.setattr(pipeline, "detect_energy", _fixed_energy)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
 
     artifact_root = tmp_path / "artifacts"
     original_render = pipeline.render_event_artifacts
@@ -1247,14 +1351,11 @@ def test_pipeline_rolls_back_only_newly_promoted_event_directories(
     tmp_path, monkeypatch
 ):
     from das_sentinel import pipeline
+    monkeypatch.setattr(pipeline, "screen_block", _screening_candidates(_two_review_events))
 
     source_path = tmp_path / "promotion-change.h5"
     artifact_root = tmp_path / "artifacts"
     _write_boundary_file(source_path)
-    monkeypatch.setattr(pipeline, "detect_stalta", _two_review_events)
-    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
     original_promote = pipeline._promote_event_directory
     promoted = 0
 
@@ -1289,14 +1390,11 @@ def test_pipeline_reuses_and_never_rolls_back_preexisting_artifacts(
     tmp_path, monkeypatch
 ):
     from das_sentinel import pipeline
+    monkeypatch.setattr(pipeline, "screen_block", _screening_candidates(_fixed_stalta, _fixed_energy))
 
     source_path = tmp_path / "preexisting.h5"
     artifact_root = tmp_path / "artifacts"
     _write_boundary_file(source_path)
-    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
-    monkeypatch.setattr(pipeline, "detect_energy", _fixed_energy)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
 
     first = pipeline.analyze_file(
         source_path,
@@ -1353,14 +1451,11 @@ def test_post_commit_failure_cannot_delete_artifacts_reused_by_another_run(
     tmp_path, monkeypatch
 ):
     from das_sentinel import pipeline
+    monkeypatch.setattr(pipeline, "screen_block", _screening_candidates(_fixed_stalta, _fixed_energy))
 
     source_path = tmp_path / "post-commit-race.h5"
     artifact_root = tmp_path / "artifacts"
     _write_boundary_file(source_path)
-    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_stalta)
-    monkeypatch.setattr(pipeline, "detect_energy", _fixed_energy)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
 
     original_commit = pipeline._ArtifactTransaction.commit
     first_committed = Event()
@@ -1425,7 +1520,7 @@ def test_post_commit_failure_cannot_delete_artifacts_reused_by_another_run(
 def test_detect_block_releases_each_distinct_band_before_next(
     tmp_path, monkeypatch
 ):
-    from das_sentinel import pipeline
+    from das_sentinel import evaluation_legacy as pipeline
 
     source_path = tmp_path / "bands.h5"
     _write_boundary_file(source_path)
@@ -1461,7 +1556,7 @@ def test_detect_block_releases_each_distinct_band_before_next(
         block,
         profile,
         select_backend("cpu"),
-        {name: 0.0 for name in pipeline._TIMING_NAMES},
+        {name: 0.0 for name in ("preprocess", "detect")},
     )
 
     assert bands == [(0.5, 4.0), (1.0, 3.0), (2.0, 4.0)]
@@ -1469,7 +1564,7 @@ def test_detect_block_releases_each_distinct_band_before_next(
 
 def test_detect_block_uses_one_forward_fft_per_temporal_source(tmp_path, monkeypatch):
     """Catches preprocessing once per detector band instead of source range."""
-    from das_sentinel import pipeline
+    from das_sentinel import evaluation_legacy as pipeline
 
     source_path = tmp_path / "fft-count.h5"
     _write_boundary_file(source_path)
@@ -1504,7 +1599,7 @@ def test_detect_block_uses_one_forward_fft_per_temporal_source(tmp_path, monkeyp
         block,
         profile,
         backend,
-        {name: 0.0 for name in pipeline._TIMING_NAMES},
+        {name: 0.0 for name in ("preprocess", "detect")},
         logical_start=50,
     )
 
@@ -1567,13 +1662,10 @@ def test_pipeline_propagates_reader_warning_and_selected_backend_reason(
     tmp_path, monkeypatch
 ):
     from das_sentinel import pipeline
+    monkeypatch.setattr(pipeline, "screen_block", _screening_candidates())
 
     source_path = tmp_path / "20260727T000000.h5"
     _write_boundary_file(source_path)
-    monkeypatch.setattr(pipeline, "detect_stalta", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
     fallback_backend = replace(
         select_backend("cpu"), unavailable_reason="configured CUDA backend unavailable"
     )

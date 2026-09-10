@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import {
   api,
   type EventDetail,
@@ -6,7 +6,7 @@ import {
 } from "../api";
 import ArtifactViewer from "../components/ArtifactViewer";
 import EventQueue, { formatOccurredAt } from "../components/EventQueue";
-import EvidencePanel from "../components/EvidencePanel";
+import EvidencePanel, { EventFeatures } from "../components/EvidencePanel";
 import ReviewForm from "../components/ReviewForm";
 
 const LABEL_NAMES: Record<string, string> = {
@@ -56,6 +56,34 @@ export default function EventsPage() {
   const activeCollectionController = useRef<AbortController | null>(null);
   const selectedRef = useRef<EventSummary | null>(null);
   const nextOffset = useRef(0);
+  const layoutRef = useRef<HTMLElement>(null);
+  const detailRef = useRef<HTMLDivElement>(null);
+
+  useLayoutEffect(() => {
+    const layout = layoutRef.current;
+    const detailElement = detailRef.current;
+    const form = detailElement?.querySelector<HTMLFormElement>(".review-form form");
+    if (!layout || !detailElement || !form) return;
+
+    const alignPanels = () => {
+      if (window.innerWidth <= 900) {
+        layout.style.removeProperty("--event-panel-height");
+        return;
+      }
+      const height = form.getBoundingClientRect().bottom - layout.getBoundingClientRect().top;
+      layout.style.setProperty("--event-panel-height", `${Math.max(0, height)}px`);
+    };
+    alignPanels();
+    const observer = new ResizeObserver(alignPanels);
+    observer.observe(detailElement);
+    observer.observe(form);
+    window.addEventListener("resize", alignPanels);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", alignPanels);
+      layout.style.removeProperty("--event-panel-height");
+    };
+  }, [selected?.id, detail?.id, collection.kind]);
 
   useEffect(() => {
     selectedRef.current = selected;
@@ -207,27 +235,25 @@ export default function EventsPage() {
   }
 
   return (
-    <section className="events-layout">
-      <div>
-        {moreError && <p className="error" role="alert">{moreError}</p>}
-        {collection.kind === "loading" && <p className="loading">正在加载…</p>}
-        <EventQueue
-          events={collection.kind === "ready" ? collection.items : []}
-          selectedId={selected?.id ?? null}
-          onSelect={openEvent}
-          machineLabel={filters.machineLabel}
-          reviewed={filters.reviewed}
-          onMachineLabelChange={(machineLabel) =>
-            setFilters((current) => ({ ...current, machineLabel }))
-          }
-          onReviewedChange={(reviewed) => setFilters((current) => ({ ...current, reviewed }))}
-          hasMore={collection.kind === "ready" && collection.hasMore}
-          loadingMore={collection.kind === "ready" && collection.loadingMore}
-          onLoadMore={loadMore}
-          showEmpty={collection.kind === "ready"}
-        />
-      </div>
-      <div className="event-detail">
+    <section className="events-layout" ref={layoutRef}>
+      <EventQueue
+        events={collection.kind === "ready" ? collection.items : []}
+        selectedId={selected?.id ?? null}
+        onSelect={openEvent}
+        machineLabel={filters.machineLabel}
+        reviewed={filters.reviewed}
+        onMachineLabelChange={(machineLabel) =>
+          setFilters((current) => ({ ...current, machineLabel }))
+        }
+        onReviewedChange={(reviewed) => setFilters((current) => ({ ...current, reviewed }))}
+        hasMore={collection.kind === "ready" && collection.hasMore}
+        loadingMore={collection.kind === "ready" && collection.loadingMore}
+        onLoadMore={loadMore}
+        showEmpty={collection.kind === "ready"}
+        loading={collection.kind === "loading"}
+        loadMoreError={moreError}
+      />
+      <div className="event-detail" ref={detailRef}>
         {detailError && <p className="error" role="alert">{detailError}</p>}
         {selected === null && <p className="loading">从左侧队列选择一个事件。</p>}
         {selected !== null && detail === null && !detailError && (
@@ -263,6 +289,9 @@ export default function EventsPage() {
           </>
         )}
       </div>
+      {selected !== null && detail !== null && selected.id === detail.id && (
+        <EventFeatures event={detail} />
+      )}
     </section>
   );
 }

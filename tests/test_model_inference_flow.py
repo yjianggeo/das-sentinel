@@ -21,6 +21,7 @@ from das_sentinel.persistence import (
     upgrade_database,
 )
 from das_sentinel.persistence.models import Classification, Event, ProcessingRun
+from das_sentinel.screening import ScreeningResult
 from das_sentinel.services.discovery import fingerprint
 from das_sentinel.services.jobs import JobService
 from das_sentinel.services.results import ResultService
@@ -73,30 +74,30 @@ def _write_inference_hdf5(path: Path) -> None:
         raw.attrs["RawDataUnit"] = "strain_rate"
 
 
-def _fixed_model_event(block, profile):
-    del profile
+def _fixed_model_event(block, profile, backend):
+    del profile, backend
     if not (
         block.sample_offset
         <= 130
         < block.sample_offset + block.data.shape[0]
     ):
-        return []
-    return [
-        Candidate(
-            detector="stalta",
-            start_sample=100,
-            end_sample=160,
-            peak_sample=130,
-            channel_start=0,
-            channel_stop=4,
-            score=0.95,
-        )
-    ]
-
-
-def _no_candidates(*args):
-    del args
-    return []
+        return ScreeningResult(candidates=(), events=(), diagnostics={})
+    return ScreeningResult(
+        candidates=(
+            Candidate(
+                detector="stalta:short",
+                start_sample=100,
+                end_sample=160,
+                peak_sample=130,
+                channel_start=0,
+                channel_stop=4,
+                score=0.95,
+                metrics={"sample_rate_hz": block.metadata.sample_rate_hz},
+            ),
+        ),
+        events=(),
+        diagnostics={},
+    )
 
 
 def _seed_published_model(sessions, artifact_root: Path, inference_path: Path):
@@ -166,7 +167,7 @@ def _seed_published_model(sessions, artifact_root: Path, inference_path: Path):
         job = JobService(session, artifact_root).enqueue(
             inference_source.id,
             profile.id,
-            "pipeline-v1",
+            "v2",
         )
         return published, job.id
 
@@ -263,10 +264,7 @@ def test_published_model_executes_fuses_and_persists_one_identity(
             claim_response(claim_snapshot).model_dump(mode="json")
         )
 
-    monkeypatch.setattr(pipeline, "detect_stalta", _fixed_model_event)
-    monkeypatch.setattr(pipeline, "detect_energy", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_coherence", _no_candidates)
-    monkeypatch.setattr(pipeline, "detect_trajectories", _no_candidates)
+    monkeypatch.setattr(pipeline, "screen_block", _fixed_model_event)
     protocol = CapturingProtocol(claim)
     outcome = Worker(
         settings=settings,
@@ -310,6 +308,9 @@ def test_published_model_executes_fuses_and_persists_one_identity(
     assert persisted_classification.model_version_id == published.id
     assert persisted_classification.method == "fusion"
     assert evidence_json["model_version"] == published.version
+    assert set(json.loads(persisted_event.features_json)) == set(FEATURE_NAMES)
+    assert evidence_json["measurements"]["schema_version"] == "2"
+    assert evidence_json["source_fingerprint"] == claim.source_fingerprint
     assert evidence_json["model_output"]["model_version_id"] == published.id
     assert set(evidence_json["model_output"]["probabilities"]) == {
         "earthquake",

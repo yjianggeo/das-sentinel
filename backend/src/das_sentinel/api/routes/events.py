@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from fastapi.concurrency import run_in_threadpool
@@ -32,6 +32,11 @@ from das_sentinel.persistence.models import (
     SourceFile,
 )
 from das_sentinel.persistence.repositories import Repositories
+from das_sentinel.services.event_measurements import (
+    EventMeasurementIdentity,
+    read_event_measurements,
+    read_registered_event_measurements,
+)
 
 router = APIRouter(prefix="/events", tags=["events"])
 MachineLabelValue = Literal[
@@ -41,6 +46,69 @@ MachineLabelValue = Literal[
     "noise",
     "unknown",
 ]
+
+
+@router.get("/{event_id}/measurements")
+def get_event_measurements(
+    event_id: str,
+    request: Request,
+    admin: AuthenticatedAdmin,
+) -> dict[str, Any]:
+    del admin
+    with request.app.state.session_factory() as session:
+        event = session.get(Event, event_id)
+        if event is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Event not found",
+            )
+        run = session.get(ProcessingRun, event.processing_run_id)
+        source = None if run is None else session.get(SourceFile, run.source_file_id)
+        if run is None or source is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Event source not found",
+            )
+        if source.fingerprint != run.source_fingerprint:
+            return {"available": False}
+        measurements = read_event_measurements(
+            request.app.state.settings.app_data_dir,
+            EventMeasurementIdentity(
+                event_id=event.id,
+                source_fingerprint=run.source_fingerprint,
+                start_sample=event.start_sample,
+                end_sample=event.end_sample,
+                channel_start=event.channel_start,
+                channel_stop=event.channel_stop,
+            ),
+        )
+        if measurements is None:
+            evidence_artifact = next(
+                (
+                    artifact
+                    for artifact in event.artifacts
+                    if artifact.kind == "evidence"
+                    and artifact.media_type == "application/json"
+                ),
+                None,
+            )
+            if evidence_artifact is not None:
+                measurements = read_registered_event_measurements(
+                    request.app.state.settings.app_data_dir / "artifacts",
+                    evidence_artifact.path,
+                    evidence_artifact.sha256,
+                    EventMeasurementIdentity(
+                        event_id=event.event_uid,
+                        source_fingerprint=run.source_fingerprint,
+                        start_sample=event.start_sample,
+                        end_sample=event.end_sample,
+                        channel_start=event.channel_start,
+                        channel_stop=event.channel_stop,
+                    ),
+                )
+    if measurements is None:
+        return {"available": False}
+    return {"available": True, "measurements": measurements}
 
 
 @router.get("", response_model=list[EventSummaryResponse])

@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { transferableAbortController } from "node:util";
 import { http, HttpResponse } from "msw";
@@ -13,9 +13,26 @@ const domAbortController = globalThis.AbortController;
 const nativeAbortController = transferableAbortController().constructor as typeof AbortController;
 const originalCreateObjectUrl = Object.getOwnPropertyDescriptor(URL, "createObjectURL");
 const originalRevokeObjectUrl = Object.getOwnPropertyDescriptor(URL, "revokeObjectURL");
+const originalResizeObserver = Object.getOwnPropertyDescriptor(globalThis, "ResizeObserver");
+const resizeNotifications = new Set<() => void>();
+
+class TestResizeObserver implements ResizeObserver {
+  private readonly notify: () => void;
+  constructor(callback: ResizeObserverCallback) {
+    this.notify = () => callback([], this);
+    resizeNotifications.add(this.notify);
+  }
+  observe() {}
+  unobserve() {}
+  disconnect() { resizeNotifications.delete(this.notify); }
+}
 
 beforeAll(() => {
   globalThis.AbortController = nativeAbortController;
+  Object.defineProperty(globalThis, "ResizeObserver", {
+    configurable: true,
+    value: TestResizeObserver,
+  });
   Object.defineProperty(URL, "createObjectURL", {
     configurable: true,
     value: vi.fn(() => "blob:event-artifact"),
@@ -48,11 +65,33 @@ beforeEach(() => {
         distance_unit: "m",
       }),
     ),
+    http.get("/api/v1/events/:eventId/measurements", () =>
+      HttpResponse.json({ available: false }),
+    ),
+    http.post("/api/v1/events/:eventId/waterfall-preview", () =>
+      HttpResponse.json({
+        distance_start_m: 12,
+        distance_stop_m: 20,
+        channel_count: 8,
+        primary_detector: "stalta",
+        primary_detector_display: "STA/LTA",
+        filter_low_hz: 3.5,
+        filter_high_hz: 27.25,
+        raw_png_base64: "cG5nLXJhdy0x",
+        filtered_png_base64: "cG5nLWZpbHRlcmVkLTE=",
+        waveform_png_base64: "cG5nLXdhdmVmb3JtLTE=",
+      }),
+    ),
   );
 });
 afterAll(() => {
   server.close();
   globalThis.AbortController = domAbortController;
+  if (originalResizeObserver) {
+    Object.defineProperty(globalThis, "ResizeObserver", originalResizeObserver);
+  } else {
+    Reflect.deleteProperty(globalThis, "ResizeObserver");
+  }
   if (originalCreateObjectUrl) {
     Object.defineProperty(URL, "createObjectURL", originalCreateObjectUrl);
   } else {
@@ -227,6 +266,65 @@ it("shows event queue artifacts and independent method evidence", async () => {
   expect(screen.getByText("规则判断")).toBeVisible();
 });
 
+it("localizes feature names while retaining values and unfamiliar metrics", async () => {
+  useEventHandlers();
+  server.use(http.get("/api/v1/events/event-1", () => HttpResponse.json({
+    ...DETAIL,
+    features: { ...DETAIL.features, custom_metric: "retained" },
+  })));
+  renderApp("/events");
+
+  await userEvent.click(await screen.findByText("2026-07-26 18:42:16"));
+
+  const features = await screen.findByRole("region", { name: "事件特征" });
+  expect(within(features).getByRole("row", { name: "均方根振幅 1.500" })).toBeVisible();
+  expect(within(features).getByRole("row", { name: "持续时间（s） 2.000" })).toBeVisible();
+  expect(within(features).getByRole("row", { name: "custom_metric retained" })).toBeVisible();
+  expect(features).toHaveAttribute("tabindex", "0");
+});
+
+it("tracks the review form bottom as content resizes and restores narrow-screen sizing", async () => {
+  useEventHandlers();
+  let formBottom = 900;
+  const originalWidth = Object.getOwnPropertyDescriptor(window, "innerWidth")!;
+  const originalRect = Element.prototype.getBoundingClientRect;
+  const rect = vi.spyOn(Element.prototype, "getBoundingClientRect").mockImplementation(function (this: Element) {
+    if (this.matches(".events-layout")) return new DOMRect(0, 60, 1100, 1000);
+    if (this.matches(".review-form form")) return new DOMRect(0, 500, 400, formBottom - 500);
+    return originalRect.call(this);
+  });
+  Object.defineProperty(window, "innerWidth", { configurable: true, value: 1280 });
+  try {
+    const view = renderApp("/events");
+    await userEvent.click(await screen.findByRole("button", { name: "事件 event-1" }));
+    const features = await screen.findByRole("region", { name: "事件特征" });
+    const layout = features.parentElement!;
+    expect(layout.style.getPropertyValue("--event-panel-height")).toBe("840px");
+
+    act(() => {
+      formBottom = 1100;
+      resizeNotifications.forEach((notify) => notify());
+    });
+    expect(layout.style.getPropertyValue("--event-panel-height")).toBe("1040px");
+
+    act(() => {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: 800 });
+      window.dispatchEvent(new Event("resize"));
+    });
+    expect(layout.style.getPropertyValue("--event-panel-height")).toBe("");
+    act(() => {
+      Object.defineProperty(window, "innerWidth", { configurable: true, value: 1280 });
+      window.dispatchEvent(new Event("resize"));
+    });
+    expect(layout.style.getPropertyValue("--event-panel-height")).toBe("1040px");
+    view.unmount();
+    expect(layout.style.getPropertyValue("--event-panel-height")).toBe("");
+  } finally {
+    rect.mockRestore();
+    Object.defineProperty(window, "innerWidth", originalWidth);
+  }
+});
+
 it("formats event UTC timestamps in the station timezone", async () => {
   useEventHandlers();
   renderApp("/events");
@@ -305,6 +403,8 @@ it("returns to login when an artifact request becomes unauthorized", async () =>
   renderApp("/events");
 
   await userEvent.click(await screen.findByText("2026-07-26 18:42:16"));
+  await screen.findByText("当前显示临时预览");
+  await userEvent.click(screen.getByRole("button", { name: "查看原始图件" }));
 
   expect(await screen.findByRole("button", { name: "登录" })).toBeVisible();
 });
@@ -322,6 +422,8 @@ it("keeps event detail visible when artifact integrity fails", async () => {
   renderApp("/events");
 
   await userEvent.click(await screen.findByText("2026-07-26 18:42:16"));
+  await screen.findByText("当前显示临时预览");
+  await userEvent.click(screen.getByRole("button", { name: "查看原始图件" }));
 
   expect(
     await screen.findByText("图件完整性校验失败，请联系管理员"),

@@ -12,7 +12,7 @@ from datetime import timedelta
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, BinaryIO
-from uuid import UUID
+from uuid import NAMESPACE_URL, UUID, uuid5
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import numpy as np
@@ -28,30 +28,26 @@ from das_sentinel.artifacts import (
 from das_sentinel.classifiers.fusion import fuse_classification
 from das_sentinel.classifiers.rules import RuleResult, score_rules
 from das_sentinel.classifiers.supervised import ModelBundle
-from das_sentinel.config import ProcessingProfile
-from das_sentinel.detectors.coherence import detect_coherence
-from das_sentinel.detectors.energy import detect_energy
-from das_sentinel.detectors.stalta import detect_stalta
-from das_sentinel.detectors.trajectory import detect_trajectories
+from das_sentinel.config import PIPELINE_VERSION, ProcessingProfile
 from das_sentinel.domain import Candidate, DasBlock, EventRecord
 from das_sentinel.features import extract_features
-from das_sentinel.fusion import fuse_candidates
+from das_sentinel.measurements import measure_event
 from das_sentinel.plot_windows import event_display_window
 from das_sentinel.readers.base import DasReader
-from das_sentinel.signal.backend import ArrayBackend
-from das_sentinel.signal.preprocess import (
-    PreprocessedBlock,
-    filter_prepared_signal,
-    prepare_signal,
+from das_sentinel.screening import (
+    ScreeningOptions,
+    fuse_screening_candidates,
+    screen_block,
 )
+from das_sentinel.signal.backend import ArrayBackend
+from das_sentinel.signal.preprocess import PreprocessedBlock
 from das_sentinel.waterfalls import (
     WaterfallFilter,
-    detector_band,
     preprocess_for_waterfall,
     resolve_waterfall_filter,
 )
 
-_TIMING_NAMES = ("read", "preprocess", "detect", "fuse", "classify", "render")
+_TIMING_NAMES = ("read", "preprocess", "detect", "fuse", "classify", "measure", "render")
 
 
 class SourceChangedError(RuntimeError):
@@ -68,7 +64,7 @@ class AnalysisContext:
     site_timezone: str = "UTC"
     processing_profile_id: str = "unknown-profile"
     profile_version: str = "profile-v1"
-    pipeline_version: str = "pipeline-v1"
+    pipeline_version: str = PIPELINE_VERSION
     model_version_id: str | None = None
     model_version: str | None = None
     cable_type: str = "unknown"
@@ -197,9 +193,25 @@ def analyze_file(
     if step_samples <= 0:
         raise ValueError("block overlap leaves no forward progress")
 
-    lta_history = round(profile.lta_seconds * metadata.sample_rate_hz)
+    options = ScreeningOptions()
+    # Condition every preceding-background detector before its canonical window.
+    history_samples = 0
+    for sta_seconds, lta_seconds in (
+        (profile.sta_seconds, profile.lta_seconds),
+        (options.short_sta_seconds, options.short_lta_seconds),
+    ):
+        sta_samples = max(1, round(sta_seconds * metadata.sample_rate_hz))
+        lta_samples = max(sta_samples + 1, round(lta_seconds * metadata.sample_rate_hz))
+        history_samples = max(history_samples, sta_samples + lta_samples)
+    energy_samples = max(1, round(profile.energy_window_seconds * metadata.sample_rate_hz))
+    history_samples = max(
+        history_samples,
+        energy_samples + max(
+            energy_samples, round(options.short_lta_seconds * metadata.sample_rate_hz)
+        ),
+    )
     for logical_start in range(0, sample_count, step_samples):
-        sample_start = max(0, logical_start - lta_history)
+        sample_start = max(0, logical_start - history_samples)
         sample_stop = min(sample_count, logical_start + block_samples)
         canonical_stop = (
             sample_count
@@ -209,34 +221,48 @@ def analyze_file(
         read_started = time.perf_counter()
         block = reader.read_block(reader_source, sample_start, sample_stop)
         timings["read"] += _elapsed_ms(read_started)
+        detect_started = time.perf_counter()
+        screening = screen_block(block, profile, backend)
+        screening_ms = _elapsed_ms(detect_started)
+        preprocess_ms = 1000.0 * screening.diagnostics.get("preprocessing_seconds", 0.0)
+        block_fuse_ms = 1000.0 * screening.diagnostics.get("fusion_seconds", 0.0)
+        timings["preprocess"] += preprocess_ms
+        timings["fuse"] += block_fuse_ms
+        timings["detect"] += max(0.0, screening_ms - preprocess_ms - block_fuse_ms)
         candidates.extend(
             candidate
-            for candidate in _detect_block(
-                block,
-                profile,
-                backend,
-                timings,
-                logical_start=logical_start,
-            )
+            for candidate in screening.candidates
             if logical_start <= candidate.peak_sample < canonical_stop
         )
         if sample_stop == sample_count:
             break
 
     _ensure_source_unchanged(source, source_fingerprint)
-    candidates = _deduplicate_candidates(
-        candidates, profile, metadata.sample_rate_hz
-    )
     fuse_started = time.perf_counter()
-    review_events = fuse_candidates(
-        candidates,
-        profile,
-        metadata.sample_rate_hz,
-        run_context.site_id,
-        run_context.pipeline_version,
-        run_context.processing_profile_id,
-        source_fingerprint=source_fingerprint,
-    )
+    review_events = [
+        replace(
+            event,
+            event_id=str(
+                uuid5(
+                    NAMESPACE_URL,
+                    json.dumps(
+                        {
+                            "site_id": run_context.site_id,
+                            "source_fingerprint": source_fingerprint,
+                            "processing_profile_id": run_context.processing_profile_id,
+                            "profile_version": run_context.profile_version,
+                            "pipeline_version": run_context.pipeline_version,
+                            "screening_event_id": event.event_id,
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                )
+            ),
+        )
+        for event in fuse_screening_candidates(candidates, profile)
+    ]
     timings["fuse"] += _elapsed_ms(fuse_started)
 
     events: list[EventRecord] = []
@@ -349,6 +375,18 @@ def analyze_file(
             timings["classify"] += _elapsed_ms(classify_started)
             events.append(classified)
 
+            read_started = time.perf_counter()
+            measurement_block = reader.read_block(
+                reader_source,
+                max(0, event.start_sample - round(7.0 * metadata.sample_rate_hz)),
+                min(sample_count, event.end_sample + round(2.0 * metadata.sample_rate_hz)),
+            )
+            timings["read"] += _elapsed_ms(read_started)
+            measure_started = time.perf_counter()
+            measurements = measure_event(measurement_block, event, profile)
+            timings["measure"] += _elapsed_ms(measure_started)
+            del measurement_block
+
             render_started = time.perf_counter()
             artifact_data = EventArtifactData(
                 raw_data=raw_block.data,
@@ -367,6 +405,8 @@ def analyze_file(
                 rule_output=_rule_output(rule_result, run_context),
                 waterfall_filter=waterfall_filter,
                 model_output=model_output,
+                source_fingerprint=source_fingerprint,
+                measurements=measurements,
             )
             timings["render"] += _elapsed_ms(render_started)
             display_start, display_stop = event_display_window(
@@ -439,102 +479,6 @@ def analyze_file(
         timings_ms=timings,
         artifacts=tuple(artifacts),
     )
-
-
-def _detect_block(
-    block: DasBlock,
-    profile: ProcessingProfile,
-    backend: ArrayBackend,
-    timings: dict[str, float],
-    *,
-    logical_start: int | None = None,
-) -> list[Candidate]:
-    found: list[Candidate] = []
-    logical_block = _logical_detector_block(block, logical_start)
-    grouped: dict[tuple[int, int], tuple[DasBlock, list[str]]] = {}
-    for detector in ("stalta", "energy", "coherence", "trajectory"):
-        detector_source = block if detector == "stalta" else logical_block
-        key = (
-            detector_source.sample_offset,
-            detector_source.data.shape[0],
-        )
-        if key not in grouped:
-            grouped[key] = (detector_source, [])
-        grouped[key][1].append(detector)
-    for detector_source, detectors in grouped.values():
-        preprocess_started = time.perf_counter()
-        prepared_signal = prepare_signal(detector_source, profile, backend)
-        timings["preprocess"] += _elapsed_ms(preprocess_started)
-        bands: dict[tuple[float, float], list[str]] = {}
-        for detector in detectors:
-            bands.setdefault(detector_band(profile, detector), []).append(detector)
-        for band, band_detectors in bands.items():
-            preprocess_started = time.perf_counter()
-            prepared_block = filter_prepared_signal(
-                prepared_signal, band[0], band[1], backend
-            )
-            timings["preprocess"] += _elapsed_ms(preprocess_started)
-            for detector in band_detectors:
-                detector_block = prepared_block
-                if detector == "trajectory" and detector_block.backend_name != "cpu":
-                    detector_block = replace(
-                        detector_block,
-                        data=np.asarray(
-                            backend.asnumpy(detector_block.data), dtype=np.float32
-                        ),
-                        backend_name="cpu",
-                    )
-                detect_started = time.perf_counter()
-                found.extend(
-                    _run_detector(detector, detector_block, profile, backend)
-                )
-                timings["detect"] += _elapsed_ms(detect_started)
-                del detector_block
-            del prepared_block
-        del prepared_signal
-    if hasattr(backend, "clear_cache"):
-        backend.clear_cache()
-    return found
-
-
-def _logical_detector_block(
-    block: DasBlock, logical_start: int | None
-) -> DasBlock:
-    if logical_start is None or logical_start == block.sample_offset:
-        return block
-    block_stop = block.sample_offset + block.data.shape[0]
-    if not block.sample_offset <= logical_start < block_stop:
-        raise ValueError("logical block start is outside the read block")
-    relative_start = logical_start - block.sample_offset
-    return replace(
-        block,
-        data=block.data[relative_start:],
-        metadata=replace(
-            block.metadata,
-            start_time_utc=block.metadata.start_time_utc
-            + timedelta(
-                seconds=relative_start / block.metadata.sample_rate_hz
-            ),
-        ),
-        sample_offset=logical_start,
-    )
-
-
-def _run_detector(
-    detector: str,
-    block: PreprocessedBlock,
-    profile: ProcessingProfile,
-    backend: ArrayBackend,
-) -> list[Candidate]:
-    if detector == "stalta":
-        return detect_stalta(block, profile)
-    if detector == "energy":
-        return detect_energy(block, profile)
-    if detector == "coherence":
-        return detect_coherence(block, profile, backend)
-    if detector == "trajectory":
-        return detect_trajectories(block, profile)
-    raise ValueError(f"unknown detector: {detector}")
 
 
 def _preprocess_for_band(
@@ -718,74 +662,6 @@ def _remove_promoted_directory(event_dir: Path, final_root: Path) -> None:
         raise ValueError("refusing to remove artifact outside final root")
     UUID(event_dir.name)
     shutil.rmtree(event_dir)
-
-
-def _deduplicate_candidates(
-    candidates: list[Candidate],
-    profile: ProcessingProfile,
-    sample_rate_hz: float,
-) -> list[Candidate]:
-    peak_tolerance = max(1, round(profile.merge_gap_seconds * sample_rate_hz))
-    remaining = sorted(
-        candidates,
-        key=lambda item: (
-            item.detector,
-            item.peak_sample,
-            item.start_sample,
-            item.channel_start,
-        ),
-    )
-    selected: list[Candidate] = []
-    while remaining:
-        group = [remaining.pop(0)]
-        index = 0
-        while index < len(remaining):
-            candidate = remaining[index]
-            if any(
-                _overlap_copy(candidate, member, peak_tolerance)
-                for member in group
-            ):
-                group.append(remaining.pop(index))
-                index = 0
-            else:
-                index += 1
-        selected.append(
-            min(
-                group,
-                key=lambda item: (
-                    bool(item.quality_flags),
-                    -item.score,
-                    item.peak_sample,
-                    item.start_sample,
-                    item.end_sample,
-                    item.channel_start,
-                    item.channel_stop,
-                ),
-            )
-        )
-    return sorted(
-        selected,
-        key=lambda item: (
-            item.start_sample,
-            item.end_sample,
-            item.channel_start,
-            item.detector,
-            item.peak_sample,
-        ),
-    )
-
-
-def _overlap_copy(
-    left: Candidate, right: Candidate, peak_tolerance: int
-) -> bool:
-    return (
-        left.detector == right.detector
-        and abs(left.peak_sample - right.peak_sample) <= peak_tolerance
-        and max(left.start_sample, right.start_sample)
-        <= min(left.end_sample, right.end_sample)
-        and max(left.channel_start, right.channel_start)
-        < min(left.channel_stop, right.channel_stop)
-    )
 
 
 def _validate_metadata(

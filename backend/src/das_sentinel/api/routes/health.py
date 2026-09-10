@@ -16,4 +16,4 @@ def healthz(request: Request) -> dict[str, str]:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="Service unavailable",
         ) from error
-    return {"status": "ok"}
+    return {"status": "ok", "pipeline_version": request.app.state.settings.pipeline_version}

@@ -109,7 +109,7 @@ def _settings(tmp_path: Path) -> Settings:
         session_secret="s" * 32,
         worker_token=WORKER_TOKEN,
         secure_cookies=False,
-        pipeline_version="pipeline-v1",
+        pipeline_version="v2",
     )
 
 
@@ -543,7 +543,7 @@ def _result_payload(ids, source_path: Path) -> dict:
         "source_file_id": ids["source_a"],
         "processing_profile_id": ids["profile_a"],
         "profile_version": 2,
-        "pipeline_version": "pipeline-result",
+        "pipeline_version": "v2",
         "source_fingerprint": fingerprint(source_path),
         "source_start_time_utc": "2026-07-30T00:00:00Z",
         "sample_rate_hz": 1000.0,
@@ -586,7 +586,7 @@ def _claim_result_job(event_api):
         json={
             "source_file_id": ids["source_a"],
             "processing_profile_id": ids["profile_a"],
-            "pipeline_version": "pipeline-result",
+            "pipeline_version": "v2",
         },
         headers={"X-CSRF-Token": token},
     )

@@ -123,6 +123,7 @@ def _settings(tmp_path: Path, *, worker_device: str = "auto") -> Settings:
         api_url="http://api.invalid",
         session_secret="s" * 32,
         worker_token="secret-" + "x" * 32,
+        pipeline_version="v2",
         worker_device=worker_device,
         secure_cookies=False,
     )
@@ -160,7 +161,7 @@ def _claim(
         processing_profile_id="profile-1",
         profile_version=3,
         profile_payload=(profile or ProcessingProfile()).model_dump(mode="json"),
-        pipeline_version="pipeline-v1",
+        pipeline_version="v2",
         model_version_id=model_version_id,
         model_version=model_version,
         model_artifact_path=model_artifact_path,
@@ -271,6 +272,30 @@ def test_worker_returns_idle_when_no_job(tmp_path: Path):
     assert protocol.failures == []
 
 
+@pytest.mark.parametrize("version", ["v1", "pipeline-v1", "v3"])
+def test_worker_rejects_noncurrent_pipeline_before_source_io(tmp_path, monkeypatch, version):
+    source = tmp_path / "input.h5"
+    source.write_bytes(b"stable")
+    protocol = FakeProtocol([replace(_claim(source), pipeline_version=version)])
+    source_opens = []
+
+    def unexpected_source_open(*args, **kwargs):
+        source_opens.append(args)
+        raise RuntimeError("source must not be opened for another pipeline version")
+
+    monkeypatch.setattr("das_sentinel.worker.main._open_anchored_source", unexpected_source_open)
+    worker = _worker(tmp_path, protocol, lambda *args: pytest.fail("analysis must not run"))
+    outcome = worker.run_once()
+
+    assert outcome.error_code == "invalid_claim"
+    assert source_opens == []
+    assert protocol.heartbeats == []
+    assert protocol.results == []
+    assert len(protocol.failures) == 1
+    assert protocol.failures[0][4] is False
+    assert "pipeline version" in protocol.failures[0][3]
+
+
 @pytest.mark.parametrize("status", [500, 502, 503])
 def test_http_client_maps_server_errors_to_transient(status: int) -> None:
     transport = httpx.MockTransport(
@@ -337,6 +362,143 @@ def test_http_client_fatal_error_does_not_expose_response_body() -> None:
 
     assert "422" in str(raised.value)
     assert secret not in str(raised.value)
+
+
+@pytest.mark.parametrize("stage", ["initial_heartbeat", "periodic_heartbeat", "result", "fail"])
+@pytest.mark.parametrize(
+    ("status", "detail"),
+    [
+        (409, "job is not running"),
+        (409, "worker is not the job owner"),
+        (404, "job not found: job-1"),
+    ],
+)
+def test_lost_claim_does_not_stop_next_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stage: str, status: int, detail: str
+) -> None:
+    source = tmp_path / "input.h5"
+    source.write_bytes(b"stable")
+    claims = [_claim(source), replace(_claim(source), id="job-2")]
+    requests = []
+    heartbeat_count = 0
+    periodic_attempted = threading.Event()
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        nonlocal heartbeat_count
+        path = request.url.path
+        requests.append(path)
+        if path.endswith("/claim"):
+            return httpx.Response(200, json=claims.pop(0).to_dict())
+        if "/job-1/" in path:
+            if path.endswith("/heartbeat"):
+                heartbeat_count += 1
+                if stage == "initial_heartbeat" or (
+                    stage == "periodic_heartbeat" and heartbeat_count > 1
+                ):
+                    periodic_attempted.set()
+                    return httpx.Response(status, json={"detail": detail})
+            elif path.endswith(f"/{stage}"):
+                return httpx.Response(status, json={"detail": detail})
+        return httpx.Response(200, json={})
+
+    analyzed = 0
+
+    def analyze(path, reader, profile, backend, artifact_root, context):
+        nonlocal analyzed
+        del reader, profile, context
+        analyzed += 1
+        if analyzed == 1:
+            if stage == "periodic_heartbeat":
+                assert periodic_attempted.wait(1)
+            elif stage == "fail":
+                raise OSError("analysis failed after cancellation")
+        return _analysis(Path(path), backend, Path(artifact_root))
+
+    client = HttpxWorkerClient("http://api", "w" * 40, transport=httpx.MockTransport(respond))
+    worker = _worker(
+        tmp_path, client, analyze, selector=lambda _: ArrayBackend("cpu", np)
+    )
+    run_once = worker.run_once
+    outcomes = []
+
+    def record_outcome():
+        outcome = run_once()
+        outcomes.append(outcome)
+        return outcome
+
+    monkeypatch.setattr(worker, "run_once", record_outcome)
+    try:
+        assert run_forever(worker, max_iterations=2, sleep=lambda _: None) == 2
+    finally:
+        client.close()
+
+    assert [(outcome.status, outcome.job_id) for outcome in outcomes] == [
+        ("claim_lost", "job-1"),
+        ("succeeded", "job-2"),
+    ]
+    assert requests[-1] == "/api/v1/internal/jobs/job-2/result"
+    assert requests.count("/api/v1/internal/jobs/claim") == 2
+    assert requests.count("/api/v1/internal/jobs/job-1/fail") == (stage == "fail")
+    assert worker.heartbeat_thread is None
+
+
+@pytest.mark.parametrize("operation", ["claim", "heartbeat", "result", "fail"])
+@pytest.mark.parametrize(
+    ("status", "body"),
+    [
+        (401, {"detail": "job is not running"}),
+        (403, {"detail": "job is not running"}),
+        (422, {"detail": "job is not running"}),
+        (409, {"detail": "source fingerprint does not match claimed job"}),
+        (404, {"detail": "job not found: another-job"}),
+        (404, {"detail": "Not Found"}),
+        (409, ["job is not running"]),
+    ],
+)
+def test_unrelated_job_protocol_errors_still_stop_worker(operation, status, body) -> None:
+    client = HttpxWorkerClient(
+        "http://api", "w" * 40,
+        transport=httpx.MockTransport(lambda _: httpx.Response(status, json=body)),
+    )
+    calls = {
+        "claim": lambda: client.claim("worker-a"),
+        "heartbeat": lambda: client.heartbeat("job-1", "worker-a", 0, 1),
+        "result": lambda: client.submit_result("job-1", {}),
+        "fail": lambda: client.fail("job-1", "worker-a", "analysis_failed", "failed", True),
+    }
+    try:
+        with pytest.raises(WorkerFatalProtocolError):
+            calls[operation]()
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize(
+    ("status", "detail"),
+    [(409, "job is not running"), (409, "worker is not the job owner"), (404, "job not found: job-1")],
+)
+def test_claim_endpoint_errors_are_not_treated_as_lost_ownership(status, detail) -> None:
+    client = HttpxWorkerClient(
+        "http://api", "w" * 40,
+        transport=httpx.MockTransport(lambda _: httpx.Response(status, json={"detail": detail})),
+    )
+    try:
+        with pytest.raises(WorkerFatalProtocolError):
+            client.claim("worker-a")
+    finally:
+        client.close()
+
+
+def test_non_json_job_conflict_remains_a_fatal_protocol_error() -> None:
+    client = HttpxWorkerClient(
+        "http://api", "w" * 40,
+        transport=httpx.MockTransport(lambda _: httpx.Response(409, text="invalid response")),
+    )
+    try:
+        with pytest.raises(WorkerFatalProtocolError):
+            client.heartbeat("job-1", "worker-a", 0, 1)
+    finally:
+        client.close()
 
 
 def test_invalid_claim_is_reported_nonretryable(tmp_path: Path) -> None:
@@ -420,7 +582,7 @@ def test_worker_submits_success_result_and_holds_no_heartbeat_thread(
     assert payload["source_file_id"] == "source-1"
     assert payload["processing_profile_id"] == "profile-1"
     assert payload["profile_version"] == 3
-    assert payload["pipeline_version"] == "pipeline-v1"
+    assert payload["pipeline_version"] == "v2"
     assert payload["events"][0]["classification"]["label"] == "unknown"
     assert len(payload["artifacts"]) == 6
     assert worker.heartbeat_thread is None

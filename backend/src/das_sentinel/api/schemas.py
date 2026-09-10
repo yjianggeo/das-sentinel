@@ -258,6 +258,10 @@ class JobEnqueueRequest(StrictSchema):
     pipeline_version: PipelineVersion
 
 
+class CancelledJobsDeleteResponse(StrictSchema):
+    deleted_count: int = Field(ge=0)
+
+
 class JobResponse(StrictSchema):
     id: str
     source_file_id: str
@@ -274,6 +278,26 @@ class JobResponse(StrictSchema):
     retry_eligible: bool
     created_at: datetime
     updated_at: datetime
+
+
+class JobListItemResponse(JobResponse):
+    source_filename: str
+    source_directory: str
+    site_id: str
+    site_name: str
+
+
+class JobPageResponse(StrictSchema):
+    items: list[JobListItemResponse]
+    total: int
+    global_counts: dict[str, int]
+
+
+class JobDirectoryResponse(StrictSchema):
+    site_id: str
+    site_name: str
+    directory: str
+    job_count: int
 
 
 class WorkerClaimRequest(StrictSchema):

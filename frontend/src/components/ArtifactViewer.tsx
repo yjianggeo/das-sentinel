@@ -33,7 +33,14 @@ export function artifactUrl(id: string): string {
   return `/api/v1/artifacts/${id}`;
 }
 
-export default function ArtifactViewer({
+export default function ArtifactViewer(props: {
+  eventId: string;
+  artifacts: EventArtifact[];
+}) {
+  return <EventArtifactViewer key={props.eventId} {...props} />;
+}
+
+function EventArtifactViewer({
   eventId,
   artifacts,
 }: {
@@ -41,8 +48,9 @@ export default function ArtifactViewer({
   artifacts: EventArtifact[];
 }) {
   const images = artifacts.filter((item) => IMAGE_KINDS.includes(item.kind));
+  const defaultKind = IMAGE_KINDS.find((kind) => images.some((item) => item.kind === kind));
   const [activeKind, setActiveKind] = useState<string>(
-    images[0]?.kind ?? "waterfall_raw",
+    defaultKind ?? "waterfall_raw",
   );
   const [fullscreen, setFullscreen] = useState(false);
   const [loadState, setLoadState] = useState<ArtifactLoadState>({
@@ -52,27 +60,25 @@ export default function ArtifactViewer({
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
   const fullscreenTriggerRef = useRef<HTMLButtonElement | null>(null);
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
-  const displayedEventIdRef = useRef(eventId);
-  const { options, optionsError, preview, busy, error, generate, reset } = useWaterfallPreview(eventId);
+  const { options, optionsError, preview, original, busy, error, generate, rejectPreview, reset } = useWaterfallPreview(eventId);
 
   useEffect(() => {
     if (images.length > 0 && !images.some((item) => item.kind === activeKind)) {
-      setActiveKind(images[0].kind);
+      setActiveKind(defaultKind!);
     }
-  }, [artifacts, activeKind, images]);
+  }, [artifacts, activeKind, images, defaultKind]);
 
   const active = images.find((item) => item.kind === activeKind) ?? images[0];
   const activeId = active?.id;
 
-  useEffect(() => {
-    if (displayedEventIdRef.current !== eventId) {
-      displayedEventIdRef.current = eventId;
-      setLoadState({ kind: "loading", eventId });
-    }
-  }, [eventId]);
+  const isPreviewKind = active?.kind === "waterfall_raw"
+    || active?.kind === "waterfall_filtered"
+    || active?.kind === "waveform";
+  const fallback = !original && !preview && Boolean(optionsError || error);
+  const showOriginal = !isPreviewKind || original || fallback;
 
   useEffect(() => {
-    if (!activeId) return;
+    if (!activeId || !showOriginal) return;
     const controller = new AbortController();
     let current = true;
     let objectUrl: string | null = null;
@@ -100,7 +106,7 @@ export default function ArtifactViewer({
       controller.abort();
       if (objectUrl !== null) URL.revokeObjectURL(objectUrl);
     };
-  }, [activeId, retryNumber]);
+  }, [activeId, eventId, retryNumber, showOriginal]);
 
   useEffect(() => {
     if (fullscreen) closeButtonRef.current?.focus();
@@ -138,11 +144,9 @@ export default function ArtifactViewer({
           ? preview?.waveform
           : undefined;
   const imageUrl = previewUrl
-    ?? (loadState.kind === "ready" && loadState.eventId === eventId
+    ?? (showOriginal && loadState.kind === "ready" && loadState.eventId === eventId
       ? loadState.url
-      : loadState.kind === "loading" && loadState.eventId === eventId
-        ? artifactUrl(active.id)
-        : undefined);
+      : undefined);
 
   const selectIndex = (index: number) => {
     if (images[index].kind === active.kind) return;
@@ -173,6 +177,10 @@ export default function ArtifactViewer({
   };
 
   const showDecodeError = () => {
+    if (previewUrl) {
+      if (rejectPreview(previewUrl) && fullscreen) closeFullscreen();
+      return;
+    }
     setLoadState({ kind: "error", message: "图件加载失败" });
     if (fullscreen) closeFullscreen();
   };
@@ -214,9 +222,11 @@ export default function ArtifactViewer({
             </button>
           ))}
         </div>
-        <a className="tab download" href={previewUrl ?? artifactUrl(active.id)} download>
-          下载
-        </a>
+        {imageUrl && (
+          <a className="tab download" href={previewUrl ?? artifactUrl(active.id)} download>
+            下载
+          </a>
+        )}
       </div>
       {images.map((item) => {
         const isActive = item.kind === active.kind;
@@ -229,10 +239,10 @@ export default function ArtifactViewer({
             className="artifact-panel"
             hidden={!isActive}
           >
-            {isActive && !previewUrl && loadState.kind === "loading" && (
+            {isActive && !imageUrl && (!showOriginal || loadState.kind === "loading") && (
               <p className="loading">正在加载图件…</p>
             )}
-            {isActive && !previewUrl && loadState.kind === "error" && (
+            {isActive && !previewUrl && showOriginal && loadState.kind === "error" && (
               <div className="artifact-error">
                 <p className="error" role="alert">{loadState.message}</p>
                 <button type="button" className="subtle" onClick={retry}>
@@ -243,6 +253,11 @@ export default function ArtifactViewer({
             {isActive && imageUrl && (
               <>
                 {previewUrl && <p>当前显示临时预览</p>}
+                {!previewUrl && isPreviewKind && (
+                  <p>{fallback
+                    ? "当前显示原始图件（预览不可用，坐标以原始图件为准）"
+                    : "当前显示原始图件（坐标以原始图件为准）"}</p>
+                )}
                 <button
                   type="button"
                   className="artifact-image-button"

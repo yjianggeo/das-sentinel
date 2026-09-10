@@ -1,5 +1,5 @@
 import pytest
-from das_sentinel.config import ProcessingProfile
+from das_sentinel.config import ProcessingProfile, Settings
 from pydantic import ValidationError
 
 
@@ -115,3 +115,22 @@ def test_profile_rejects_non_runnable_values(overrides):
 def test_profile_rejects_single_energy_band():
     with pytest.raises(ValidationError):
         ProcessingProfile(energy_bands_hz=((1.0, 5.0),))
+
+
+def test_settings_default_to_current_pipeline(monkeypatch):
+    monkeypatch.delenv("DAS_PIPELINE_VERSION", raising=False)
+    settings = Settings(_env_file=None, session_secret="s" * 32, worker_token="w" * 32)
+    assert settings.pipeline_version == "v2"
+
+
+@pytest.mark.parametrize("version", ["v1", "pipeline-v1", "v3"])
+def test_settings_reject_noncurrent_pipeline(version):
+    with pytest.raises(ValidationError, match="pipeline_version"):
+        Settings(_env_file=None, session_secret="s" * 32, worker_token="w" * 32,
+                 pipeline_version=version)
+
+
+def test_settings_reject_legacy_pipeline_environment(monkeypatch):
+    monkeypatch.setenv("DAS_PIPELINE_VERSION", "v1")
+    with pytest.raises(ValidationError, match="pipeline_version"):
+        Settings(_env_file=None, session_secret="s" * 32, worker_token="w" * 32)

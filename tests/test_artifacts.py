@@ -168,6 +168,34 @@ def test_renders_complete_event_artifact_set_with_distinct_raw_and_filtered_inpu
     assert "NaN" not in manifest.files["evidence"].path.read_text("utf-8")
 
 
+def test_evidence_embeds_measurements_with_source_and_event_identity(tmp_path):
+    from das_sentinel.artifacts import render_event_artifacts
+
+    measurements = {
+        "schema_version": "2",
+        "values": {"input_rms": 1.25},
+        "status": {"input_rms": "measured"},
+        "context": {"input_unit": "strain_rate"},
+    }
+    data = replace(
+        _artifact_data(),
+        source_fingerprint="a" * 64,
+        measurements=measurements,
+    )
+
+    manifest = render_event_artifacts(data, _event(), {}, tmp_path)
+    evidence = json.loads(manifest.files["evidence"].path.read_text("utf-8"))
+
+    assert evidence["source_fingerprint"] == "a" * 64
+    assert evidence["event_range"] == {
+        "start_sample": 1_020,
+        "end_sample": 1_080,
+        "channel_start": 1,
+        "channel_stop": 5,
+    }
+    assert evidence["measurements"] == measurements
+
+
 def test_png_artifacts_leave_a_clean_margin_around_plot_content(tmp_path):
     from das_sentinel.artifacts import render_event_artifacts
 
@@ -508,6 +536,76 @@ def test_waveform_axis_contains_event_and_candidate_exclusive_boundaries(monkeyp
     assert {round(line.get_xdata()[0], 10) for line in axis.lines} >= {round(start, 10), round(end, 10)}
     assert any(round(patch.get_x(), 10) == round(candidate_start, 10) and round(patch.get_x() + patch.get_width(), 10) == round(candidate_end, 10) for patch in axis.patches)
     assert axis.get_xlim()[0] < start and axis.get_xlim()[1] > end
+
+
+def test_waveform_legend_deduplicates_and_compacts_without_dropping_evidence(monkeypatch):
+    from das_sentinel import artifacts
+    from matplotlib import pyplot as plt
+
+    data = _artifact_data()
+    repeated = (
+        Candidate("stalta:short", 1_021, 1_030, 1_025, 1, 5, 0.7),
+        Candidate("stalta:long", 1_025, 1_045, 1_035, 1, 5, 0.7),
+        Candidate("stalta:long", 1_026, 1_046, 1_036, 1, 5, 0.8),
+        Candidate("energy:band-0", 1_030, 1_050, 1_040, 1, 5, 0.7),
+        Candidate("energy:band-0", 1_031, 1_051, 1_041, 1, 5, 0.8),
+        Candidate("energy:band-1", 1_035, 1_055, 1_045, 1, 5, 0.7),
+        Candidate("energy:band-2", 1_040, 1_060, 1_050, 1, 5, 0.7),
+        Candidate("coherence:band-0", 1_035, 1_055, 1_045, 1, 5, 0.7),
+        Candidate("trajectory", 1_050, 1_075, 1_060, 1, 5, 0.8),
+    )
+    event = replace(_event(), evidence=repeated)
+    captured = {}
+
+    def capture(figure):
+        figure.canvas.draw()
+        captured["axis"] = figure.axes[0]
+        captured["figure_bounds"] = figure.bbox.bounds
+        captured["legend_bounds"] = figure.axes[0].get_legend().get_window_extent(
+            figure.canvas.get_renderer()
+        ).bounds
+        plt.close(figure)
+        return b"png"
+
+    monkeypatch.setattr(artifacts, "_png", capture)
+    dates = artifacts._sample_dates(data, slice(20, 80))
+    context = artifacts.WaterfallPlotContext(
+        data.sample_rate_hz, data.site_timezone, data.profile_version,
+        data.pipeline_version, data.model_version, data.waterfall_filter,
+    )
+
+    artifacts.render_waveform_png(
+        np.zeros(60), dates, context, event, sample_offset=1020
+    )
+
+    axis = captured["axis"]
+    assert len(axis.patches) == len(repeated)
+    assert len(axis.lines) == 4 + len(repeated)
+    assert [text.get_text() for text in axis.get_legend().get_texts()] == [
+        "event start",
+        "event end",
+        "event peak",
+        "stalta:short span",
+        "stalta:short peak",
+        "stalta:long span",
+        "stalta:long peak",
+        "energy:band-0 span",
+        "energy:band-0 peak",
+        "energy:band-1 span",
+        "energy:band-1 peak",
+        "energy:band-2 span",
+        "energy:band-2 peak",
+        "coherence:band-0 span",
+        "coherence:band-0 peak",
+        "trajectory span",
+        "trajectory peak",
+    ]
+    assert axis.get_legend()._ncols == 2
+    figure_x, figure_y, figure_width, figure_height = captured["figure_bounds"]
+    legend_x, legend_y, legend_width, legend_height = captured["legend_bounds"]
+    assert legend_x >= figure_x and legend_y >= figure_y
+    assert legend_x + legend_width <= figure_x + figure_width
+    assert legend_y + legend_height <= figure_y + figure_height
 
 
 def test_time_axes_use_unique_relative_seconds_from_local_integer_reference():

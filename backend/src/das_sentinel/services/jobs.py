@@ -7,10 +7,10 @@ from collections.abc import Mapping, Sequence
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, case, delete, func, or_, select, update
 from sqlalchemy.orm import Session
 
 from das_sentinel.classifiers.similarity import FeatureVectorizer
@@ -18,6 +18,7 @@ from das_sentinel.persistence.models import (
     Job,
     ModelVersion,
     ProcessingProfile,
+    ProcessingRun,
     Site,
     SourceFile,
     freeze_json,
@@ -69,6 +70,30 @@ class JobSnapshot:
 
 
 @dataclass(frozen=True)
+class JobListItem:
+    job: JobSnapshot
+    source_filename: str
+    source_directory: str
+    site_id: str
+    site_name: str
+
+
+@dataclass(frozen=True)
+class JobPage:
+    items: list[JobListItem]
+    total: int
+    global_counts: dict[str, int]
+
+
+@dataclass(frozen=True)
+class JobDirectory:
+    site_id: str
+    site_name: str
+    directory: str
+    job_count: int
+
+
+@dataclass(frozen=True)
 class JobClaim:
     id: str
     source_file_id: str
@@ -92,6 +117,34 @@ class JobClaim:
     attempt_count: int
     worker_id: str
     heartbeat_at: datetime
+
+
+def _job_directory_filter(directory: str) -> str:
+    normalized = directory.replace("\\", "/")
+    windows_path = PureWindowsPath(normalized)
+    if (
+        (windows_path.drive and not windows_path.is_absolute())
+        or any(part == ".." for part in normalized.split("/"))
+        or "\0" in normalized
+    ):
+        raise JobValidationError("invalid task directory")
+    result = PurePosixPath(normalized).as_posix()
+    if windows_path.is_absolute() and len(result) == 2 and result[1] == ":":
+        result += "/"
+    return "" if result == "." else result
+
+
+def _job_source_context(source_path: str, site_root: str) -> tuple[str, str]:
+    source = PurePosixPath(source_path.replace("\\", "/"))
+    root = PurePosixPath(site_root.replace("\\", "/"))
+    try:
+        directory = source.parent.relative_to(root).as_posix()
+    except ValueError:
+        # A site may move while its registered source files remain at the old root.
+        directory = source.parent.as_posix()
+        if len(directory) == 2 and directory[1] == ":":
+            directory += "/"
+    return source.name, "" if directory == "." else directory
 
 
 class JobService:
@@ -174,6 +227,103 @@ class JobService:
             statement = statement.where(Job.status == status)
         statement = statement.order_by(Job.created_at, Job.id)
         return [_snapshot(row) for row in self.session.scalars(statement)]
+
+    def list_page(
+        self,
+        *,
+        status: str = "all",
+        site_id: str | None = None,
+        directory: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> JobPage:
+        if status not in JOB_STATUSES | {"all", "active"}:
+            raise JobValidationError(f"unsupported job status: {status}")
+        if not 1 <= limit <= 100 or not 0 <= offset <= MAX_SQLITE_INTEGER:
+            raise JobValidationError("invalid job page bounds")
+        if directory is not None:
+            if not site_id:
+                raise JobValidationError("directory requires a site ID")
+            directory = _job_directory_filter(directory)
+
+        counts = dict.fromkeys(JOB_STATUSES, 0)
+        counts.update(self.session.execute(
+            select(Job.status, func.count(Job.id)).group_by(Job.status)
+        ).all())
+        statement = (
+            select(Job, SourceFile.path, Site.id, Site.name, Site.data_path)
+            .join(SourceFile, Job.source_file_id == SourceFile.id)
+            .join(Site, SourceFile.site_id == Site.id)
+        )
+        if status == "active":
+            statement = statement.where(Job.status.in_(("queued", "running")))
+        elif status != "all":
+            statement = statement.where(Job.status == status)
+        if site_id is not None:
+            statement = statement.where(Site.id == site_id)
+        if directory is not None:
+            # Compare literal prefixes, then exclude nested directories. No NAS I/O.
+            source_path = func.replace(SourceFile.path, "\\", "/")
+            root = func.rtrim(func.replace(Site.data_path, "\\", "/"), "/")
+            absolute = directory.startswith("/") or PureWindowsPath(directory).is_absolute()
+            prefix = (
+                directory.rstrip("/") + "/" if absolute
+                else root + "/" + (directory + "/" if directory else "")
+            )
+            matches_directory = and_(
+                func.substr(source_path, 1, func.length(prefix)) == prefix,
+                func.instr(func.substr(source_path, func.length(prefix) + 1), "/") == 0,
+            )
+            if absolute:
+                historical = func.substr(source_path, 1, func.length(root) + 1) != root + "/"
+                registered = self.session.scalar(
+                    select(SourceFile.id)
+                    .join(Site, SourceFile.site_id == Site.id)
+                    .where(Site.id == site_id, matches_directory, historical)
+                    .limit(1)
+                )
+                if registered is None:
+                    raise JobValidationError("absolute directory is not registered history for this site")
+                statement = statement.where(historical)
+            statement = statement.where(matches_directory)
+        total = self.session.scalar(select(func.count()).select_from(statement.subquery()))
+        priority = case(
+            {"running": 0, "queued": 1, "failed": 2, "cancelled": 3, "succeeded": 4},
+            value=Job.status,
+        )
+        rows = self.session.execute(
+            statement.order_by(priority, Job.created_at.desc(), Job.id.desc())
+            .limit(limit).offset(offset)
+        )
+        items = []
+        for job, source_path, source_site_id, site_name, site_root in rows:
+            filename, source_directory = _job_source_context(source_path, site_root)
+            items.append(JobListItem(
+                job=_snapshot(job), source_filename=filename,
+                source_directory=source_directory, site_id=source_site_id,
+                site_name=site_name,
+            ))
+        return JobPage(items=items, total=total or 0, global_counts=counts)
+
+    def directories(self) -> list[JobDirectory]:
+        statement = (
+            select(Site.id, Site.name, Site.data_path, SourceFile.path, func.count(Job.id))
+            .select_from(Job)
+            .join(SourceFile, Job.source_file_id == SourceFile.id)
+            .join(Site, SourceFile.site_id == Site.id)
+            .group_by(Site.id, Site.name, Site.data_path, SourceFile.path)
+        )
+        groups: dict[tuple[str, str, str], int] = {}
+        for site_id, site_name, site_root, source_path, count in self.session.execute(statement):
+            _, directory = _job_source_context(source_path, site_root)
+            key = (site_id, site_name, directory)
+            groups[key] = groups.get(key, 0) + count
+        return [
+            JobDirectory(site_id=site_id, site_name=site_name, directory=directory, job_count=count)
+            for (site_id, site_name, directory), count in sorted(
+                groups.items(), key=lambda item: (item[0][1], item[0][2], item[0][0])
+            )
+        ]
 
     def claim(
         self,
@@ -287,6 +437,8 @@ class JobService:
         with _hold_artifact_paths(self.artifact_root, artifact_paths):
             finished_at = _utc(now)
             row.status = "succeeded"
+            row.progress_denominator = max(row.progress_denominator, 1)
+            row.progress_numerator = row.progress_denominator
             row.worker_id = None
             row.heartbeat_at = None
             row.retry_eligible = False
@@ -373,6 +525,29 @@ class JobService:
         row.updated_at = changed_at
         self.session.flush()
         return _snapshot(row)
+
+    def delete(self, job_id: str) -> None:
+        row = self._require(job_id)
+        if row.status != "cancelled":
+            raise JobConflictError("only cancelled jobs can be deleted")
+        self.session.execute(
+            update(ProcessingRun)
+            .where(ProcessingRun.job_id == row.id)
+            .values(job_id=None)
+        )
+        self.session.delete(row)
+        self.session.flush()
+
+    def delete_cancelled(self) -> int:
+        cancelled_ids = select(Job.id).where(Job.status == "cancelled")
+        self.session.execute(
+            update(ProcessingRun)
+            .where(ProcessingRun.job_id.in_(cancelled_ids))
+            .values(job_id=None)
+        )
+        result = self.session.execute(delete(Job).where(Job.status == "cancelled"))
+        self.session.flush()
+        return result.rowcount
 
     def recover_stale(
         self,

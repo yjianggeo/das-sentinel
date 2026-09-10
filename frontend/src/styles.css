@@ -169,6 +169,49 @@ table.data th {
   font-weight: 600;
 }
 
+.job-filters,
+.job-pagination {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+  margin: 1rem 0;
+}
+
+.job-filters label {
+  display: grid;
+  gap: 0.3rem;
+  max-width: 100%;
+}
+
+.job-filters select {
+  max-width: 100%;
+}
+
+.jobs-table td {
+  overflow-wrap: anywhere;
+}
+
+.jobs-table th,
+.jobs-table td:first-child,
+.jobs-table .status-pill {
+  white-space: nowrap;
+}
+
+.jobs-table .job-source {
+  max-width: 22rem;
+  min-width: 7rem;
+}
+
+.job-source small,
+.job-summary {
+  color: #8b949e;
+}
+
+.jobs-table .progress-track {
+  min-width: 70px;
+}
+
 .status-pill {
   display: inline-block;
   padding: 0.1rem 0.6rem;
@@ -192,31 +235,62 @@ table.data th {
 }
 
 .progress-fill {
-  background: #58a6ff;
+  background: currentColor;
   height: 100%;
 }
 
 /* Task 20: three-column event review and model lifecycle */
+main:has(> .events-layout) {
+  max-width: 1680px;
+  margin-inline: auto;
+}
+
 .events-layout {
+  --event-panel-height: 80vh;
   display: grid;
-  grid-template-columns: 30% 70%;
+  grid-template-columns: clamp(14rem, 20vw, 16rem) minmax(0, 1fr) clamp(16rem, 23vw, 19rem);
   gap: 1rem;
   align-items: start;
 }
 
-.event-queue {
+.event-queue,
+.event-features {
   background: #161b22;
   border: 1px solid #30363d;
-  border-radius: 8px;
-  padding: 0.75rem;
-  max-height: 80vh;
+  border-radius: 12px;
+  padding: 0.875rem;
+  height: var(--event-panel-height);
   overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scrollbar-width: thin;
+  scrollbar-color: #484f58 transparent;
+}
+
+.event-panel-heading {
+  position: sticky;
+  top: -0.875rem;
+  z-index: 1;
+  margin: -0.875rem -0.875rem 0.875rem;
+  padding: 0.875rem;
+  border-bottom: 1px solid #30363d;
+  background: #161b22;
+  color: #c9d1d9;
+  font-size: 0.9rem;
+  font-weight: 600;
+  line-height: 1.5;
 }
 
 .queue-filters {
   display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.5rem;
   margin-bottom: 0.75rem;
+}
+
+.queue-filters select {
+  min-width: 0;
+  width: 100%;
+  font-size: 0.8rem;
 }
 
 .queue-list {
@@ -228,7 +302,8 @@ table.data th {
 }
 
 .queue-item {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
   gap: 0.5rem;
   width: 100%;
@@ -236,9 +311,15 @@ table.data th {
   border: 1px solid transparent;
   border-radius: 6px;
   color: #e6edf3;
-  padding: 0.4rem 0.5rem;
+  padding: 0.5rem;
   cursor: pointer;
   text-align: left;
+  font-size: 0.82rem;
+  line-height: 1.5;
+}
+
+.queue-item .status-pill {
+  white-space: nowrap;
 }
 
 .queue-item:hover {
@@ -255,9 +336,17 @@ table.data th {
 }
 
 .queue-review {
-  margin-left: auto;
+  grid-column: 1 / -1;
   color: #3fb950;
   font-size: 0.8rem;
+}
+
+.event-detail {
+  min-width: 0;
+}
+
+.event-detail-header {
+  padding: 0.25rem 0 1rem;
 }
 
 .event-detail-header h2 {
@@ -265,14 +354,29 @@ table.data th {
   font-size: 1.2rem;
 }
 
+.event-detail-header p {
+  margin: 0.5rem 0 0;
+  color: #8b949e;
+  font-size: 0.9rem;
+  line-height: 1.6;
+}
+
 .event-detail-body {
   display: grid;
-  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr);
   gap: 1rem;
+}
+
+.event-artifacts {
+  padding: 0.875rem;
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 12px;
 }
 
 @media (max-width: 900px) {
   .events-layout {
+    --event-panel-height: min(60vh, 32rem);
     grid-template-columns: 1fr;
   }
   .event-detail-body {
@@ -406,7 +510,56 @@ table.data th {
 
 .evidence-panel {
   display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 0.75rem;
+  overflow-wrap: anywhere;
+}
+
+.evidence-panel > section {
+  background: #161b22;
+  border: 1px solid #30363d;
+  border-radius: 12px;
+  padding: 0.875rem;
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+
+.evidence-panel ul {
+  margin: 0.5rem 0 0;
+  padding-left: 1.1rem;
+}
+
+.evidence-panel p {
+  margin: 0.5rem 0;
+}
+
+.event-features:focus-visible {
+  outline: 2px solid #58a6ff;
+  outline-offset: 2px;
+}
+
+.event-features table {
+  table-layout: fixed;
+  margin-top: 0;
+}
+
+.event-features th,
+.event-features td {
+  overflow-wrap: anywhere;
+  padding: 0.65rem 0.4rem;
+  font-size: 0.82rem;
+  line-height: 1.5;
+  vertical-align: top;
+}
+
+.event-features th {
+  width: 62%;
+  font-weight: 400;
+}
+
+.event-features td {
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 
 .evidence-panel h3,
@@ -447,6 +600,13 @@ table.data th {
   border-radius: 8px;
   padding: 1.25rem;
   max-width: 420px;
+}
+
+@media (max-width: 1100px) {
+  .event-detail .review-form,
+  .evidence-panel {
+    grid-template-columns: 1fr;
+  }
 }
 
 .scan-directory-dialog {

@@ -46,3 +46,11 @@ it("forwards AbortSignal for JSON POST requests", async () => {
   controller.abort();
   await expect(pending).rejects.toMatchObject({ name: "AbortError" });
 });
+
+it("rejects an aborted DELETE response instead of reporting successful deletion", async () => {
+  vi.stubGlobal("fetch", vi.fn(() => Promise.resolve(new Response(null, { status: 204 }))));
+  const controller = new AbortController();
+  const pending = api.delete("/api/v1/jobs/cancelled-job-1", controller.signal);
+  controller.abort();
+  await expect(pending).rejects.toMatchObject({ name: "AbortError" });
+});

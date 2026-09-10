@@ -37,7 +37,7 @@ def _settings(tmp_path: Path) -> Settings:
         session_secret="s" * 32,
         worker_token=WORKER_TOKEN,
         secure_cookies=False,
-        pipeline_version="pipeline-v1",
+        pipeline_version="v2",
     )
 
 

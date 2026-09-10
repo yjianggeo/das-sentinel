@@ -32,7 +32,7 @@ def client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 def test_healthz_is_json_and_not_spa(client) -> None:
     response = client.get("/healthz")
     assert response.status_code == 200
-    assert response.json() == {"status": "ok"}
+    assert response.json() == {"status": "ok", "pipeline_version": "v2"}
     assert response.headers["content-type"].startswith("application/json")
 
 

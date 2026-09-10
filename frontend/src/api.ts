@@ -100,7 +100,8 @@ export const api = {
   post: <T>(path: string, body?: unknown, signal?: AbortSignal) =>
     request<T>("POST", path, body, undefined, signal),
   patch: <T>(path: string, body: unknown) => request<T>("PATCH", path, body),
-  delete: <T>(path: string) => request<T>("DELETE", path),
+  delete: <T>(path: string, signal?: AbortSignal) =>
+    request<T>("DELETE", path, undefined, undefined, signal),
 };
 
 export interface SessionInfo {
@@ -183,6 +184,26 @@ export interface Job {
   error_message: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface JobListItem extends Job {
+  source_filename: string;
+  source_directory: string;
+  site_id: string;
+  site_name: string;
+}
+
+export interface JobPage {
+  items: JobListItem[];
+  total: number;
+  global_counts: Record<Job["status"], number>;
+}
+
+export interface JobDirectory {
+  site_id: string;
+  site_name: string;
+  directory: string;
+  job_count: number;
 }
 
 export interface Review {
@@ -277,6 +298,17 @@ export interface EventDetail extends EventSummary {
   artifacts: EventArtifact[];
   run: EventRun;
 }
+
+export interface EventMeasurements {
+  schema_version: "2";
+  values: Record<string, number | null>;
+  status: Record<string, string>;
+  context: Record<string, unknown>;
+}
+
+export type EventMeasurementsResponse =
+  | { available: false }
+  | { available: true; measurements: EventMeasurements };
 
 export interface ModelInfo {
   id: string;

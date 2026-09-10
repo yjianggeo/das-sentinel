@@ -36,7 +36,7 @@ from das_sentinel.waterfalls import (
 )
 
 _MAX_PREVIEW_SAMPLES = 30_000
-_MAX_PREVIEW_CHANNELS = 256
+_MAX_PREVIEW_CHANNELS = 2048
 
 
 class WaterfallPreviewConflict(RuntimeError):

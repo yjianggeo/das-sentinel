@@ -62,7 +62,7 @@ uvicorn das_sentinel.api.app:create_runtime_app --factory --reload
 For CPU/NAS first boot, create `.env` with real `DAS_HOST_DATA_ROOT`,
 `DAS_SESSION_SECRET`, and `DAS_WORKER_TOKEN` values, then start the API and
 confirm that `curl -fsS http://127.0.0.1:8000/healthz` returns
-`{"status":"ok"}` before initializing the administrator and starting the
+`{"status":"ok","pipeline_version":"v2"}` before initializing the administrator and starting the
 worker. The complete command sequence is in `docs/operations.md`.
 
 GPU image construction (`docker build -f docker/Dockerfile.gpu ...`) is
