@@ -8,6 +8,7 @@ from scipy.signal import butter, detrend, hilbert, sosfiltfilt
 
 from das_sentinel.config import ProcessingProfile
 from das_sentinel.domain import DasBlock, EventRecord
+from das_sentinel.signal.scan_distance import scan_channel_mask
 
 MEASUREMENT_NAMES = (
     "input_rms",
@@ -483,7 +484,14 @@ def measure_event(
             (requested_stop - requested_start) / fs,
         )
 
-    selected_count = max(0, channel_stop - channel_start)
+    distance_selected = scan_channel_mask(block.metadata.channel_distance_m, profile)[
+        channel_start:channel_stop
+    ]
+    selected_count = int(distance_selected.sum())
+    context["scan_distance_range_m"] = {
+        "start": profile.scan_distance_start_m,
+        "stop": profile.scan_distance_stop_m,
+    }
     if selected_count == 0:
         quality_flags.append("empty_channel_window")
         for name in MEASUREMENT_NAMES:
@@ -503,7 +511,7 @@ def measure_event(
         block.data[analysis_start:analysis_stop, channel_start:channel_stop],
         dtype=np.float64,
     )
-    valid = np.isfinite(selected).all(axis=0)
+    valid = np.isfinite(selected).all(axis=0) & distance_selected
     if selected.shape[0]:
         valid &= np.ptp(np.where(np.isfinite(selected), selected, 0.0), axis=0) > 0.0
     else:

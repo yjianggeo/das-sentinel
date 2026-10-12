@@ -1,0 +1,5 @@
+.model-scans { margin-bottom: 2rem; }
+.model-scan-card { border: 1px solid #d8e1eb; border-radius: 8px; padding: 1rem; margin: 1rem 0; scroll-margin-top: 1rem; }
+.model-scan-heading { display: flex; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+.model-scan-paths { overflow-wrap: anywhere; color: #536477; font-size: .9rem; }
+.model-scan-directories { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: .5rem; margin-bottom: 1rem; }

@@ -99,6 +99,7 @@ export const api = {
   getBlob: (path: string, signal?: AbortSignal) => requestBlob(path, signal),
   post: <T>(path: string, body?: unknown, signal?: AbortSignal) =>
     request<T>("POST", path, body, undefined, signal),
+  put: <T>(path: string, body: unknown) => request<T>("PUT", path, body),
   patch: <T>(path: string, body: unknown) => request<T>("PATCH", path, body),
   delete: <T>(path: string, signal?: AbortSignal) =>
     request<T>("DELETE", path, undefined, undefined, signal),
@@ -110,9 +111,9 @@ export interface SessionInfo {
 }
 
 export interface Dashboard {
-  job_counts: Record<string, number>;
-  today_event_count: number;
-  machine_label_counts: Record<string, number>;
+  window_status_counts: Record<string, number>;
+  model_scan_status_counts: Record<string, number>;
+  review_counts: { earthquake: number; noise: number; pending: number };
 }
 
 export interface ProfileInfo {
@@ -171,41 +172,6 @@ export interface ScanStatus {
   error_message: string | null;
 }
 
-export interface Job {
-  id: string;
-  source_file_id: string;
-  processing_profile_id: string;
-  pipeline_version: string;
-  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
-  attempt_count: number;
-  progress_numerator: number;
-  progress_denominator: number;
-  error_code: string | null;
-  error_message: string | null;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface JobListItem extends Job {
-  source_filename: string;
-  source_directory: string;
-  site_id: string;
-  site_name: string;
-}
-
-export interface JobPage {
-  items: JobListItem[];
-  total: number;
-  global_counts: Record<Job["status"], number>;
-}
-
-export interface JobDirectory {
-  site_id: string;
-  site_name: string;
-  directory: string;
-  job_count: number;
-}
-
 export interface Review {
   id: number;
   label: string;
@@ -224,108 +190,6 @@ export interface EventSummary {
   channel_start: number;
   channel_stop: number;
   machine_label: "earthquake" | "blast" | "traffic" | "noise" | "unknown";
+  detection_score: number | null;
   latest_review: Review | null;
-}
-
-export interface EventEvidence {
-  detector: string;
-  score: number;
-  payload: Record<string, unknown>;
-}
-
-export interface MachineClassification {
-  id: number;
-  label: string;
-  decision_score: number;
-  method: string;
-  reasons: string[];
-  model_version_id: string | null;
-  created_at: string;
-}
-
-export interface EventArtifact {
-  id: string;
-  kind: string;
-  media_type: string;
-}
-
-export interface WaterfallOptions {
-  automatic_distance_start_m: number;
-  automatic_distance_stop_m: number;
-  available_distance_start_m: number;
-  available_distance_stop_m: number;
-  primary_detector: string;
-  primary_detector_display: string;
-  filter_low_hz: number;
-  filter_high_hz: number;
-  distance_unit: "m";
-}
-
-export interface WaterfallPreview {
-  distance_start_m: number;
-  distance_stop_m: number;
-  channel_count: number;
-  primary_detector: string;
-  primary_detector_display: string;
-  filter_low_hz: number;
-  filter_high_hz: number;
-  raw_png_base64: string;
-  filtered_png_base64: string;
-  waveform_png_base64: string;
-}
-
-export interface EventRun {
-  id: string;
-  source_file_id: string;
-  source_fingerprint: string;
-  processing_profile_id: string;
-  requested_backend: string;
-  actual_backend: string;
-  backend_fallback_reason: string | null;
-  profile_version: number;
-  pipeline_version: string;
-  model_version_id: string | null;
-  timings_ms: Record<string, number>;
-  started_at: string | null;
-  finished_at: string | null;
-}
-
-export interface EventDetail extends EventSummary {
-  features: Record<string, number | string>;
-  evidence: EventEvidence[];
-  machine_history: MachineClassification[];
-  review_history: Review[];
-  artifacts: EventArtifact[];
-  run: EventRun;
-}
-
-export interface EventMeasurements {
-  schema_version: "2";
-  values: Record<string, number | null>;
-  status: Record<string, string>;
-  context: Record<string, unknown>;
-}
-
-export type EventMeasurementsResponse =
-  | { available: false }
-  | { available: true; measurements: EventMeasurements };
-
-export interface ModelInfo {
-  id: string;
-  site_id: string;
-  version: string;
-  status: "candidate" | "active" | "retired" | "invalid";
-  dataset_sha256: string | null;
-  bundle_sha256: string;
-  metrics: {
-    macro_f1?: number;
-    recall_by_label?: Record<string, number>;
-    precision_by_label?: Record<string, number>;
-    confusion_matrix?: number[][];
-    rule_baseline_macro_f1?: number;
-    reviewed_count_by_label?: Record<string, number>;
-    feature_names?: string[];
-  } & Record<string, unknown>;
-  created_at: string;
-  published_at: string | null;
 }

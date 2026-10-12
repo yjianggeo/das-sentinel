@@ -50,9 +50,9 @@ it("logs in and redirects to the dashboard", async () => {
       });
     }),
     http.get("/api/v1/dashboard", () => HttpResponse.json({
-      job_counts: {},
-      today_event_count: 0,
-      machine_label_counts: {},
+      window_status_counts: {},
+      model_scan_status_counts: {},
+      review_counts: { earthquake: 0, noise: 0, pending: 0 },
     })),
   );
   renderApp("/login");
@@ -74,9 +74,9 @@ it("keeps the session and shows an error when logout fails", async () => {
       HttpResponse.json({ admin_id: 1, csrf_token: "token-1" }),
     ),
     http.get("/api/v1/dashboard", () => HttpResponse.json({
-      job_counts: {},
-      today_event_count: 0,
-      machine_label_counts: {},
+      window_status_counts: {},
+      model_scan_status_counts: {},
+      review_counts: { earthquake: 0, noise: 0, pending: 0 },
     })),
     http.delete("/api/v1/session", () =>
       HttpResponse.json({ detail: "failed" }, { status: 500 }),
@@ -130,9 +130,9 @@ it("ignores a stale dashboard 401 after logging into a new session", async () =>
         });
       }
       return HttpResponse.json({
-        job_counts: {},
-        today_event_count: 0,
-        machine_label_counts: {},
+        window_status_counts: {},
+        model_scan_status_counts: {},
+        review_counts: { earthquake: 0, noise: 0, pending: 0 },
       });
     }),
   );
@@ -160,9 +160,9 @@ it("clears the session after a successful logout", async () => {
       HttpResponse.json({ admin_id: 1, csrf_token: "token-1" }),
     ),
     http.get("/api/v1/dashboard", () => HttpResponse.json({
-      job_counts: {},
-      today_event_count: 0,
-      machine_label_counts: {},
+      window_status_counts: {},
+      model_scan_status_counts: {},
+      review_counts: { earthquake: 0, noise: 0, pending: 0 },
     })),
     http.delete("/api/v1/session", () => new HttpResponse(null, { status: 204 })),
   );

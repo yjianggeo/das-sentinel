@@ -69,7 +69,7 @@ def _write_source(path: Path, sample_count: int = 200, channel_count: int = 5) -
 
 
 @pytest.fixture
-def waterfall_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def waterfall_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, request):
     settings = _settings(tmp_path)
     upgrade_database(settings.database_url)
     engine = create_local_engine(settings.database_url)
@@ -93,6 +93,7 @@ def waterfall_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
                 artifact_pad_seconds=0.05,
                 stalta_freq_low_hz=3.5,
                 stalta_freq_high_hz=27.25,
+                **getattr(request, "param", {}),
             ).model_dump(mode="json"),
             is_current=False,
         )
@@ -100,7 +101,8 @@ def waterfall_api(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             site_id=site.id,
             version=5,
             payload=ProcessingProfile(
-                device="cpu", stalta_freq_low_hz=1.0, stalta_freq_high_hz=2.0
+                device="cpu", stalta_freq_low_hz=1.0, stalta_freq_high_hz=2.0,
+                **getattr(request, "param", {}),
             ).model_dump(mode="json"),
             is_current=True,
         )
@@ -304,13 +306,19 @@ def test_waterfall_preview_returns_three_pngs_after_one_read_without_writes(
 
 
 @pytest.mark.parametrize(
+    "waterfall_api",
+    [{}, {"scan_distance_start_m": 12.0, "scan_distance_stop_m": 20.0}],
+    indirect=True,
+    ids=["unrestricted-scan", "restricted-scan"],
+)
+@pytest.mark.parametrize(
     ("channel_count", "expected_stop_m", "expected_usable_channels"),
     [(832, 3332.0, 831), (1663, 6656.0, 1662)],
 )
 def test_waterfall_preview_reads_full_source_distance_without_writes(
     waterfall_api, monkeypatch, channel_count, expected_stop_m, expected_usable_channels
 ):
-    """Rejecting or truncating a full JJK channel range must fail."""
+    """Full previews must include channels outside the run and current scan bounds."""
     client, settings, sessions, csrf_token, ids, source_path = waterfall_api
     _write_source(source_path, sample_count=300, channel_count=channel_count)
     with sessions.begin() as session:

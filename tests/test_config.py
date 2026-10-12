@@ -11,6 +11,22 @@ def test_profile_has_approved_block_defaults():
     assert profile.device == "auto"
 
 
+@pytest.mark.parametrize("field", ["scan_distance_start_m", "scan_distance_stop_m"])
+@pytest.mark.parametrize("value", [-1, float("nan"), float("inf"), True, "300"])
+def test_scan_distance_rejects_invalid_bound(field, value):
+    with pytest.raises(ValidationError):
+        ProcessingProfile(**{field: value})
+
+
+def test_scan_distance_supports_open_bounds_and_rejects_reversed_range():
+    assert ProcessingProfile().scan_distance_start_m is None
+    assert ProcessingProfile(scan_distance_start_m=300).scan_distance_stop_m is None
+    assert ProcessingProfile(scan_distance_stop_m=900).scan_distance_start_m is None
+    for stop in (299, 300):
+        with pytest.raises(ValidationError):
+            ProcessingProfile(scan_distance_start_m=300, scan_distance_stop_m=stop)
+
+
 def test_profile_rejects_overlap_not_smaller_than_block():
     with pytest.raises(ValidationError):
         ProcessingProfile(block_seconds=5.0, overlap_seconds=5.0)

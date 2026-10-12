@@ -12,6 +12,91 @@ from das_sentinel.detectors.trajectory import (
 from tests.synthetic import preprocessed_block
 
 
+def legacy_line_energy(energy, distances_m, sample_rate_hz, velocity_mps):
+    """Frozen scalar search: preserves the pre-optimization reduction and ties."""
+    delays = np.rint((distances_m - distances_m[0]) / velocity_mps * sample_rate_hz).astype(int)
+    best_energy, best_start, best_indices = -1.0, 0, np.empty(0, dtype=int)
+    for start in range(energy.shape[0]):
+        indices = start + delays
+        if ((indices >= 0) & (indices < energy.shape[0])).all():
+            value = float(energy[indices, np.arange(energy.shape[1])].sum())
+            if value > best_energy:
+                best_energy, best_start, best_indices = value, start, indices
+    return best_energy, best_start, best_indices
+
+
+@pytest.mark.parametrize("distance", ([0., 1., 3.5, 8.], [-4., -2., 1., 7.], [3., -2., 7., 0.]))
+@pytest.mark.parametrize("velocity", [-1., 1., -80., 80.])
+@pytest.mark.parametrize("count", [0, 1, 35, 600])
+def test_line_energy_exactly_matches_scalar_search(distance, velocity, count):
+    from das_sentinel.detectors.trajectory import _line_energy
+
+    rng = np.random.default_rng(9)
+    energy = rng.random((count, 4))
+    if count > 2:
+        energy[1, 0] = np.nan
+    expected = legacy_line_energy(energy, np.array(distance), 100., velocity)
+    actual = _line_energy(energy, np.array(distance), 100., velocity)
+    assert actual[:2] == expected[:2]
+    np.testing.assert_array_equal(actual[2], expected[2])
+
+
+def test_line_energy_ties_keep_earliest_valid_signed_start():
+    from das_sentinel.detectors.trajectory import _line_energy
+
+    result = _line_energy(np.ones((600, 3)), np.array([0., -2., 3.]), 1., 1.)
+    assert result[:2] == (3., 2)
+    np.testing.assert_array_equal(result[2], [2, 0, 5])
+
+
+@pytest.mark.parametrize("dtype", ["f4", "f8"])
+@pytest.mark.parametrize("channels", [1, 7, 63, 64])
+def test_line_energy_preserves_reduction_order_across_chunks(dtype, channels):
+    from das_sentinel.detectors.trajectory import _line_energy
+
+    rng = np.random.default_rng(81)
+    energy = (rng.random((3000, channels)) * np.geomspace(1e-10, 1e10, channels)).astype(dtype)
+    distance = np.cumsum(rng.uniform(.5, 2., channels)) - 10
+    expected = legacy_line_energy(energy, distance, 100., -18.)
+    actual = _line_energy(energy, distance, 100., -18.)
+    assert actual[:2] == expected[:2]
+    np.testing.assert_array_equal(actual[2], expected[2])
+
+
+def test_line_energy_python_work_is_bounded_by_chunks():
+    import sys
+
+    from das_sentinel.detectors.trajectory import _line_energy
+
+    line_events = 0
+
+    def trace(frame, event, arg):
+        nonlocal line_events
+        if frame.f_code is _line_energy.__code__ and event == "line":
+            line_events += 1
+        return trace
+
+    previous = sys.gettrace()
+    try:
+        sys.settrace(trace)
+        result = _line_energy(np.ones((3000, 8)), np.arange(8.), 100., 10.)
+    finally:
+        sys.settrace(previous)
+    assert result[0] == 8.
+    assert line_events < 500, "per-start Python work returned to trajectory scoring"
+
+
+def test_trajectory_candidates_exactly_match_scalar_search(vehicle_diagonal, profile, monkeypatch):
+    from dataclasses import asdict
+
+    import das_sentinel.detectors.trajectory as module
+
+    actual = [asdict(value) for value in module.detect_trajectories(vehicle_diagonal, profile)]
+    monkeypatch.setattr(module, "_line_energy", legacy_line_energy)
+    expected = [asdict(value) for value in module.detect_trajectories(vehicle_diagonal, profile)]
+    assert actual == expected
+
+
 @pytest.fixture
 def profile() -> ProcessingProfile:
     return ProcessingProfile(

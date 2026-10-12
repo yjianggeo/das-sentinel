@@ -41,6 +41,7 @@ from das_sentinel.screening import (
 )
 from das_sentinel.signal.backend import ArrayBackend
 from das_sentinel.signal.preprocess import PreprocessedBlock
+from das_sentinel.signal.scan_distance import mask_scan_block, scan_channel_mask
 from das_sentinel.waterfalls import (
     WaterfallFilter,
     preprocess_for_waterfall,
@@ -183,6 +184,7 @@ def analyze_file(
     sample_count = reader.sample_count(reader_source)
     timings["read"] += _elapsed_ms(read_started)
     _validate_metadata(profile, metadata.sample_rate_hz)
+    scan_channel_mask(metadata.channel_distance_m, profile)
     if sample_count <= 0:
         raise ValueError("DAS source must contain at least one sample")
 
@@ -488,7 +490,7 @@ def _preprocess_for_band(
     band: tuple[float, float],
 ) -> PreprocessedBlock:
     return preprocess_for_waterfall(
-        block,
+        mask_scan_block(block, profile),
         profile,
         backend,
         WaterfallFilter("stalta", band[0], band[1]),

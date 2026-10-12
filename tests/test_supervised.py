@@ -99,6 +99,33 @@ def test_training_rejects_nonfinite_features():
         train_model(rows, groups=[row.day for row in rows])
 
 
+def test_training_uses_feasible_whole_group_folds_when_greedy_stratification_fails():
+    distributions = [
+        [6, 6, 2, 1, 4, 5, 0, 6],
+        [0, 2, 0, 12, 4, 3, 1, 8],
+        [0, 6, 2, 3, 7, 7, 4, 1],
+        [17, 2, 3, 0, 3, 0, 4, 1],
+    ]
+    rows = _rows(30)
+    groups = [f"day-{day}" for counts in distributions
+              for day, count in enumerate(counts) for _ in range(count)]
+
+    bundle, report = train_model(rows, groups)
+
+    assert report.confusion_matrix.sum() == 120
+    assert list(report.confusion_matrix.sum(axis=1)) == [30, 30, 30, 30]
+    assert np.isfinite(report.macro_f1)
+    assert sum(bundle.predict_probabilities(rows[0].features).values()) == pytest.approx(1.0)
+
+
+def test_training_rejects_class_coverage_that_cannot_be_grouped():
+    rows = _rows(20)
+    groups = ["blast-day" if row.label == Label.BLAST else row.day for row in rows]
+
+    with pytest.raises(TrainingGateError, match="class.*groups"):
+        train_model(rows, groups)
+
+
 def test_publishable_report_meets_all_gates_and_bundle_schema_is_checked(tmp_path: Path):
     rows = _rows(25)
 

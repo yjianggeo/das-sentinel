@@ -137,6 +137,35 @@ def test_strong_stalta_uses_profile_strong_ratio_and_can_form_an_event() -> None
     assert result.events
 
 
+def test_scan_distance_excludes_external_pulses_and_preserves_original_channels():
+    data = _noise(700, 32, 177)
+    data[300:311, :8] += _pulse(11, 8.0)[:, None]
+    data[500:511, 18:24] += _pulse(11, 8.0)[:, None]
+    block = _block(data, spacing_m=20.0)
+    options = _amplitude_options(spatial_window_m=160.0)
+    full = screen_block(block, _profile(), CPU, options)
+    assert any(item.channel_start < 15 for item in full.events)
+
+    profile = _profile(scan_distance_start_m=300, scan_distance_stop_m=540)
+    ranged = screen_block(block, profile, CPU, options)
+    assert ranged.events
+    assert all(15 <= item.channel_start < item.channel_stop <= 28 for item in ranged.candidates)
+    assert any(10_480 <= item.peak_sample <= 10_530 for item in ranged.events)
+    assert not any(10_280 <= item.peak_sample <= 10_330 for item in ranged.events)
+
+    contaminated = data.copy()
+    contaminated[:, :15] *= 1e30
+    contaminated[:, 28:] *= 1e30
+    changed = screen_block(_block(contaminated, spacing_m=20.0), profile, CPU, options)
+    assert changed.candidates == ranged.candidates
+    np.testing.assert_array_equal(block.data, data)
+
+
+def test_scan_distance_rejects_a_range_without_source_channels():
+    with pytest.raises(ValueError, match="scan distance range"):
+        screen_block(_block(_noise(100, 8, 9)), _profile(scan_distance_start_m=300), CPU)
+
+
 def test_scattered_channels_do_not_count_as_local_support() -> None:
     pulse = _pulse(11, 8.0)
     scattered = _noise(500, 24, 2)
@@ -234,6 +263,181 @@ def test_near_zero_moveout_is_retained_as_ambiguous_evidence() -> None:
     assert near_zero
     assert "apparent_velocity_mps" not in near_zero[0].metrics
     assert any(near_zero[0] in event.evidence for event in result.events)
+
+
+def test_persistent_coherence_is_audited_but_does_not_create_interior_events():
+    fs = 200.0
+    data = _noise(4000, 64, 20260913)
+    data += (0.0085 * np.sin(2 * np.pi * 8 * np.arange(4000) / fs))[:, None]
+    profile = ProcessingProfile()
+    result = screen_block(
+        _block(data, sample_rate_hz=fs, spacing_m=4), profile, CPU,
+        ScreeningOptions(enable_trajectory=False),
+    )
+    persistent = [
+        candidate for candidate in result.candidates
+        if "persistent_coherence_background" in candidate.quality_flags
+    ]
+    assert persistent
+    assert all(candidate.detector == "coherence" for candidate in persistent)
+    assert all(candidate.metrics["coherence_peak_prominence"] < 0.04 for candidate in persistent)
+    assert all(candidate.metrics["coherence_beam_energy_ratio"] < 1.5 for candidate in persistent)
+    assert result.diagnostics["detectors"]["coherence"]["persistent_background_count"] == len(persistent)
+    assert all(candidate not in persistent for event in result.events for candidate in event.evidence)
+    unmarked = [replace(candidate, quality_flags=()) for candidate in result.candidates]
+    assert len(result.events) < len(fuse_screening_candidates(unmarked, profile))
+
+
+def test_weak_coherence_only_transient_remains_a_primary_event():
+    fs = 200.0
+    data = _noise(4000, 64, 20260913)
+    data[1600:2200] += (
+        0.012 * np.hanning(600) * np.sin(2 * np.pi * 8 * np.arange(600) / fs)
+    )[:, None]
+    result = screen_block(
+        _block(data, sample_rate_hz=fs, spacing_m=4), ProcessingProfile(), CPU,
+        ScreeningOptions(enable_trajectory=False),
+    )
+    assert result.events
+    assert {candidate.detector for candidate in result.candidates} == {"coherence"}
+    primary = max(result.candidates, key=lambda candidate: candidate.metrics["semblance"])
+    assert primary.metrics["coherence_peak_prominence"] >= 0.04
+    assert "near_zero_moveout_ambiguous" in primary.quality_flags
+    assert "persistent_coherence_background" not in primary.quality_flags
+    assert any(primary in event.evidence for event in result.events)
+
+
+@pytest.mark.parametrize(
+    "prominence,current_power,before_power,after_power,peak_index,persistent",
+    [
+        (0.02, 1.0, 1.0, 1.0, 100, True),
+        (0.04, 1.0, 1.0, 1.0, 100, False),
+        (0.05, 1.0, 1.0, 1.0, 100, False),
+        (0.02, 1.5, 1.0, 1.0, 100, False),
+        (0.02, 1.6, 1.0, 1.0, 100, False),
+        (0.02, 1.6, 2.0, 1.0, 100, False),
+        (0.02, 1.0, 1.0, 1.0, 10, False),
+        (0.02, 1.0, 1.0, 1.0, 170, False),
+    ],
+)
+def test_coherence_background_requires_both_complete_quiet_flanks(
+    monkeypatch, prominence, current_power, before_power, after_power, peak_index, persistent,
+):
+    from das_sentinel import screening
+
+    width, samples = 20, 200
+    curve = np.full(samples - width + 1, 0.2)
+    curve[peak_index] += prominence
+    stack = np.ones(samples)
+    stack[max(0, peak_index - width):peak_index] = np.sqrt(before_power)
+    stack[peak_index:peak_index + width] = np.sqrt(current_power)
+    stack[peak_index + width:peak_index + 2 * width] = np.sqrt(after_power)
+    monkeypatch.setattr(screening, "_moveout_semblance", lambda *args: (curve, stack))
+    block = PreprocessedBlock(
+        data=np.zeros((samples, 8), dtype=np.float32),
+        bad_channel_mask=np.zeros(8, dtype=bool), backend_name="cpu",
+        sample_offset=1000, sample_rate_hz=10,
+        channel_distance_m=np.arange(8, dtype=float),
+    )
+    profile = _profile(coherence_window_seconds=2, coherence_freq_high_hz=4)
+    candidates, _ = screening._coherence_candidates(
+        block, [np.arange(8)], profile, ScreeningOptions(), CPU,
+    )
+    assert len(candidates) == 1
+    candidate = candidates[0]
+    assert candidate.metrics["coherence_peak_prominence"] == pytest.approx(prominence)
+    complete = width <= peak_index and peak_index + 2 * width <= samples
+    assert candidate.metrics["coherence_background_complete"] == float(complete)
+    if complete:
+        assert candidate.metrics["coherence_beam_energy_ratio"] == pytest.approx(
+            current_power / min(before_power, after_power)
+        )
+    else:
+        assert "coherence_beam_energy_ratio" not in candidate.metrics
+    assert ("persistent_coherence_background" in candidate.quality_flags) is persistent
+
+
+def test_coherence_global_maximum_fallback_keeps_missing_background(monkeypatch):
+    from das_sentinel import screening
+
+    curve = np.full(181, 0.2)
+    monkeypatch.setattr(screening, "_moveout_semblance", lambda *args: (curve, np.ones(200)))
+    block = PreprocessedBlock(
+        data=np.zeros((200, 8), dtype=np.float32),
+        bad_channel_mask=np.zeros(8, dtype=bool), backend_name="cpu",
+        sample_offset=1000, sample_rate_hz=10,
+        channel_distance_m=np.arange(8, dtype=float),
+    )
+    profile = _profile(coherence_window_seconds=2, coherence_freq_high_hz=4)
+    candidates, _ = screening._coherence_candidates(
+        block, [np.arange(8)], profile, ScreeningOptions(), CPU,
+    )
+    assert len(candidates) == 1
+    assert candidates[0].metrics["coherence_peak_prominence"] == 0.0
+    assert candidates[0].metrics["coherence_background_complete"] == 0.0
+    assert "persistent_coherence_background" not in candidates[0].quality_flags
+    assert fuse_screening_candidates(candidates, profile)
+
+
+def test_coherence_background_must_remain_complete_after_moveout(monkeypatch):
+    from das_sentinel import screening
+
+    curve = np.full(181, 0.2)
+    curve[80] = 0.22
+
+    def moveout(data, delays, width, xp):
+        return (curve if int(delays.min()) == -70 else np.zeros(181)), np.ones(200)
+
+    monkeypatch.setattr(screening, "_moveout_semblance", moveout)
+    block = PreprocessedBlock(
+        data=np.zeros((200, 8), dtype=np.float32),
+        bad_channel_mask=np.zeros(8, dtype=bool), backend_name="cpu",
+        sample_offset=1000, sample_rate_hz=10,
+        channel_distance_m=np.arange(8, dtype=float) * 10,
+    )
+    profile = _profile(coherence_window_seconds=2, coherence_freq_high_hz=4,
+                       slowness_max_s_per_m=0.1, slowness_points=3)
+    candidates, _ = screening._coherence_candidates(
+        block, [np.arange(8)], profile, ScreeningOptions(), CPU,
+    )
+    assert len(candidates) == 1
+    assert candidates[0].metrics["slowness_s_per_m"] == pytest.approx(-0.1)
+    assert candidates[0].metrics["coherence_background_complete"] == 0.0
+    assert "persistent_coherence_background" not in candidates[0].quality_flags
+
+
+def test_persistent_coherence_does_not_suppress_a_primary_spatial_candidate():
+    background = replace(
+        _candidate("coherence", 0.99, channel_start=0, channel_stop=20),
+        quality_flags=("persistent_coherence_background",),
+    )
+    primary = _candidate("coherence", 0.7, channel_start=4, channel_stop=8)
+    candidates = _suppress_duplicates([background, primary], peak_tolerance=3)
+    assert background in candidates
+    assert primary in candidates
+
+
+@pytest.mark.parametrize("amplitude_score", [0.60, 0.85])
+def test_persistent_coherence_cannot_vote_or_change_primary_event_bounds(amplitude_score):
+    profile = _profile()
+    background = replace(
+        _candidate("coherence", 1.0, start_sample=0, end_sample=1000,
+                   peak_sample=10, channel_start=0, channel_stop=20),
+        quality_flags=("persistent_coherence_background",),
+    )
+    amplitude = _candidate("stalta:long", amplitude_score)
+    assert fuse_screening_candidates((background,), profile) == ()
+    events = fuse_screening_candidates((background, amplitude), profile)
+    if amplitude_score < profile.fusion_strong_score:
+        assert events == ()
+    else:
+        assert len(events) == 1
+        assert events[0].evidence == (amplitude,)
+        assert events[0].start_sample == amplitude.start_sample
+        assert events[0].end_sample == amplitude.end_sample
+        assert events[0].peak_sample == amplitude.peak_sample
+        assert events[0].channel_start == amplitude.channel_start
+        assert events[0].channel_stop == amplitude.channel_stop
 
 
 def test_trajectory_scans_a_feasible_local_part_of_a_long_cable() -> None:

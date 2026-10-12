@@ -31,6 +31,10 @@ from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 
 EXPECTED_TABLES = {
+    "event_windows",
+    "window_analyses",
+    "window_reviews",
+    "window_label_imports",
     "admins",
     "sites",
     "processing_profiles",
@@ -156,7 +160,7 @@ def test_upgrade_database_uses_installed_package_migrations(tmp_path, monkeypatc
     try:
         with engine.connect() as connection:
             assert connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one() == (
-                "0002_job_model_and_review_request"
+                "0012_model_scan_coverage_index"
             )
     finally:
         engine.dispose()

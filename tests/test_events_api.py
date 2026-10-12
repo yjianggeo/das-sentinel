@@ -324,7 +324,8 @@ def test_event_list_filters_and_stable_bounded_pagination(event_api):
     ).status_code == 422
 
 
-def test_event_list_select_count_is_constant_across_page_sizes(event_api):
+@pytest.mark.parametrize("sort", ["time_desc", "score_desc", "score_asc"])
+def test_event_list_select_count_is_constant_across_page_sizes(event_api, sort):
     client, _, _, _, _ = event_api
     engine = client.app.state.engine
     select_counts = []
@@ -347,7 +348,7 @@ def test_event_list_select_count_is_constant_across_page_sizes(event_api):
 
         sqlalchemy_event.listen(engine, "before_cursor_execute", count_selects)
         try:
-            response = client.get("/api/v1/events", params={"limit": limit})
+            response = client.get("/api/v1/events", params={"limit": limit, "sort": sort})
         finally:
             sqlalchemy_event.remove(
                 engine,
@@ -359,6 +360,96 @@ def test_event_list_select_count_is_constant_across_page_sizes(event_api):
 
     assert select_counts[0] == select_counts[1] == select_counts[2]
     assert select_counts[0] <= 3
+
+
+@pytest.mark.parametrize("sort,expected", [
+    ("time_desc", ["event-3", "event-2", "event-1"]),
+    ("score_desc", ["event-1", "event-2", "event-3"]),
+    ("score_asc", ["event-2", "event-1", "event-3"]),
+])
+def test_event_list_sorts_by_max_evidence_score_with_null_last(event_api, sort, expected):
+    client, _, sessions, _, ids = event_api
+    with sessions.begin() as session:
+        events = Repositories(session).events
+        events.add_evidence(ids["event_1"], detector="stalta", score=0.95, payload={})
+        events.add_evidence(ids["event_1"], detector="coherence", score=0.1, payload={})
+        events.add_evidence(ids["event_2"], detector="energy", score=0.0, payload={})
+
+    response = client.get("/api/v1/events", params={"sort": sort})
+
+    assert response.status_code == 200
+    assert [item["event_uid"] for item in response.json()] == expected
+    assert {item["event_uid"]: item["detection_score"] for item in response.json()} == {
+        "event-1": 0.95, "event-2": 0.0, "event-3": None,
+    }
+    pages = [client.get("/api/v1/events", params={"sort": sort, "limit": 1, "offset": offset}).json()
+             for offset in range(3)]
+    assert [page[0]["event_uid"] for page in pages] == expected
+    assert client.get(f"/api/v1/events/{ids['event_1']}").json()["detection_score"] == 0.95
+    assert client.get(f"/api/v1/events/{ids['event_3']}").json()["detection_score"] is None
+
+
+@pytest.mark.parametrize("sort", ["score_desc", "score_asc"])
+def test_event_score_sort_has_stable_ties_and_preserves_filters(event_api, sort):
+    client, _, sessions, _, ids = event_api
+    same_time_ids = [ids["event_2"]]
+    with sessions.begin() as session:
+        repositories = Repositories(session)
+        for name in ("event_2", "event_3"):
+            repositories.events.add_evidence(ids[name], detector="energy", score=0.8, payload={})
+        for index in range(2):
+            event = repositories.events.add(
+                run_id=ids["run_a"], event_uid=f"score-tie-{index}",
+                start_sample=40 + index * 10, end_sample=45 + index * 10,
+                channel_start=0, channel_stop=4,
+                occurred_at=datetime(2026, 7, 30, 0, 0, 20, tzinfo=UTC),
+            )
+            repositories.events.add_evidence(event.id, detector="coherence", score=0.8, payload={})
+            repositories.events.add_classification(
+                event.id, label="traffic", decision_score=0.1, method="rules",
+            )
+            same_time_ids.append(event.id)
+    expected = [ids["event_3"], *sorted(same_time_ids, reverse=True), ids["event_1"]]
+
+    pages = [client.get("/api/v1/events", params={"sort": sort, "limit": 2, "offset": offset})
+             for offset in (0, 2, 4)]
+
+    assert all(response.status_code == 200 for response in pages)
+    assert [item["id"] for response in pages for item in response.json()] == expected
+    filtered = client.get("/api/v1/events", params={
+        "sort": sort, "site_id": ids["site_a"], "machine_label": "traffic", "reviewed": "false",
+        "start_utc": "2026-07-30T00:00:15Z", "end_utc": "2026-07-30T00:00:25Z",
+    })
+    assert filtered.status_code == 200
+    assert [item["id"] for item in filtered.json()] == sorted(same_time_ids[1:], reverse=True)
+
+
+@pytest.mark.parametrize("sort", ["score", "time_asc", "score_desc;DROP", ""])
+def test_event_list_rejects_unsupported_sort(event_api, sort):
+    client, _, _, _, _ = event_api
+
+    assert client.get("/api/v1/events", params={"sort": sort}).status_code == 422
+
+
+def test_similar_event_detection_scores_match_list_and_detail(event_api):
+    client, _, sessions, _, _ = event_api
+    event_id = _seed_events_with_extract_features_output(event_api, count=6)
+    with sessions.begin() as session:
+        repositories = Repositories(session)
+        for event in session.scalars(select(Event).where(Event.event_uid.like("real-feature-%"))):
+            repositories.events.add_evidence(event.id, detector="energy", score=0.7, payload={})
+            repositories.events.add_evidence(event.id, detector="stalta", score=0.4, payload={})
+
+    response = client.get(f"/api/v1/events/{event_id}/similar?limit=5")
+
+    assert response.status_code == 200
+    scores = {item["id"]: item["detection_score"] for item in client.get("/api/v1/events").json()}
+    assert any(item["detection_score"] == 0.7 for item in response.json())
+    for item in response.json():
+        assert item["detection_score"] == scores[item["id"]]
+        assert item["detection_score"] == client.get(
+            f"/api/v1/events/{item['id']}",
+        ).json()["detection_score"]
 
 
 def test_event_list_uses_created_at_then_id_for_latest_machine_label(event_api):

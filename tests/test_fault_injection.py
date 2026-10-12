@@ -1,4 +1,4 @@
-"""Fault-injection acceptance: a corrupt file fails without blocking the next file.
+"""Legacy worker acceptance: a corrupt file fails without blocking the next file.
 
 Runs the real stack (API served by Uvicorn on a local port + persistence +
 worker) against one corrupt HDF5 and one valid synthetic ZD HDF5, then
@@ -22,6 +22,11 @@ from das_sentinel.persistence import (
     create_local_engine,
     session_factory,
     upgrade_database,
+)
+from das_sentinel.services.discovery import (
+    DiscoveredFile,
+    enqueue_discovered,
+    load_discovery_site,
 )
 from das_sentinel.worker.main import HttpxWorkerClient, Worker
 
@@ -80,6 +85,13 @@ def running_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
             is_current=True,
         )
         site_id = site.id
+        # New directory scans create whole-window jobs. Seed the preserved
+        # legacy queue explicitly to continue testing its failure isolation.
+        enqueue_discovered(
+            session, load_discovery_site(session, site_id),
+            [DiscoveredFile.from_path(corrupt), DiscoveredFile.from_path(valid)],
+            settings.pipeline_version, artifact_root=settings.app_data_dir / "artifacts",
+        )
 
     monkeypatch.setattr("das_sentinel.api.app.check_database_startup", lambda _: None)
     app = create_app(settings)
@@ -99,27 +111,7 @@ def running_stack(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     client = httpx.Client(base_url=API_BASE, timeout=30.0)
     try:
         login = client.post("/api/v1/session", json={"password": PASSWORD})
-        csrf = login.headers["x-csrf-token"]
-
-        started = client.post(
-            f"/api/v1/sites/{site_id}/scan",
-            json={"path": "jjk/day"},
-            headers={"X-CSRF-Token": csrf},
-        )
-        assert started.status_code == 202, started.text
-        scan_id = started.json()["id"]
-        deadline = time.monotonic() + 30.0
-        while time.monotonic() < deadline:
-            response = client.get(f"/api/v1/scans/{scan_id}")
-            assert response.status_code == 200, response.text
-            snapshot = response.json()
-            if snapshot["phase"] in {"completed", "failed"}:
-                break
-            time.sleep(0.05)
-        else:
-            raise AssertionError(f"scan {scan_id} did not reach a terminal phase")
-        assert snapshot["phase"] == "completed", snapshot
-        assert snapshot["submitted_files"] == 2
+        assert login.status_code == 204
 
         # Fault injection: the file changes after being fingerprinted and
         # enqueued, so the worker must refuse it and mark the job failed

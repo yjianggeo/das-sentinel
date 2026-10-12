@@ -32,6 +32,38 @@ from das_sentinel.worker.main import (
 )
 
 
+def test_result_artifact_limit_rejects_one_job_without_fatal_protocol_error():
+    from das_sentinel.worker.main import ResultSubmissionError
+
+    client = HttpxWorkerClient(
+        "http://api", "w" * 40,
+        transport=httpx.MockTransport(lambda request: httpx.Response(
+            422, json={"detail": "result contains too many artifact files"},
+            request=request,
+        )),
+    )
+    try:
+        with pytest.raises(ResultSubmissionError):
+            client.submit_result("one-job", {})
+    finally:
+        client.close()
+
+
+def test_result_identity_rejection_still_stops_worker():
+    client = HttpxWorkerClient(
+        "http://api", "w" * 40,
+        transport=httpx.MockTransport(lambda request: httpx.Response(
+            422, json={"detail": "result identity does not match job"},
+            request=request,
+        )),
+    )
+    try:
+        with pytest.raises(WorkerFatalProtocolError):
+            client.submit_result("one-job", {})
+    finally:
+        client.close()
+
+
 class FakeReader:
     def probe(self, path) -> ProbeResult:
         del path

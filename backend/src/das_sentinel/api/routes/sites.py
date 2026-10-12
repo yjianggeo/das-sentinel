@@ -148,6 +148,10 @@ def _update_site(
             if payload.profile is not None
             else {}
         )
+        if payload.profile is not None:
+            for name in ("scan_distance_start_m", "scan_distance_stop_m"):
+                if name in payload.profile.model_fields_set:
+                    profile_updates[name] = getattr(payload.profile, name)
         try:
             next_profile = ProcessingProfile.model_validate(
                 {**json.loads(current.payload_json), **profile_updates}

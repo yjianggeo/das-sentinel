@@ -38,13 +38,27 @@ def run_migrations_online() -> None:
     engine = create_local_engine(_database_url())
     try:
         with engine.connect() as connection:
-            context.configure(
-                connection=connection,
-                target_metadata=target_metadata,
-                render_as_batch=True,
-            )
-            with context.begin_transaction():
-                context.run_migrations()
+            # SQLite batch rebuilds must temporarily disable referring FK enforcement.
+            # An explicit transaction makes DDL and version updates roll back together.
+            connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+            connection.commit()
+            try:
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
+                context.configure(
+                    connection=connection,
+                    target_metadata=target_metadata,
+                    render_as_batch=True,
+                    transactional_ddl=True,
+                )
+                with context.begin_transaction():
+                    context.run_migrations()
+                if connection.exec_driver_sql("PRAGMA foreign_key_check").fetchall():
+                    raise RuntimeError("migration would leave broken foreign keys")
+                connection.commit()
+            finally:
+                connection.rollback()
+                connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+                connection.commit()
     finally:
         engine.dispose()
 

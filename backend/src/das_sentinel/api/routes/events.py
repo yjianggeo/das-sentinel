@@ -25,6 +25,7 @@ from das_sentinel.classifiers.similarity import SimilarityIndex
 from das_sentinel.persistence.models import (
     MACHINE_LABELS,
     Classification,
+    DetectionEvidence,
     Event,
     ProcessingRun,
     Review,
@@ -120,6 +121,7 @@ def list_events(
     end_utc: datetime | None = None,
     machine_label: str | None = Query(default=None, max_length=16),
     reviewed: bool | None = None,
+    sort: Literal["time_desc", "score_desc", "score_asc"] = "time_desc",
     limit: int = Query(default=50, ge=1, le=100),
     offset: int = Query(default=0, ge=0, le=100_000),
 ) -> list[EventSummaryResponse]:
@@ -159,6 +161,12 @@ def list_events(
         .correlate(Event)
         .scalar_subquery()
     )
+    detection_score = (
+        select(func.max(DetectionEvidence.score))
+        .where(DetectionEvidence.event_id == Event.id)
+        .correlate(Event)
+        .scalar_subquery()
+    )
     statement = (
         select(
             Event,
@@ -166,6 +174,7 @@ def list_events(
             Site.timezone,
             func.coalesce(latest_machine_label, "unknown"),
             Review,
+            detection_score,
         )
         .join(ProcessingRun, ProcessingRun.id == Event.processing_run_id)
         .join(SourceFile, SourceFile.id == ProcessingRun.source_file_id)
@@ -188,6 +197,11 @@ def list_events(
             if reviewed
             else latest_review_id.is_(None)
         )
+    if sort != "time_desc":
+        statement = statement.order_by(
+            detection_score.is_(None).asc(),
+            detection_score.desc() if sort == "score_desc" else detection_score.asc(),
+        )
     statement = statement.order_by(
         Event.occurred_at.desc(),
         Event.id.desc(),
@@ -202,8 +216,9 @@ def list_events(
                 row_site_timezone,
                 cast(MachineLabelValue, label),
                 latest_review,
+                score,
             )
-            for event, row_site_id, row_site_timezone, label, latest_review in rows
+            for event, row_site_id, row_site_timezone, label, latest_review, score in rows
         ]
 
 
@@ -481,6 +496,7 @@ def _summary(
         channel_start=event.channel_start,
         channel_stop=event.channel_stop,
         machine_label=cast(MachineLabelValue, event.machine_label),
+        detection_score=max((item.score for item in event.evidence), default=None),
         latest_review=None if latest is None else _review(latest),
     )
 
@@ -491,6 +507,7 @@ def _list_summary(
     site_timezone: str,
     machine_label: MachineLabelValue,
     latest_review: Review | None,
+    detection_score: float | None,
 ) -> EventSummaryResponse:
     return EventSummaryResponse(
         id=event.id,
@@ -503,6 +520,7 @@ def _list_summary(
         channel_start=event.channel_start,
         channel_stop=event.channel_stop,
         machine_label=machine_label,
+        detection_score=detection_score,
         latest_review=None if latest_review is None else _review(latest_review),
     )
 

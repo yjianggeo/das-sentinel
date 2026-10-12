@@ -86,9 +86,9 @@ class SessionResponse(StrictSchema):
 
 
 class DashboardResponse(StrictSchema):
-    job_counts: dict[str, int]
-    today_event_count: int
-    machine_label_counts: dict[str, int]
+    window_status_counts: dict[str, int]
+    model_scan_status_counts: dict[str, int]
+    review_counts: dict[str, int]
 
 
 class ProfileCreate(ProcessingProfile):
@@ -96,6 +96,8 @@ class ProfileCreate(ProcessingProfile):
 
 
 class ProfilePatch(StrictSchema):
+    scan_distance_start_m: float | None = Field(default=None, ge=0, strict=True, allow_inf_nan=False)
+    scan_distance_stop_m: float | None = Field(default=None, ge=0, strict=True, allow_inf_nan=False)
     block_seconds: float | None = None
     overlap_seconds: float | None = None
     device: Literal["auto", "cpu", "cuda"] | None = None
@@ -291,6 +293,26 @@ class JobPageResponse(StrictSchema):
     items: list[JobListItemResponse]
     total: int
     global_counts: dict[str, int]
+
+
+class QueueEstimateResponse(StrictSchema):
+    key: Literal["windows", "files"]
+    label: str
+    status: Literal["complete", "running", "estimating", "waiting_worker"]
+    queued: int = Field(ge=0)
+    running: int = Field(ge=0)
+    sample_count: int = Field(ge=0)
+    remaining_seconds: int | None = Field(ge=0)
+
+
+class JobEstimateResponse(StrictSchema):
+    as_of: datetime
+    status: Literal["complete", "running", "estimating", "waiting_worker"]
+    queued: int = Field(ge=0)
+    running: int = Field(ge=0)
+    remaining_seconds: int | None = Field(ge=0)
+    estimated_finish_at: datetime | None
+    queues: list[QueueEstimateResponse]
 
 
 class JobDirectoryResponse(StrictSchema):
@@ -549,6 +571,7 @@ class EventSummaryResponse(StrictSchema):
     end_sample: int
     channel_start: int
     channel_stop: int
+    detection_score: FiniteFloat | None = Field(default=None, ge=0, le=1)
     machine_label: Literal[
         "earthquake",
         "blast",

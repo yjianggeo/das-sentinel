@@ -401,6 +401,55 @@ def _empty_artifact_manifest(data, event, features, out_dir, **kwargs):
     return ArtifactManifest(event.event_id, {})
 
 
+def test_pipeline_scan_distance_retains_original_indices_and_measurements(tmp_path, monkeypatch):
+    from das_sentinel import pipeline
+
+    source = tmp_path / "range.h5"
+    _write_default_stalta_file(source)
+    with h5py.File(source, "r+") as handle:
+        dataset = handle["Acquisition/Raw[0]/RawData"]
+        raw = dataset[:]
+        raw[:, 4:8] = raw[:, :4]
+        raw[:, :4] *= 1e6
+        dataset[:] = raw
+    captured = []
+
+    def capture(data, event, features, out_dir, **kwargs):
+        captured.append(data)
+        return _empty_artifact_manifest(data, event, features, out_dir, **kwargs)
+
+    monkeypatch.setattr(pipeline, "render_event_artifacts", capture)
+    result = pipeline.analyze_file(
+        source, ZdHdf5Reader(),
+        ProcessingProfile(scan_distance_start_m=24, scan_distance_stop_m=36),
+        select_backend("cpu"), tmp_path / "artifacts",
+    )
+    assert result.events
+    assert all(4 <= event.channel_start < event.channel_stop <= 8 for event in result.events)
+    for data in captured:
+        assert data.raw_data.shape[1] == 8
+        np.testing.assert_array_equal(data.channel_distance_m, np.arange(2, 10) * 4)
+        assert data.bad_channel_mask[:4].all()
+        assert data.profile["scan_distance_start_m"] == 24
+        assert data.measurements["values"]["valid_channel_count"] <= 4
+
+
+def test_pipeline_rejects_empty_scan_distance_before_reading_blocks(tmp_path, monkeypatch):
+    from das_sentinel import pipeline
+
+    source = tmp_path / "range.h5"
+    _write_default_stalta_file(source)
+    reader = ZdHdf5Reader()
+
+    def unexpected_read(*args, **kwargs):
+        pytest.fail("empty scan distance must be rejected before reading waveform blocks")
+
+    monkeypatch.setattr(reader, "read_block", unexpected_read)
+    with pytest.raises(ValueError, match="scan distance range"):
+        pipeline.analyze_file(source, reader, ProcessingProfile(scan_distance_start_m=300),
+                              select_backend("cpu"), tmp_path / "artifacts")
+
+
 class _PredictingBundle:
     def predict_probabilities(self, features):
         assert features["site_id"] == "site-a"

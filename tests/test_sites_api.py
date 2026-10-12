@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterator
 from pathlib import Path
 from threading import Event, Thread
@@ -161,6 +162,52 @@ def test_list_and_detail_include_disabled_sites_for_admin(
     assert listed.json()[0]["enabled"] is False
     assert detailed.status_code == 200
     assert detailed.json()["enabled"] is False
+
+
+def test_scan_distance_updates_are_versioned_and_explicit_null_clears(csrf_client):
+    client, token, settings = csrf_client
+    original = _create_site(client, token, settings).json()
+    path = f"/api/v1/sites/{original['id']}"
+    headers = {"X-CSRF-Token": token}
+    response = client.patch(path, json={"profile": {
+        "scan_distance_start_m": 300, "scan_distance_stop_m": 1500,
+    }}, headers=headers)
+    assert response.status_code == 200
+    ranged = response.json()["current_profile"]
+    assert ranged["version"] == 2
+    assert ranged["payload"]["scan_distance_start_m"] == 300
+    assert ranged["payload"]["scan_distance_stop_m"] == 1500
+    assert ranged["payload"]["device"] == "cpu"
+
+    response = client.patch(path, json={"profile": {"scan_distance_stop_m": None}}, headers=headers)
+    assert response.status_code == 200
+    open_end = response.json()["current_profile"]
+    assert open_end["payload"]["scan_distance_start_m"] == 300
+    assert open_end["payload"]["scan_distance_stop_m"] is None
+    assert open_end["version"] == 3
+    response = client.patch(path, json={"profile": {"scan_distance_start_m": None}}, headers=headers)
+    assert response.status_code == 200
+    assert response.json()["current_profile"]["payload"]["scan_distance_start_m"] is None
+
+    engine = create_local_engine(settings.database_url)
+    try:
+        with session_factory(engine)() as session:
+            previous = session.get(ProcessingProfile, ranged["id"])
+            assert json.loads(previous.payload_json)["scan_distance_start_m"] == 300
+            assert json.loads(previous.payload_json)["scan_distance_stop_m"] == 1500
+    finally:
+        engine.dispose()
+
+
+def test_scan_distance_patch_validates_against_retained_bound(csrf_client):
+    client, token, settings = csrf_client
+    created = _create_site(client, token, settings, profile={"scan_distance_start_m": 300})
+    assert created.status_code == 201
+    path = f"/api/v1/sites/{created.json()['id']}"
+    response = client.patch(path, json={"profile": {"scan_distance_stop_m": 200}},
+                            headers={"X-CSRF-Token": token})
+    assert response.status_code == 422
+    assert client.get(path).json()["current_profile"]["version"] == 1
 
 
 def test_site_reads_require_enabled_admin_session(

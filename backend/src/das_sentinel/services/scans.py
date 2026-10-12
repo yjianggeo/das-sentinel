@@ -21,8 +21,12 @@ from das_sentinel.services.discovery import (
     DiscoverySite,
     StableFileTracker,
     discover_batch,
-    enqueue_discovered,
     resolve_scan_directory,
+)
+from das_sentinel.services.window_planning import (
+    persist_window_files,
+    prepare_window_files,
+    validate_window_sources,
 )
 
 logger = logging.getLogger(__name__)
@@ -212,19 +216,26 @@ class ScanCoordinator:
                     verification.verification_found_files - len(files),
                 ),
             )
+            plans = await _to_thread(
+                prepare_window_files,
+                self.sessions,
+                site,
+                files,
+                self.artifact_root.parent / "window-artifacts",
+            )
+            await _to_thread(validate_window_sources, site, files, plans)
             async with self.write_coordinator.lock:
                 submitted = await _to_thread(
                     _enqueue,
                     self.sessions,
-                    self.artifact_root,
                     site,
                     files,
-                    self.pipeline_version,
+                    plans,
                 )
             self._replace(
                 scan_id,
                 phase="completed",
-                submitted_files=len(submitted),
+                submitted_files=len(files) if submitted else 0,
             )
         except DiscoveryPathError:
             logger.exception("scan %s could not read its selected path", scan_id)
@@ -283,21 +294,14 @@ class ScanCoordinator:
 
 def _enqueue(
     sessions: sessionmaker[Session],
-    artifact_root: Path,
     site: DiscoverySite,
     files,
-    pipeline_version: str,
+    plans,
 ):
     if not files:
         return ()
     with sessions.begin() as session:
-        return enqueue_discovered(
-            session,
-            site,
-            files,
-            pipeline_version,
-            artifact_root=artifact_root,
-        )
+        return persist_window_files(session, site, files, plans, sources_validated=True)
 
 
 async def _to_thread[ResultT](

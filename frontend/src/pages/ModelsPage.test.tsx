@@ -1,22 +1,14 @@
-import { screen } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
+import { screen, waitFor } from "@testing-library/react";
 import { http, HttpResponse } from "msw";
 import { setupServer } from "msw/node";
-import { afterAll, beforeAll, beforeEach } from "vitest";
+import { transferableAbortController } from "node:util";
+import { afterAll, beforeAll, beforeEach, expect, it } from "vitest";
 import { renderApp } from "../test/render";
 
 const server = setupServer();
-
-beforeAll(() => server.listen());
-beforeEach(() => {
-  server.resetHandlers();
-  server.use(
-    http.get("/api/v1/session", () =>
-      HttpResponse.json({ admin_id: 1, csrf_token: "token-1" }),
-    ),
-  );
-});
-afterAll(() => server.close());
+const domAbortController = globalThis.AbortController;
+let legacyRequests = 0;
+let windowTrainingRequests = 0;
 
 const SITE = {
   id: "site-1",
@@ -35,79 +27,56 @@ const SITE = {
   },
 };
 
-const CANDIDATE = {
-  id: "model-1",
-  site_id: "site-1",
-  version: "1",
-  status: "candidate",
-  dataset_sha256: "a".repeat(64),
-  bundle_sha256: "b".repeat(64),
-  metrics: {
-    macro_f1: 0.82,
-    rule_baseline_macro_f1: 0.61,
-    recall_by_label: { earthquake: 0.8, blast: 0.85, traffic: 0.83, noise: 0.8 },
-    precision_by_label: { earthquake: 0.82, blast: 0.84, traffic: 0.8, noise: 0.83 },
-    reviewed_count_by_label: { earthquake: 25, blast: 25, traffic: 25, noise: 25 },
-    confusion_matrix: [
-      [20, 2, 2, 1],
-      [1, 21, 2, 1],
-      [2, 1, 21, 1],
-      [1, 2, 2, 20],
-    ],
-    feature_names: ["rms", "duration_s"],
-  },
-  created_at: "2026-07-26T00:00:00Z",
-  published_at: null,
-};
-
-it("requires explicit confirmation before model publication", async () => {
-  server.use(
-    http.get("/api/v1/sites", () => HttpResponse.json([SITE])),
-    http.get("/api/v1/sites/site-1/models", () =>
-      HttpResponse.json([CANDIDATE]),
-    ),
-  );
-  renderApp("/models");
-
-  await userEvent.click(
-    await screen.findByRole("button", { name: "发布候选模型" }),
-  );
-
-  expect(
-    screen.getByRole("dialog", { name: "确认发布模型" }),
-  ).toBeVisible();
+beforeAll(() => {
+  globalThis.AbortController = transferableAbortController().constructor as typeof AbortController;
+  server.listen();
 });
-
-it("publishes after confirmation and shows the validation report", async () => {
-  let published = false;
+beforeEach(() => {
+  legacyRequests = 0;
+  windowTrainingRequests = 0;
+  server.resetHandlers();
   server.use(
-    http.get("/api/v1/sites", () => HttpResponse.json([SITE])),
-    http.get("/api/v1/sites/site-1/models", () =>
-      HttpResponse.json([
-        { ...CANDIDATE, status: published ? "active" : "candidate" },
-      ]),
+    http.get("/api/v1/session", () =>
+      HttpResponse.json({ admin_id: 1, csrf_token: "token-1" }),
     ),
-    http.post("/api/v1/models/model-1/publish", () => {
-      published = true;
-      return HttpResponse.json({ ...CANDIDATE, status: "active" });
+    http.get("/api/v1/sites", () => HttpResponse.json([SITE])),
+    http.get("/api/v1/window-training/readiness", () => {
+      windowTrainingRequests += 1;
+      return HttpResponse.json({
+        window_count: 3522,
+        reviewed_windows: 2270,
+        eligible_windows: 2260,
+        ready: false,
+        reasons: ["需要更多独立验证分组"],
+        classes: { earthquake: { present: 107, absent: 2153, unknown: 1262 } },
+      });
+    }),
+    http.get("/api/v1/window-training/jobs", () => HttpResponse.json([])),
+    http.get("/api/v1/window-models/active", () => HttpResponse.json(null)),
+    http.get("/api/v1/sites/:siteId/models", () => {
+      legacyRequests += 1;
+      return HttpResponse.json([]);
+    }),
+    http.get("/api/v1/sites/:siteId/training-readiness", () => {
+      legacyRequests += 1;
+      return HttpResponse.json({});
     }),
   );
+});
+afterAll(() => {
+  server.close();
+  globalThis.AbortController = domAbortController;
+});
+
+it("shows only whole-window training and does not load legacy ROI models", async () => {
   renderApp("/models");
 
-  await userEvent.click(
-    await screen.findByRole("button", { name: "查看验证报告" }),
-  );
-  expect(await screen.findByText("宏平均 F1：0.820", { exact: false }))
-    .toBeVisible();
-  expect(screen.getByLabelText("混淆矩阵")).toBeVisible();
-
-  await userEvent.click(
-    screen.getByRole("button", { name: "发布候选模型" }),
-  );
-  await userEvent.click(
-    screen.getByRole("button", { name: "确认发布" }),
-  );
-
-  expect(await screen.findByText("已发布")).toBeVisible();
-  expect(published).toBe(true);
+  await screen.findByRole("option", { name: "JJK-01" });
+  expect(screen.getByRole("combobox", { name: "站点" })).toHaveValue("site-1");
+  expect(screen.getByRole("region", { name: "整窗二分类训练" })).toBeVisible();
+  expect(await screen.findByText(/窗口记录 3522/)).toBeVisible();
+  expect(screen.queryByText("历史局部 ROI 模型（旧随机森林）")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: /发布候选模型|回滚到上一模型|训练历史 ROI 模型/ })).not.toBeInTheDocument();
+  await waitFor(() => expect(windowTrainingRequests).toBe(1));
+  expect(legacyRequests).toBe(0);
 });

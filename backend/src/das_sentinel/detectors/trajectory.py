@@ -123,14 +123,21 @@ def _line_energy(
     delays = np.rint((distances_m - distances_m[0]) / velocity_mps * sample_rate_hz).astype(int)
     sample_count = energy.shape[0]
     best_energy, best_start, best_indices = -1.0, 0, np.empty(0, dtype=int)
-    for start in range(sample_count):
-        indices = start + delays
-        valid = (indices >= 0) & (indices < sample_count)
-        if not valid.all():
+    first = max(0, -int(delays.min()))
+    stop = min(sample_count, sample_count - int(delays.max()))
+    channels = np.arange(energy.shape[1])
+    for chunk_start in range(first, stop, 256):
+        starts = np.arange(chunk_start, min(chunk_start + 256, stop))
+        indices = starts[:, None] + delays
+        # Each contiguous row has the same reduction order as the scalar search.
+        values = energy[indices, channels].sum(axis=1)
+        eligible = values > best_energy
+        if not eligible.any():
             continue
-        value = float(energy[indices, np.arange(energy.shape[1])].sum())
+        peak = int(np.argmax(np.where(eligible, values, -np.inf)))
+        value = float(values[peak])
         if value > best_energy:
-            best_energy, best_start, best_indices = value, start, indices
+            best_energy, best_start, best_indices = value, int(starts[peak]), indices[peak]
     return best_energy, best_start, best_indices
 
 

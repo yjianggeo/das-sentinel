@@ -1,27 +1,18 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime, time, timedelta
-from zoneinfo import ZoneInfo
-
 from fastapi import APIRouter, Request
-from sqlalchemy import func, select
+from sqlalchemy import and_, case, func, or_, select
 
 from das_sentinel.api.auth import AuthenticatedAdmin
 from das_sentinel.api.schemas import DashboardResponse
-from das_sentinel.persistence.models import (
-    Classification,
-    Event,
-    Job,
-    ProcessingRun,
-    Site,
-    SourceFile,
+from das_sentinel.persistence.model_scan_models import ModelScan
+from das_sentinel.persistence.window_models import (
+    EventWindow,
+    WindowAnalysis,
+    WindowReview,
 )
 
 router = APIRouter(tags=["dashboard"])
-
-
-def utc_now() -> datetime:
-    return datetime.now(UTC)
 
 
 @router.get("/dashboard", response_model=DashboardResponse)
@@ -30,62 +21,53 @@ def dashboard(
     admin: AuthenticatedAdmin,
 ) -> DashboardResponse:
     del admin
-    latest_classification_id = (
-        select(Classification.id)
-        .where(Classification.event_id == Event.id)
-        .order_by(Classification.created_at.desc(), Classification.id.desc())
+    # Materialization keeps SQLite on the covering index, away from large result rows.
+    analyses = select(
+        WindowAnalysis.id, WindowAnalysis.status, WindowAnalysis.input_sha256,
+    ).cte("analysis_summary").prefix_with("MATERIALIZED", dialect="sqlite")
+    current_analysis = analyses.c.id == EventWindow.latest_analysis_id
+    window_status = func.coalesce(analyses.c.status, "planned")
+    latest_review_id = (
+        select(WindowReview.id)
+        .where(WindowReview.window_id == EventWindow.id)
+        .order_by(WindowReview.created_at.desc(), WindowReview.id.desc())
         .limit(1)
-        .correlate(Event)
+        .correlate(EventWindow)
         .scalar_subquery()
     )
-    latest_label = func.coalesce(
-        select(Classification.label)
-        .where(Classification.id == latest_classification_id)
-        .scalar_subquery(),
-        "unknown",
+    bound_review = and_(
+        WindowReview.analysis_id == analyses.c.id,
+        WindowReview.input_sha256 == analyses.c.input_sha256,
+    )
+    earthquake = func.json_extract(WindowReview.labels_json, "$.earthquake")
+    blast = func.json_extract(WindowReview.labels_json, "$.blast")
+    review_class = case(
+        (and_(bound_review, or_(earthquake == "present", blast == "present")), "earthquake"),
+        (and_(bound_review, earthquake == "absent", or_(blast == "absent", blast.is_(None))), "noise"),
+        else_="pending",
     )
     with request.app.state.session_factory() as session:
-        now = utc_now()
-        job_counts = dict(
-            session.execute(
-                select(Job.status, func.count()).group_by(Job.status)
-            ).all()
-        )
-        machine_label_counts = dict(
-            session.execute(
-                select(latest_label, func.count())
-                .select_from(Event)
-                .group_by(latest_label)
-            ).all()
-        )
-        today_event_count = sum(
-            _site_today_event_count(session, site, now=now)
-            for site in session.scalars(select(Site).where(Site.enabled.is_(True)))
-        )
+        window_status_counts = dict(session.execute(
+            select(window_status, func.count())
+            .select_from(EventWindow)
+            .outerjoin(analyses, current_analysis)
+            .where(EventWindow.window_seconds == 30)
+            .group_by(window_status)
+        ).all())
+        model_scan_status_counts = dict(session.execute(
+            select(ModelScan.status, func.count()).group_by(ModelScan.status)
+        ).all())
+        review_counts = {"earthquake": 0, "noise": 0, "pending": 0}
+        review_counts.update(session.execute(
+            select(review_class, func.count())
+            .select_from(EventWindow)
+            .join(analyses, current_analysis)
+            .outerjoin(WindowReview, WindowReview.id == latest_review_id)
+            .where(EventWindow.window_seconds == 30, analyses.c.status == "succeeded")
+            .group_by(review_class)
+        ).all())
     return DashboardResponse(
-        job_counts=job_counts,
-        today_event_count=today_event_count,
-        machine_label_counts=machine_label_counts,
+        window_status_counts=window_status_counts,
+        model_scan_status_counts=model_scan_status_counts,
+        review_counts=review_counts,
     )
-
-
-def _site_today_event_count(session, site: Site, *, now: datetime) -> int:
-    local_now = now.astimezone(ZoneInfo(site.timezone))
-    timezone = ZoneInfo(site.timezone)
-    start_utc = datetime.combine(local_now.date(), time.min, timezone).astimezone(UTC)
-    end_utc = datetime.combine(
-        local_now.date() + timedelta(days=1),
-        time.min,
-        timezone,
-    ).astimezone(UTC)
-    return session.scalar(
-        select(func.count())
-        .select_from(Event)
-        .join(ProcessingRun, ProcessingRun.id == Event.processing_run_id)
-        .join(SourceFile, SourceFile.id == ProcessingRun.source_file_id)
-        .where(
-            SourceFile.site_id == site.id,
-            Event.occurred_at >= start_utc,
-            Event.occurred_at < end_utc,
-        )
-    ) or 0

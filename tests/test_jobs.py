@@ -85,6 +85,28 @@ def test_enqueue_is_idempotent_for_source_profile_pipeline(job_database):
         assert service.list() == [first]
 
 
+def test_scan_distance_version_keeps_queued_profile_and_allows_new_range(job_database):
+    with seeded_service(job_database) as (service, repositories, site, original, source):
+        old_job = service.enqueue(source.id, original.id, "v2")
+        ranged = repositories.profiles.add(
+            site_id=site.id, version=8,
+            payload={"scan_distance_start_m": 300, "scan_distance_stop_m": None},
+            is_current=False,
+        )
+        repositories.sites.set_current_profile(site.id, ranged.id)
+        new_job = service.enqueue(source.id, ranged.id, "v2")
+        assert new_job.id != old_job.id
+        assert service.enqueue(source.id, ranged.id, "v2").id == new_job.id
+        first_claim = service.claim("worker-a")
+        assert first_claim.id == old_job.id
+        assert first_claim.profile_version == 7
+        assert "scan_distance_start_m" not in first_claim.profile_payload
+        second_claim = service.claim("worker-b")
+        assert second_claim.id == new_job.id
+        assert second_claim.profile_payload["scan_distance_start_m"] == 300
+        assert second_claim.profile_payload["scan_distance_stop_m"] is None
+
+
 @pytest.mark.parametrize("delete_all", [False, True])
 def test_delete_cancelled_preserves_analysis_history_and_files(job_database, tmp_path, delete_all):
     with seeded_service(job_database) as (service, repositories, _, profile, source):

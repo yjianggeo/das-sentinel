@@ -8,6 +8,7 @@ from das_sentinel.api.schemas import (
     CancelledJobsDeleteResponse,
     JobDirectoryResponse,
     JobEnqueueRequest,
+    JobEstimateResponse,
     JobListItemResponse,
     JobPageResponse,
     JobResponse,
@@ -23,6 +24,14 @@ from das_sentinel.services.jobs import (
 )
 
 router = APIRouter(prefix="/jobs", tags=["jobs"])
+
+
+@router.get("/estimate", response_model=JobEstimateResponse)
+def job_estimate(request: Request, admin: AuthenticatedAdmin) -> JobEstimateResponse:
+    from das_sentinel.services.job_estimate import estimate_jobs
+
+    with request.app.state.session_factory() as session:
+        return JobEstimateResponse(**estimate_jobs(session))
 
 
 @router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)

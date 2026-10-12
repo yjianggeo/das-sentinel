@@ -1,0 +1,45 @@
+.scan-coverage {
+  min-width: 0;
+  max-width: 100%;
+  margin: 1rem 0 1.5rem;
+  padding: 1rem;
+  border: 1px solid #30363d;
+  border-radius: 8px;
+  background: #161b22;
+}
+
+.scan-coverage-heading,
+.scan-coverage-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.scan-coverage-heading { justify-content: space-between; }
+.scan-coverage-heading h2 { margin: 0; font-size: 1.15rem; }
+.scan-coverage-filters { min-width: 0; max-width: 100%; }
+.scan-coverage-filters label { display: flex; align-items: center; flex-wrap: wrap; min-width: 0; max-width: 100%; }
+.scan-coverage-filters select { min-width: 0; max-width: 100%; }
+.scan-coverage-help,
+.scan-coverage-summary { color: #8b949e; font-size: 0.85rem; line-height: 1.6; }
+.scan-coverage-scroll { max-width: 100%; overflow-x: auto; padding: 0.25rem; }
+.scan-coverage-grid { display: grid; grid-template-rows: 1.25rem repeat(7, 12px); gap: 3px; width: max-content; }
+.scan-coverage-month,
+.scan-coverage-weekday { color: #8b949e; font-size: 0.7rem; line-height: 12px; white-space: nowrap; }
+.scan-coverage-month { align-self: start; }
+.scan-coverage-day,
+.scan-coverage-swatch { width: 12px; height: 12px; border: 1px solid rgba(240, 246, 252, 0.08); border-radius: 2px; }
+.scan-coverage-day { padding: 0; cursor: pointer; }
+.scan-coverage-day:hover { border-color: #e6edf3; }
+.scan-coverage-day[aria-pressed="true"] { outline: 1px solid #e6edf3; outline-offset: 1px; }
+.scan-coverage-day:focus-visible { outline: 2px solid #58a6ff; outline-offset: 2px; }
+.scan-coverage-level-0 { background: #21262d; }
+.scan-coverage-level-1 { background: #0e4429; }
+.scan-coverage-level-2 { background: #006d32; }
+.scan-coverage-level-3 { background: #26a641; }
+.scan-coverage-level-4 { background: #39d353; }
+.scan-coverage-legend { display: flex; justify-content: flex-end; align-items: center; gap: 0.3rem; margin-top: 0.5rem; color: #8b949e; font-size: 0.75rem; }
+.scan-coverage-detail { margin-top: 1rem; padding-top: 0.75rem; border-top: 1px solid #30363d; font-size: 0.85rem; }
+.scan-coverage-detail h3 { margin: 0; font-size: 0.95rem; }
+.scan-coverage-detail ul { padding-left: 1.25rem; line-height: 1.8; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }

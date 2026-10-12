@@ -72,6 +72,20 @@ def test_measurement_contract_reports_one_windowed_sinusoidal_pulse():
     json.dumps(result, allow_nan=False)
 
 
+def test_measurements_obey_scan_distance_even_when_event_spans_excluded_channels():
+    block, event = _event_block()
+    profile = ProcessingProfile(scan_distance_start_m=30, scan_distance_stop_m=60)
+    result = measure_event(block, event, profile)
+    assert result["values"]["valid_channel_count"] == 4
+    contaminated = block.data.copy()
+    contaminated[:, :3] *= 1e20
+    contaminated[:, 7] *= 1e20
+    changed = measure_event(replace(block, data=contaminated), event, profile)
+    assert changed["values"] == result["values"]
+    assert result["context"]["channel_window"]["requested_start"] == 0
+    assert result["context"]["channel_window"]["requested_stop"] == 8
+
+
 def test_short_event_keeps_known_resolution_and_supported_spectral_measurements():
     block, event = _event_block(event_start=500, event_stop=550)
 

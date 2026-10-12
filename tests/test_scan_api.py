@@ -231,7 +231,8 @@ def test_scan_preserves_browsed_leading_space_path(scan_api, selected_name):
         ]
     assert started.json()["path"] == browsed_path
     assert terminal["path"] == browsed_path
-    assert len(client.get("/api/v1/jobs").json()) == 1
+    assert len(client.get("/api/v1/jobs").json()) == 0
+    assert client.get("/api/v1/window-jobs").json()["total"] == 1
 
 
 def test_scan_directory_error_does_not_expose_absolute_path(scan_api):
@@ -258,7 +259,9 @@ def test_scan_returns_immediately_then_completes_automatic_recheck(scan_api):
     assert terminal["initial_found_files"] == 2
     assert terminal["verification_found_files"] == 2
     assert terminal["submitted_files"] == 2
-    assert len(client.get("/api/v1/jobs").json()) == 2
+    assert len(client.get("/api/v1/jobs").json()) == 0
+    # Both fixture files occupy the same UTC minute, so they share one window.
+    assert client.get("/api/v1/window-jobs").json()["total"] == 1
 
 
 def test_duplicate_start_returns_existing_active_scan(scan_api):

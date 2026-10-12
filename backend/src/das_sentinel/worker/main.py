@@ -194,6 +194,19 @@ class HttpxWorkerClient:
                 f"worker API returned HTTP {response.status_code}"
             )
         if response.status_code >= 400:
+            if (
+                claimed_job_id is not None
+                and path == f"/api/v1/internal/jobs/{claimed_job_id}/result"
+                and response.status_code == 422
+            ):
+                try:
+                    rejection = response.json()
+                except ValueError:
+                    rejection = None
+                if isinstance(rejection, dict) and rejection.get("detail") == (
+                    "result contains too many artifact files"
+                ):
+                    raise ResultSubmissionError("result contains too many artifact files")
             if claimed_job_id is not None and response.status_code in {404, 409}:
                 try:
                     body = response.json()

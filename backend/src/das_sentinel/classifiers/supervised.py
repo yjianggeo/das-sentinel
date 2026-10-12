@@ -17,12 +17,12 @@ import sklearn
 from sklearn.base import clone
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score
-from sklearn.model_selection import StratifiedGroupKFold
 from skops.io import dumps as skops_dumps
 from skops.io import get_untrusted_types
 from skops.io import loads as skops_loads
 
 from das_sentinel.classifiers.fusion import fuse_classification
+from das_sentinel.classifiers.group_folds import make_group_folds
 from das_sentinel.classifiers.rules import score_rules
 from das_sentinel.classifiers.similarity import FeatureVectorizer
 from das_sentinel.domain import Label
@@ -160,7 +160,10 @@ def train_model(rows: Iterable[Any], groups: Sequence[Any], *, rule_profile: Map
 
     classifier = RandomForestClassifier(n_estimators=300, class_weight="balanced", random_state=_SEED, n_jobs=1)
     predicted = np.empty(labels.shape, dtype=object)
-    splits = list(StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=_SEED).split(features, labels, groups))
+    try:
+        splits = make_group_folds(labels, groups, n_splits=5, seed=_SEED)
+    except ValueError as exc:
+        raise TrainingGateError(str(exc)) from exc
     for train_index, test_index in splits:
         if set(labels[train_index]) != set(_LABELS) or set(labels[test_index]) != set(_LABELS):
             raise TrainingGateError("each validation fold must cover the four reviewed labels")

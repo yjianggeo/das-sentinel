@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 from fastapi import APIRouter, HTTPException, Request, status
 from fastapi.concurrency import run_in_threadpool
@@ -14,9 +14,27 @@ from das_sentinel.services.training import (
     TrainingDataError,
     TrainingService,
 )
+from das_sentinel.services.training_readiness import TrainingReadinessService
 
 router = APIRouter(tags=["models"])
 ModelStatus = Literal["candidate", "active", "retired", "invalid"]
+
+
+@router.get("/sites/{site_id}/training-readiness")
+def training_readiness(
+    site_id: str,
+    request: Request,
+    admin: AuthenticatedAdmin,
+) -> dict[str, Any]:
+    del admin
+    with request.app.state.session_factory() as session:
+        try:
+            return TrainingReadinessService(session, _artifact_root(request)).get(site_id)
+        except LookupError as error:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Site not found",
+            ) from error
 
 
 @router.get(

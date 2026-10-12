@@ -48,6 +48,8 @@ class ProcessingProfile(BaseModel):
     merge_gap_seconds: float = 1.0
     artifact_pad_seconds: float = 5.0
     recursive_discovery: bool = True
+    scan_distance_start_m: float | None = Field(default=None, ge=0, strict=True, allow_inf_nan=False)
+    scan_distance_stop_m: float | None = Field(default=None, ge=0, strict=True, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def validate_windows_and_bands(self) -> "ProcessingProfile":
@@ -56,6 +58,7 @@ class ProcessingProfile(BaseModel):
             for name, value in self.model_dump().items()
             if name not in {"device", "common_mode_removal", "recursive_discovery"}
             and name != "energy_bands_hz"
+            and value is not None
         )
         if any(not math.isfinite(value) for value in numeric_values):
             raise ValueError("all numeric profile values must be finite")
@@ -110,6 +113,12 @@ class ProcessingProfile(BaseModel):
             raise ValueError("fusion_normal_score must not exceed fusion_strong_score")
         if self.merge_gap_seconds < 0 or self.artifact_pad_seconds < 0:
             raise ValueError("merge and artifact padding must be nonnegative")
+        if (
+            self.scan_distance_start_m is not None
+            and self.scan_distance_stop_m is not None
+            and self.scan_distance_stop_m <= self.scan_distance_start_m
+        ):
+            raise ValueError("scan_distance_stop_m must exceed scan_distance_start_m")
         if len(self.energy_bands_hz) < 2:
             raise ValueError("energy_bands_hz must contain at least two bands")
         previous_high = 0.0

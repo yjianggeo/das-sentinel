@@ -10,6 +10,19 @@ from das_sentinel.services.discovery import _open_anchored_source
 from tests.fixtures import write_zd_h5
 
 
+@pytest.mark.parametrize("n_time,n_channel", [(0, 8), (200, 0), (0, 0)])
+@pytest.mark.parametrize("transpose", [False, True])
+def test_empty_recording_is_rejected_before_accessing_samples(tmp_path, n_time, n_channel, transpose):
+    path = tmp_path / "empty.h5"
+    write_zd_h5(path, n_time=n_time, n_channel=n_channel, transpose=transpose)
+    reader = ZdHdf5Reader()
+    assert not reader.probe(path).supported
+    for read in (reader.read_metadata, reader.sample_count):
+        with pytest.raises(ValueError, match="empty"):
+            read(path)
+
+
+
 def test_reads_metadata_and_slice(tmp_path):
     path = tmp_path / "sample.h5"
     write_zd_h5(path)
@@ -163,17 +176,58 @@ def _drop_spacing_attr(path) -> None:
         del handle["Acquisition/Raw[0]"].attrs["SpatialSamplingInterval"]
 
 
-def test_infers_channel_spacing_from_filename_when_attribute_missing(tmp_path):
+def test_rejects_legacy_gauge_length_as_channel_spacing(tmp_path):
     path = tmp_path / "jjk__3400m_4m_2_1000Hz_500Hz_UTC8_20230919173.h5"
     write_zd_h5(path, fs=500.0)
     _drop_spacing_attr(path)
 
     reader = ZdHdf5Reader()
 
-    assert reader.probe(path).supported
-    block = reader.read_block(path, 10, 12, slice(1, 4))
-    np.testing.assert_allclose(block.metadata.channel_distance_m, [12, 16, 20])
-    assert "channel spacing inferred from filename" in block.metadata.warnings
+    assert not reader.probe(path).supported
+    with pytest.raises(ValueError, match="SpatialSamplingInterval"):
+        reader.read_metadata(path)
+
+
+@pytest.mark.parametrize(("layout", "spacing"), [("8m_4", 4.089979648590088), ("4m_2", 2.044989824295044)])
+def test_reads_legacy_spacing_from_acquisition_on_held_stream(tmp_path, layout, spacing):
+    path = tmp_path / f"jjk__3400m_{layout}_5000Hz_500Hz_UTC8_202607260000.h5"
+    write_zd_h5(path)
+    _drop_spacing_attr(path)
+    with h5py.File(path, "r+") as handle:
+        handle["Acquisition"].attrs["SpatialSamplingInterval"] = spacing
+
+    with _open_anchored_source(tmp_path, path) as source:
+        reader = ZdHdf5Reader()
+        assert reader.probe(source.stream).supported
+        metadata = reader.read_metadata(source.stream)
+        block = reader.read_block(source.stream, 10, 12, slice(1, 4))
+
+    np.testing.assert_allclose(metadata.channel_distance_m[:3], np.array([2, 3, 4]) * spacing)
+    np.testing.assert_allclose(block.metadata.channel_distance_m, np.array([3, 4, 5]) * spacing)
+    assert "channel spacing inferred from filename" not in metadata.warnings
+    assert metadata.start_time_utc == datetime(2026, 7, 25, 16, 0, tzinfo=UTC)
+
+
+@pytest.mark.parametrize("spacing", [0, -1, float("nan"), float("inf")])
+def test_rejects_invalid_legacy_acquisition_spacing(tmp_path, spacing):
+    path = tmp_path / "jjk__3400m_8m_4_5000Hz_500Hz_UTC8_202607260000.h5"
+    write_zd_h5(path)
+    _drop_spacing_attr(path)
+    with h5py.File(path, "r+") as handle:
+        handle["Acquisition"].attrs["SpatialSamplingInterval"] = spacing
+    reader = ZdHdf5Reader()
+    assert not reader.probe(path).supported
+    with pytest.raises(ValueError, match="SpatialSamplingInterval"):
+        reader.read_metadata(path)
+
+
+def test_preserves_explicit_nominal_spacing_with_acquisition_attribute(tmp_path):
+    path = tmp_path / "ZD_3400m_8m_4m_10000Hz_1000Hz_UTC8_202607260000.h5"
+    write_zd_h5(path)
+    _drop_spacing_attr(path)
+    with h5py.File(path, "r+") as handle:
+        handle["Acquisition"].attrs["SpatialSamplingInterval"] = 4.089979648590088
+    np.testing.assert_allclose(ZdHdf5Reader().read_metadata(path).channel_distance_m[:3], [8, 12, 16])
 
 
 def test_infers_channel_spacing_from_filename_on_held_stream(tmp_path):

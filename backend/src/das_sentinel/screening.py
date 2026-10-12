@@ -23,9 +23,12 @@ from das_sentinel.signal.preprocess import (
     filter_prepared_signal,
     prepare_signal,
 )
+from das_sentinel.signal.scan_distance import mask_scan_block, scan_channel_mask
 
 ALGORITHM_VERSION = "screening-v2"
 _MAX_COHERENCE_CHANNELS = 64
+_COHERENCE_BACKGROUND_ENERGY_RATIO = 1.5
+_PERSISTENT_COHERENCE_BACKGROUND = "persistent_coherence_background"
 
 
 @dataclass(frozen=True)
@@ -107,9 +110,10 @@ def _option_fingerprint(options: ScreeningOptions) -> float:
 def _physical_windows(
     distances: np.ndarray,
     options: ScreeningOptions,
+    included: np.ndarray | None = None,
 ) -> tuple[list[np.ndarray], dict[str, int]]:
     finite = np.isfinite(distances)
-    finite_indices = np.flatnonzero(finite)
+    finite_indices = np.flatnonzero(finite if included is None else finite & included)
     skipped = {
         "nonfinite_channels": int((~finite).sum()),
         "spatial_windows_too_small": 0,
@@ -387,6 +391,10 @@ def _suppress_duplicates(
     for candidate in ordered:
         if any(
             prior.detector == candidate.detector
+            and (
+                (_PERSISTENT_COHERENCE_BACKGROUND in prior.quality_flags)
+                == (_PERSISTENT_COHERENCE_BACKGROUND in candidate.quality_flags)
+            )
             and _is_duplicate(candidate, prior, peak_tolerance)
             for prior in selected
         ):
@@ -580,16 +588,21 @@ def _coherence_candidates(
             curve_cpu,
             height=profile.coherence_threshold,
             distance=max(1, width // 2),
+            prominence=(None, None),
         )
         if peaks.size == 0 and curve_cpu.size:
             maximum = int(np.argmax(curve_cpu))
             if curve_cpu[maximum] >= profile.coherence_threshold:
                 peaks = np.array([maximum], dtype=int)
-                properties = {"peak_heights": np.array([curve_cpu[maximum]])}
+                properties = {
+                    "peak_heights": np.array([curve_cpu[maximum]]),
+                    "prominences": np.array([0.0]),
+                }
 
-        for peak_index, semblance in zip(
+        for peak_index, semblance, prominence in zip(
             peaks,
             properties.get("peak_heights", curve_cpu[peaks]),
+            properties["prominences"],
             strict=True,
         ):
             selected_slowness = float(slowness_cpu[peak_index])
@@ -607,6 +620,14 @@ def _coherence_candidates(
                 (int(peak_index) + width) * decimation,
             )
             near_zero = abs(selected_slowness) <= zero_tolerance
+            delays_cpu = _as_numpy(delays, backend)
+            valid_start = max(0, -int(delays_cpu.min()))
+            valid_stop = min(data.shape[0], data.shape[0] - int(delays_cpu.max()))
+            background_complete = (
+                peak_index - width >= valid_start
+                and peak_index + 2 * width <= valid_stop
+            )
+            prominence_threshold = profile.coherence_threshold / 2.0
             metrics = {
                 "sample_rate_hz": float(block.sample_rate_hz),
                 "semblance": float(semblance),
@@ -615,7 +636,47 @@ def _coherence_candidates(
                 "coherence_channels_used": float(channels.size),
                 "temporal_decimation": float(decimation),
                 "options_fingerprint": option_fingerprint,
+                "coherence_peak_prominence": float(prominence),
+                "coherence_prominence_threshold": float(prominence_threshold),
+                "coherence_background_window_seconds": float(width / effective_rate),
+                "coherence_background_complete": float(background_complete),
+                "coherence_energy_ratio_threshold": _COHERENCE_BACKGROUND_ENERGY_RATIO,
             }
+            persistent_background = False
+            if background_complete:
+                # Compare non-overlapping flanks with this same aligned beam.
+                powers = [
+                    float(_as_numpy(xp.mean(xp.square(
+                        stack[start:stop].astype(xp.float64) / channels.size
+                    )), backend))
+                    for start, stop in (
+                        (peak_index - width, peak_index),
+                        (peak_index, peak_index + width),
+                        (peak_index + width, peak_index + 2 * width),
+                    )
+                ]
+                if all(math.isfinite(power) for power in powers):
+                    before_power, current_power, after_power = powers
+                    metrics.update({
+                        "coherence_beam_before_power": before_power,
+                        "coherence_beam_current_power": current_power,
+                        "coherence_beam_after_power": after_power,
+                    })
+                    # A quieter flank protects an onset beside an energetic coda.
+                    background_power = min(before_power, after_power)
+                    if background_power > 0.0:
+                        energy_ratio = current_power / background_power
+                        if math.isfinite(energy_ratio):
+                            metrics["coherence_beam_energy_ratio"] = energy_ratio
+                            persistent_background = (
+                                prominence < prominence_threshold
+                                and not math.isclose(prominence, prominence_threshold)
+                                and energy_ratio < _COHERENCE_BACKGROUND_ENERGY_RATIO
+                                and not math.isclose(energy_ratio, _COHERENCE_BACKGROUND_ENERGY_RATIO)
+                            )
+            quality_flags = ("near_zero_moveout_ambiguous",) if near_zero else ()
+            if persistent_background:
+                quality_flags += (_PERSISTENT_COHERENCE_BACKGROUND,)
             if not near_zero:
                 metrics["apparent_velocity_mps"] = 1.0 / abs(selected_slowness)
                 metrics["direction"] = float(np.sign(selected_slowness))
@@ -634,7 +695,7 @@ def _coherence_candidates(
                         profile,
                     ),
                     metrics=metrics,
-                    quality_flags=("near_zero_moveout_ambiguous",) if near_zero else (),
+                    quality_flags=quality_flags,
                 )
             )
     tolerance = round(options.coincidence_tolerance_seconds * block.sample_rate_hz)
@@ -806,7 +867,16 @@ def fuse_screening_candidates(
     profile: ProcessingProfile,
 ) -> tuple[EventRecord, ...]:
     """Fuse v2 evidence while keeping STA/LTA and energy in one amplitude family."""
-    remaining = sorted(candidates, key=_candidate_key)
+    remaining = sorted(
+        (
+            candidate for candidate in candidates
+            if not (
+                candidate.detector == "coherence"
+                and _PERSISTENT_COHERENCE_BACKGROUND in candidate.quality_flags
+            )
+        ),
+        key=_candidate_key,
+    )
     sample_rates = {
         float(candidate.metrics["sample_rate_hz"])
         for candidate in remaining
@@ -889,20 +959,28 @@ def screen_block(
         update={"common_mode_removal": options.common_mode_removal}
     )
     preparation_started = perf_counter()
-    normalized_block, input_scale_divisor = _normalize_block_scale(block)
+    included = scan_channel_mask(block.metadata.channel_distance_m, profile)
+    normalized_block, input_scale_divisor = _normalize_block_scale(mask_scan_block(block, profile))
     prepared = prepare_signal(normalized_block, screening_profile, backend)
-    rms_warning_count = int(prepared.bad_channel_mask.sum())
-    invalid_mask = _invalid_channel_mask(normalized_block.data)
+    rms_warning_count = int((prepared.bad_channel_mask & included).sum())
+    invalid_mask = _invalid_channel_mask(normalized_block.data) | ~included
     prepared = replace(prepared, bad_channel_mask=invalid_mask)
     diagnostics["preprocessing_seconds"] = perf_counter() - preparation_started
     diagnostics["channel_quality"] = {
         "rms_warning_channels": rms_warning_count,
-        "invalid_excluded_channels": int(invalid_mask.sum()),
+        "invalid_excluded_channels": int((invalid_mask & included).sum()),
         "input_scale_divisor": input_scale_divisor,
+    }
+    diagnostics["scan_distance"] = {
+        "start_m": profile.scan_distance_start_m,
+        "stop_m": profile.scan_distance_stop_m,
+        "selected_channels": int(included.sum()),
+        "excluded_channels": int((~included).sum()),
     }
     windows, skipped_geometry = _physical_windows(
         prepared.channel_distance_m,
         options,
+        included,
     )
     usable_windows: list[np.ndarray] = []
     for window in windows:
@@ -989,6 +1067,10 @@ def screen_block(
     diagnostics["detectors"]["coherence"] = {
         "seconds": perf_counter() - coherence_started,
         "count": len(coherence),
+        "persistent_background_count": sum(
+            _PERSISTENT_COHERENCE_BACKGROUND in candidate.quality_flags
+            for candidate in coherence
+        ),
         "skipped_windows": coherence_skipped,
         "enabled": options.enable_coherence,
         "status": coherence_status,

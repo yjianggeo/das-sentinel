@@ -139,7 +139,9 @@ def test_scan_runs_two_passes_and_enqueues_without_second_start(scan_context):
         assert coordinator.active(site.site_id) is None
         with sessions() as session:
             assert session.scalar(select(func.count()).select_from(SourceFile)) == 1
-            assert session.scalar(select(func.count()).select_from(Job)) == 1
+            from das_sentinel.persistence.window_models import WindowAnalysis
+            assert session.scalar(select(func.count()).select_from(Job)) == 0
+            assert session.scalar(select(func.count()).select_from(WindowAnalysis)) == 1
         await coordinator.close()
 
     asyncio.run(scenario())

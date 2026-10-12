@@ -1,0 +1,10 @@
+.job-completion-estimate { margin-bottom: 1.75rem; padding: 1.1rem 1.25rem; border: 1px solid #30363d; border-radius: 10px; background: #161b22; }
+.job-estimate-heading { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; gap: .5rem; }
+.job-estimate-heading h2 { margin: 0; font-size: 1rem; }
+.job-estimate-heading span, .job-estimate-values span, .job-estimate-values small, .job-estimate-note { color: #8b949e; font-size: .8rem; }
+.job-estimate-values { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1.25rem; margin: 1rem 0; }
+.job-estimate-values > div { display: flex; flex-direction: column; gap: .35rem; }
+.job-estimate-values strong { font-size: 1.25rem; font-weight: 600; font-variant-numeric: tabular-nums; }
+.job-estimate-values > div:first-child strong { color: #79c0ff; }
+.job-completion-estimate p { font-size: .8rem; line-height: 1.6; margin: .4rem 0 0; }
+@media(max-width:700px) { .job-estimate-values { grid-template-columns: 1fr; gap: 1rem; } }

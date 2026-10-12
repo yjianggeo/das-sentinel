@@ -36,9 +36,7 @@ class ZdHdf5Reader:
                     return ProbeResult(False, self.FORMAT_NAME, f"{self.DATASET_TIME} is not a dataset")
                 if data.ndim != 2 or times.ndim != 1:
                     return ProbeResult(False, self.FORMAT_NAME, "RawData dimensions are invalid")
-                n_time = times.shape[0]
-                if data.shape[0] != n_time and data.shape[1] != n_time:
-                    return ProbeResult(False, self.FORMAT_NAME, "RawData dimensions do not match RawDataTime")
+                self._dimensions(data, times)
                 for attribute_name in (
                     self.ATTR_SAMPLE_RATE,
                     self.ATTR_START_LOCUS,
@@ -46,28 +44,23 @@ class ZdHdf5Reader:
                 ):
                     if attribute_name not in raw.attrs:
                         return ProbeResult(False, self.FORMAT_NAME, f"missing {attribute_name}")
-                if (
-                    self.ATTR_CHANNEL_SPACING not in raw.attrs
-                    and self._spacing_from_filename(path) is None
-                ):
-                    return ProbeResult(
-                        False,
-                        self.FORMAT_NAME,
-                        f"missing {self.ATTR_CHANNEL_SPACING} and no filename spacing hint",
-                    )
+                self._spacing(raw, path)
         except (OSError, TypeError, ValueError) as error:
             return ProbeResult(False, self.FORMAT_NAME, str(error))
         return ProbeResult(True, self.FORMAT_NAME)
 
     def read_metadata(self, path: Path | BinaryIO) -> DasMetadata:
+        metadata, _ = self.read_metadata_and_count(path)
+        return metadata
+
+    def read_metadata_and_count(self, path: Path | BinaryIO) -> tuple[DasMetadata, int]:
         with h5py.File(path, "r") as handle:
             raw, data, times = self._required_datasets(handle)
             n_time, n_channel, _ = self._dimensions(data, times)
-            del n_time
             start_time = self._time_at(times, 0, path)
             spacing, inferred = self._spacing(raw, path)
             start_locus = int(self._required_attr(raw, self.ATTR_START_LOCUS))
-            return self._metadata(
+            metadata = self._metadata(
                 path,
                 start_time,
                 float(self._required_attr(raw, self.ATTR_SAMPLE_RATE)),
@@ -75,6 +68,7 @@ class ZdHdf5Reader:
                 self._required_attr(raw, self.ATTR_UNIT),
                 spacing_inferred=inferred,
             )
+            return metadata, n_time
 
     def sample_count(self, path: Path | BinaryIO) -> int:
         with h5py.File(path, "r") as handle:
@@ -127,6 +121,8 @@ class ZdHdf5Reader:
         if times.ndim != 1:
             raise ValueError("RawDataTime must be one-dimensional")
         n_time = len(times)
+        if n_time == 0 or 0 in data.shape:
+            raise ValueError("empty RawData or RawDataTime")
         if data.shape[0] == n_time:
             return n_time, data.shape[1], False
         if data.shape[1] == n_time:
@@ -203,6 +199,11 @@ class ZdHdf5Reader:
             return float(raw.attrs[self.ATTR_CHANNEL_SPACING]), False
         hint = self._spacing_from_filename(path)
         if hint is None:
+            if self.ATTR_CHANNEL_SPACING in raw.parent.attrs:
+                spacing = float(raw.parent.attrs[self.ATTR_CHANNEL_SPACING])
+                if not np.isfinite(spacing) or spacing <= 0:
+                    raise ValueError(f"{self.ATTR_CHANNEL_SPACING} must be finite and positive")
+                return spacing, False
             raise ValueError(
                 f"missing required attribute {self.ATTR_CHANNEL_SPACING} "
                 "and no filename spacing hint"
@@ -211,12 +212,17 @@ class ZdHdf5Reader:
 
     @classmethod
     def _spacing_from_filename(cls, path: Path | BinaryIO) -> float | None:
-        """Infer channel spacing from ZD names like ``site__3400m_4m_2_...``.
+        """Infer channel spacing from ZD names like ``site__3400m_8m_4m_...``.
 
         The interrogator naming convention embeds ``<gauge length>m_<spacing>m``;
         when several ``Xm`` tokens exist the spacing is the last one.
         """
         name = cls._source_name(path)
+        # Legacy names end in gauge-length metres followed by a bare spacing
+        # token; the last ``Xm`` is not the channel spacing. Use acquisition
+        # metadata for these files instead of stretching their distance axis.
+        if re.search(r"_\d+(?:\.\d+)?m_\d+(?:\.\d+)?_\d+(?:\.\d+)?Hz_", name, re.IGNORECASE):
+            return None
         matches = re.findall(r"_(\d+(?:\.\d+)?)m(?=_)", name)
         if not matches:
             return None

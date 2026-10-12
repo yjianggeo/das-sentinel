@@ -23,15 +23,22 @@ from das_sentinel.api.routes import health_router
 from das_sentinel.api.routes.artifacts import router as artifacts_router
 from das_sentinel.api.routes.auth import router as auth_router
 from das_sentinel.api.routes.dashboard import router as dashboard_router
+from das_sentinel.api.routes.event_windows import router as event_windows_router
 from das_sentinel.api.routes.events import router as events_router
 from das_sentinel.api.routes.internal import router as internal_router
 from das_sentinel.api.routes.jobs import router as jobs_router
+from das_sentinel.api.routes.low_frequency import router as low_frequency_router
+from das_sentinel.api.routes.model_scans import router as model_scans_router
 from das_sentinel.api.routes.models import router as models_router
+from das_sentinel.api.routes.review_batches import router as review_batches_router
+from das_sentinel.api.routes.scan_coverage import router as scan_coverage_router
 from das_sentinel.api.routes.scans import router as scans_router
 from das_sentinel.api.routes.sites import router as sites_router
 from das_sentinel.api.routes.waterfall_previews import (
     router as waterfall_previews_router,
 )
+from das_sentinel.api.routes.window_inference import router as window_inference_router
+from das_sentinel.api.routes.window_training import router as window_training_router
 from das_sentinel.config import Settings
 from das_sentinel.persistence import (
     AsyncWriteCoordinator,
@@ -42,8 +49,11 @@ from das_sentinel.persistence import (
 from das_sentinel.readers.zd_hdf5 import ZdHdf5Reader
 from das_sentinel.runtime import probe_storage
 from das_sentinel.services.jobs import JobService
+from das_sentinel.services.low_frequency_scans import LowFrequencyScanService
 from das_sentinel.services.scans import ScanCoordinator
 from das_sentinel.services.waterfall_previews import WaterfallPreviewService
+from das_sentinel.services.window_inference import WindowInferenceService
+from das_sentinel.services.window_training import WindowTrainingService
 
 
 class ApiSessionSecurityMiddleware(BaseHTTPMiddleware):
@@ -77,6 +87,9 @@ def create_app(settings: Settings) -> FastAPI:
             yield
         finally:
             await app.state.scan_coordinator.close()
+            app.state.low_frequency_service.close()
+            app.state.window_training_service.close()
+            await run_in_threadpool(app.state.window_inference_service.close)
             engine.dispose()
 
     app = FastAPI(title="DAS Sentinel", version="0.1.0", lifespan=lifespan)
@@ -85,6 +98,12 @@ def create_app(settings: Settings) -> FastAPI:
     app.state.engine = engine
     app.state.session_factory = session_factory(engine)
     app.state.write_coordinator = AsyncWriteCoordinator()
+    app.state.window_inference_service = WindowInferenceService(
+        app.state.session_factory, settings.app_data_dir,
+    )
+    app.state.window_training_service = WindowTrainingService(
+        app.state.session_factory, settings.app_data_dir,
+    )
     app.state.scan_coordinator = ScanCoordinator(
         app.state.session_factory,
         settings.app_data_dir / "artifacts",
@@ -92,6 +111,9 @@ def create_app(settings: Settings) -> FastAPI:
         app.state.write_coordinator,
     )
     app.state.auth_limiter = asyncio.Semaphore(1)
+    app.state.low_frequency_service = LowFrequencyScanService(
+        settings.app_data_dir / "low-frequency-scans", settings.data_root,
+    )
     app.state.waterfall_preview_service = WaterfallPreviewService(
         settings.data_root,
         ZdHdf5Reader(),
@@ -108,11 +130,18 @@ def create_app(settings: Settings) -> FastAPI:
     app.include_router(dashboard_router, prefix="/api/v1")
     app.include_router(sites_router, prefix="/api/v1")
     app.include_router(jobs_router, prefix="/api/v1")
+    app.include_router(low_frequency_router, prefix="/api/v1")
     app.include_router(events_router, prefix="/api/v1")
+    app.include_router(event_windows_router, prefix="/api/v1")
+    app.include_router(window_training_router, prefix="/api/v1")
+    app.include_router(window_inference_router, prefix="/api/v1")
+    app.include_router(review_batches_router, prefix="/api/v1")
     app.include_router(waterfall_previews_router, prefix="/api/v1")
     app.include_router(artifacts_router, prefix="/api/v1")
     app.include_router(models_router, prefix="/api/v1")
+    app.include_router(model_scans_router, prefix="/api/v1")
     app.include_router(scans_router, prefix="/api/v1")
+    app.include_router(scan_coverage_router, prefix="/api/v1")
     app.include_router(internal_router, prefix="/api/v1")
     app.include_router(health_router)
     _mount_spa(app)

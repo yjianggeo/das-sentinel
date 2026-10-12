@@ -1,12 +1,10 @@
 import { useEffect, useState } from "react";
 import { ApiError, api, type Dashboard } from "../api";
 
-const LABEL_NAMES: Record<string, string> = {
-  earthquake: "地震",
-  blast: "爆破",
-  traffic: "车辆",
-  noise: "噪声",
-  unknown: "待定",
+const STATUS_NAMES: Record<string, string> = {
+  planned: "待规划", pending: "待分析", queued: "排队", running: "运行中", succeeded: "成功",
+  failed: "失败", cancelled: "已取消", cancelling: "取消中",
+  paused: "已暂停", completed_with_errors: "已结束，部分数据无法判断",
 };
 
 export default function DashboardPage() {
@@ -40,33 +38,23 @@ export default function DashboardPage() {
     <section>
       <h1>运行总览</h1>
       <div className="card-grid">
-        <div className="card">
-          <div className="card-value">{dashboard.job_counts.queued ?? 0}</div>
-          <div className="card-title">排队任务</div>
-        </div>
-        <div className="card">
-          <div className="card-value">{dashboard.job_counts.running ?? 0}</div>
-          <div className="card-title">运行中任务</div>
-        </div>
-        <div className="card">
-          <div className="card-value">{dashboard.job_counts.failed ?? 0}</div>
-          <div className="card-title">失败任务</div>
-        </div>
-        <div className="card">
-          <div className="card-value">{dashboard.today_event_count}</div>
-          <div className="card-title">今日事件</div>
-        </div>
-      </div>
-      <div className="card">
-        <div className="card-title">机器分类分布</div>
-        <ul>
-          {Object.entries(dashboard.machine_label_counts).map(([label, count]) => (
-            <li key={label}>
-              {LABEL_NAMES[label] ?? label}：{count}
-            </li>
-          ))}
-          {Object.keys(dashboard.machine_label_counts).length === 0 && <li>暂无事件</li>}
-        </ul>
+        <section className="card" aria-label="30 秒窗口任务">
+          <div className="card-title">30 秒窗口任务</div>
+          <ul>{Object.entries(dashboard.window_status_counts).map(([status, count]) => <li key={status}>{STATUS_NAMES[status] ?? status}：{count}</li>)}</ul>
+        </section>
+        <section className="card" aria-label="模型扫描批次">
+          <div className="card-title">模型扫描批次</div>
+          <ul>{Object.entries(dashboard.model_scan_status_counts).map(([status, count]) => <li key={status}>{STATUS_NAMES[status] ?? status}：{count}</li>)}</ul>
+        </section>
+        <section className="card" aria-label="人工复核">
+          <div className="card-title">人工复核</div>
+          <ul>
+            <li>地震类：{dashboard.review_counts.earthquake}</li>
+            <li>噪声类：{dashboard.review_counts.noise}</li>
+            <li>待复核：{dashboard.review_counts.pending}</li>
+          </ul>
+          <p>成功的 30 秒窗口；待复核表示当前输入尚无有效的地震类或噪声类人工标签。</p>
+        </section>
       </div>
     </section>
   );
